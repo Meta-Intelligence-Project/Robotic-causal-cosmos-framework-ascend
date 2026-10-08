@@ -7,6 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from cosmos_framework.data.generator.action.action_state_template import resolve_action_template
+from cosmos_framework.data.generator.action.block_state import BlockStatistics
 from cosmos_framework.data.generator.action.block_statistics import mock_template_statistics
 from cosmos_framework.data.generator.action.causal_block_geometry import CausalBlockGeometry
 from cosmos_framework.data.generator.action.lerobot_discovery import discover_dataset_roots
@@ -78,6 +79,7 @@ def get_causal_action_dataset(
     # 环境变量仅用于部署路径；来源语义和读取选项保留在版本化 JSON 中。
     sources = json.loads(os.path.expandvars(manifest.read_text()))["sources"]
     datasets, weights = [], []
+    statistics_by_path = {}
     transform = ActionTransformPipeline(
         max_action_dim=template.width,
         video_temporal_downsample=4,
@@ -114,8 +116,13 @@ def get_causal_action_dataset(
             if not len(reader):
                 raise ValueError(f"No complete training segments: {root}")
             statistics_path = source.get("statistics_path")
-            statistics = None
-            if not statistics_path:
+            if statistics_path:
+                path = Path(statistics_path).resolve()
+                # Share one object across adapters, including sources that use the same file.
+                if path not in statistics_by_path:
+                    statistics_by_path[path] = BlockStatistics.load(path)
+                statistics = statistics_by_path[path]
+            else:
                 if not allow_mock_statistics:
                     raise ValueError(f"{root}: specify statistics_path or explicitly enable mock statistics")
                 statistics = mock_template_statistics(
@@ -128,7 +135,7 @@ def get_causal_action_dataset(
             dataset = CausalActionSFTDataset(
                 ActionSFTDataset(reader, transform, resolution),
                 mode=source.get("mode", mode),
-                statistics_path=statistics_path,
+                statistics_path=None,
                 statistics=statistics,
                 allow_mock_statistics=allow_mock_statistics,
                 history_blocks_min=history_blocks_min,
