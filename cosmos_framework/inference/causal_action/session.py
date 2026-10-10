@@ -20,16 +20,16 @@ class CausalActionSession:
     The next call always requires a fresh measured state and image.
     """
 
-    def __init__(self, contract, planner, history_blocks=8, *, template):
+    def __init__(self, planner, history_blocks=8, *, template):
         if history_blocks < 1:
             raise ValueError("history_blocks must be positive")
-        self.contract, self.planner, self.history_blocks = contract, planner, history_blocks
+        self.planner, self.history_blocks = planner, history_blocks
         self.template = template
         self.history, self.pending = [], None
         self.revision = 0
 
     @classmethod
-    def for_model(cls, contract, model, batch_builder, *, template, history_blocks=8, **sampling_options):
+    def for_model(cls, model, batch_builder, *, template, history_blocks=8, **sampling_options):
         """Connect Cosmos to an execution adapter's batch construction.
 
         ``batch_builder`` receives measured state/image and ObservedBlock
@@ -46,8 +46,6 @@ class CausalActionSession:
             if not 0 <= current < len(metadata.states):
                 raise ValueError("Requested block has no measured state")
             batch["causal_action_current_block"] = current
-            if metadata.contract != contract:
-                raise ValueError("Execution adapter changed the source representation contract")
             if not torch.equal(metadata.anchors[current].cpu(), inputs["state"].cpu()):
                 raise ValueError("Batch builder must preserve the current measured state")
             if not torch.equal(metadata.state_mask[current].cpu(), inputs["state_mask"].cpu()):
@@ -61,7 +59,7 @@ class CausalActionSession:
             )
             return real_actions(generated, batch)[0]
 
-        return cls(contract, planner, history_blocks=history_blocks, template=template)
+        return cls(planner, history_blocks=history_blocks, template=template)
 
     def generate_current_block(self, *, state, state_mask, image, action_mask):
         if self.pending is not None:
@@ -83,7 +81,6 @@ class CausalActionSession:
             image=image,
             history=history,
             revision=self.revision,
-            contract=self.contract,
         )
         if proposed.ndim != 2 or proposed.shape[1] != self.template.width or not len(proposed):
             raise ValueError("Planner must return a complete real action block [N,template.width]")

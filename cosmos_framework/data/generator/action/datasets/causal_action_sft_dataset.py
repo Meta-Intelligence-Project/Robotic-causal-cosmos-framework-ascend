@@ -74,7 +74,7 @@ class CausalActionSFTDataset(ActionSFTDataset):
         except Exception as error:
             # 只标记原始读取错误；统计校验、编码和 transform 错误仍直接抛出。
             raise ActionSampleReadError(
-                f"Failed to read source={self._dataset.source_contract.source!r}, sample_index={idx}: "
+                f"Failed to read source={str(self._dataset.root)!r}, sample_index={idx}: "
                 f"{type(error).__name__}: {error}"
             ) from error
         finally:
@@ -104,7 +104,8 @@ class CausalActionSFTDataset(ActionSFTDataset):
             "state_timestamps",
             "action_timestamps",
             "storage_fps",
-            "source_contract",
+            "source",
+            "split",
             "read_options",
         ):
             raw.pop(key, None)

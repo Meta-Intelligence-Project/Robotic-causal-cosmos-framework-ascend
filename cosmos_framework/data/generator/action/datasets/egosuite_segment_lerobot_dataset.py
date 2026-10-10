@@ -28,7 +28,7 @@ _CAMERA_MAPPING = {"head": _HEAD_LEFT_KEY}  # ego_view 的 head 使用左相机�
 class EgoSuiteSegmentLeRobotDataset(SegmentLeRobotDataset):
     """处理后 EgoSuite：ego_view 默认只读取左侧头部相机。
 
-    template/source_contract/planner 由调用方传入，不在 Reader 中解释通道语义。
+    template/planner 由调用方传入，不在 Reader 中解释通道语义。
     当前导出的 action 已是下一步 state，默认直接读取，不重复移位。
     """
 

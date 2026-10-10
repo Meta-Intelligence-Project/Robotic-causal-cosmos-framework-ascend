@@ -6,13 +6,13 @@ import logging
 import math
 import warnings
 from bisect import bisect_right
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from cosmos_framework.data.generator.action.action_state_template import ActionStateTemplate, TemplateSourceContract
+from cosmos_framework.data.generator.action.action_state_template import ActionStateTemplate
 from cosmos_framework.data.generator.action.datasets.cosmos3_action_lerobot import (
     BaseActionLeRobotDataset,
     LeRobotDatasetMetadata,
@@ -49,7 +49,6 @@ class SegmentLeRobotDataset(BaseActionLeRobotDataset):
         *,
         root: str | Path,
         template: ActionStateTemplate,
-        source_contract: TemplateSourceContract,
         planner: SegmentPlanner,
         read_options: ActionReadOptions = ActionReadOptions(),
         use_subtask: bool = False,  # 仅训练按 action_config 切分；统计保持默认 episode 模式。
@@ -65,6 +64,7 @@ class SegmentLeRobotDataset(BaseActionLeRobotDataset):
     ):
         if table_backend not in ("parquet", "hf"):
             raise ValueError("table_backend must be parquet or hf")
+        self.root = Path(root)
         self.table_backend = table_backend
         self.early_video_sampling = early_video_sampling
         meta = LeRobotDatasetMetadata(repo_id="local", root=root, revision="local", use_hf_cache=table_backend == "hf")
@@ -78,8 +78,6 @@ class SegmentLeRobotDataset(BaseActionLeRobotDataset):
         fps = float(meta.fps)
         if not math.isfinite(fps) or fps <= 0:
             raise ValueError("Source FPS must be finite and positive")
-        if source_contract.fps and not math.isclose(source_contract.fps, fps):
-            raise ValueError("Source contract FPS must match the aligned observation rate")
         super().__init__(
             fps=fps,
             chunk_length=planner.max_action_steps,
@@ -96,7 +94,6 @@ class SegmentLeRobotDataset(BaseActionLeRobotDataset):
         self.use_subtask = use_subtask
         self.template = template
         self.read_options = read_options
-        self.source_contract = replace(source_contract, fps=fps, split=self.split)
         self._episode_fps, self._subtask_ranges = self._load_episode_metadata(Path(root), meta)
         self.unannotated_observation_frames = 0
         # 索引计数属于当前 Reader，不修改调用方或其他 Reader 的 planner。
@@ -179,7 +176,7 @@ class SegmentLeRobotDataset(BaseActionLeRobotDataset):
                             ranges[episode_id] = parsed
                         except ValueError as error:
                             warnings.warn(
-                                f"Episode {episode_id} in {self.source_contract.source}: falling back to episode mode: {error}",
+                                f"Episode {episode_id} in {self.root}: falling back to episode mode: {error}",
                                 UserWarning,
                                 stacklevel=2,
                             )
@@ -200,7 +197,7 @@ class SegmentLeRobotDataset(BaseActionLeRobotDataset):
         ranges = self._subtask_ranges.get(episode_id)
         if ranges is None:
             warnings.warn(
-                f"Episode {episode_id} in {self.source_contract.source}: falling back to episode mode: missing metadata",
+                f"Episode {episode_id} in {self.root}: falling back to episode mode: missing metadata",
                 UserWarning,
                 stacklevel=2,
             )
@@ -300,7 +297,6 @@ class SegmentLeRobotDataset(BaseActionLeRobotDataset):
             masks = []
             for key in (self.read_options.state_mask_key, self.read_options.target_mask_key):
                 mask = self.template.validate_valid_mask(values[key][0]).clone()
-                self.template.validate_source_contract(self.source_contract, mask)
                 masks.append(mask)
             self._masks = tuple(masks)
         return self._masks
@@ -390,7 +386,8 @@ class SegmentLeRobotDataset(BaseActionLeRobotDataset):
             state_timestamps=times,
             action_timestamps=times[:-1].clone(),
             action_state_indexes=torch.arange(actions),
-            source_contract=self.source_contract,
+            source=str(self.root),
+            split=self.split,
             # 存储时间戳仍搭配 storage_fps；训练 FPS 在读取完成后统一切换。
             storage_fps=torch.tensor(self.fps, dtype=torch.float32),
             conditioning_fps=torch.tensor(source_fps, dtype=torch.float32),

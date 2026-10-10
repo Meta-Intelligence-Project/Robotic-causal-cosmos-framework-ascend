@@ -8,24 +8,10 @@ import torch
 
 from cosmos_framework.data.generator.action.action_state_template import (
     ActionStateTemplate55,
-    TemplateSourceContract,
 )
 from cosmos_framework.data.generator.action.sample_contract import (
     ActionReadOptions,
 )
-
-
-def make_contract(template):
-    names = template.fields.keys()
-    return TemplateSourceContract(
-        template_id=template.template_id,
-        source="synthetic",
-        frame="robot_base",
-        endpoints={name: "test_endpoint" for name in names if name.endswith("_eef")},
-        units={name: "metres,unit_quaternion" if name.endswith("_eef") else "source_native" for name in names},
-        scalar_semantics=dict.fromkeys(names, "absolute"),
-        target_semantics="existing absolute action command at each interval start",
-    )
 
 
 def template_values():
@@ -44,13 +30,12 @@ def template_values():
 
 def test_absolute_hands_grippers_and_relative_fields_round_trip():
     template, mask, anchor, target = template_values()
-    contract = make_contract(template)
-    delta = template.encode_action_delta(target, anchor, mask, source_contract=contract)
+    delta = template.encode_action_delta(target, anchor, mask)
     for name in ("left_gripper", "right_gripper", "left_hand", "right_hand"):
         torch.testing.assert_close(delta[:, template.fields[name]], target[:, template.fields[name]])
     torch.testing.assert_close(delta[:, template.fields["left_arm_joint"]], torch.full((3, 7), 0.5))
     assert (delta[:, ~mask] == 0).all()
-    restored = template.decode_action_delta(delta, anchor, mask, source_contract=contract)
+    restored = template.decode_action_delta(delta, anchor, mask)
     torch.testing.assert_close(restored, template.sanitize(target, mask))
     assert torch.isnan(target[:, ~mask]).all()  # Validation/conversion does not mutate input.
 
@@ -62,9 +47,8 @@ def test_quaternion_composition_order_and_sign():
     for group in template.rotation_groups:
         anchor[list(group)] = torch.tensor([half, 0.0, 0.0, half])
         target[:, list(group)] = torch.tensor([0.0, -half, 0.0, -half])
-    contract = make_contract(template)
-    delta = template.encode_action_delta(target, anchor, mask, source_contract=contract)
-    decoded = template.decode_action_delta(delta, anchor, mask, source_contract=contract)
+    delta = template.encode_action_delta(target, anchor, mask)
+    decoded = template.decode_action_delta(delta, anchor, mask)
     for group in template.rotation_groups:
         torch.testing.assert_close(delta[:, list(group)], torch.tensor([[-0.5, 0.5, -0.5, 0.5]]).expand(3, -1))
         torch.testing.assert_close(decoded[:, list(group)], torch.tensor([[0.0, half, 0.0, half]]).expand(3, -1))
@@ -72,9 +56,6 @@ def test_quaternion_composition_order_and_sign():
 
 def test_template_rejects_invalid_representation():
     template, mask, anchor, target = template_values()
-    contract = make_contract(template)
-    with pytest.raises(ValueError, match="version"):
-        template.validate_source_contract(replace(contract, template_id="old-template"), mask)
     with pytest.raises(ValueError, match="vector"):
         template.validate_valid_mask(mask[:-1])
     partial = mask.clone()
@@ -83,7 +64,7 @@ def test_template_rejects_invalid_representation():
         template.validate_valid_mask(partial)
     target[:, template.rotation_groups[0]] = 0
     with pytest.raises(ValueError, match="nonzero"):
-        template.encode_action_delta(target, anchor, mask, source_contract=contract)
+        template.encode_action_delta(target, anchor, mask)
 
 
 def test_read_options_are_explicit_and_do_not_relabel():

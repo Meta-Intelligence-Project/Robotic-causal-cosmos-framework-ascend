@@ -47,7 +47,7 @@ LeRobot v3 子数据集
 | AgiBot   | `state_unified[t]` | `state_unified[t+1]`         | `mask_state`  |
 | EgoSuite | `state_unified[t]` | 已处理的 `action_unified[t]` | `mask_action` |
 
-AgiBot 配置为 `action_from_state=true, action_time_offset_steps=1`；EgoSuite 为 `false, 0`，不能再次移位。切换为 state 来源不会自动增加偏移，二者必须分别配置。`--profile` 只声明来源语义，不自动选择 target。
+AgiBot 配置为 `action_from_state=true, action_time_offset_steps=1`；EgoSuite 为 `false, 0`，不能再次移位。切换为 state 来源不会自动增加偏移，二者必须分别配置。统计工具的目标读取也由这些选项决定，不要求来源语义声明。
 
 因此，AgiBot 当前监督的是下一实测状态轨迹，并不能直接等同于机器人的底层控制指令。部署时还需要执行适配层。
 

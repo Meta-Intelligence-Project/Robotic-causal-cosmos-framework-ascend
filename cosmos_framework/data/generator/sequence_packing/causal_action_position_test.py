@@ -37,7 +37,6 @@ def test_state_positions_match_video_and_preserve_block_isolation(fps_modulation
             action_target=state[1:].clone(),
             state_mask=mask,
             action_mask=mask,
-            source_contract=template.source_contract("agibot", source="test", info={}, target_semantics="next state"),
             conditioning_fps=source_fps,
             storage_fps=30.0,
             state_timestamps=torch.arange(start, start + n + 1).double() / 30,

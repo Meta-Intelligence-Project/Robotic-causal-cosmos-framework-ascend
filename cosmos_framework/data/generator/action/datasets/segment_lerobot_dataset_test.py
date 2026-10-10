@@ -17,7 +17,9 @@ from cosmos_framework.data.generator.action.sample_contract import ActionReadOpt
 from cosmos_framework.data.generator.action.segment_planner import SegmentPlanner
 
 
-def make_reader(monkeypatch, *, lengths=(100, 50), offset=0, from_state=False, root="synthetic", use_subtask=False):
+def make_reader(
+    monkeypatch, *, lengths=(100, 50), offset=0, from_state=False, root="synthetic", use_subtask=False, split="full"
+):
     template = ActionStateTemplate55()
     size = sum(lengths)
     state = torch.arange(size, dtype=torch.float32)[:, None].expand(-1, template.width).clone()
@@ -62,12 +64,12 @@ def make_reader(monkeypatch, *, lengths=(100, 50), offset=0, from_state=False, r
         root=root,
         table_backend="hf",
         template=template,
-        source_contract=template.source_contract("agibot", source="test", info={}, target_semantics="absolute"),
         planner=SegmentPlanner(
             max_action_steps=64, overlap_action_steps=16, geometry=CausalBlockGeometry(temporal_compression_factor=4)
         ),
         read_options=ActionReadOptions(action_from_state=from_state, action_time_offset_steps=offset),
         use_subtask=use_subtask,
+        split=split,
     )
     return reader, queries
 
@@ -187,22 +189,6 @@ def test_timestamp_precision_and_video_hook(monkeypatch):
     sample = reader[0]
     assert sample["state_timestamps"].tolist() == timestamps
     assert received == [timestamps]
-
-
-def test_dataset_contract_is_checked_only_when_loading_masks(monkeypatch):
-    reader, _ = make_reader(monkeypatch)
-    calls = []
-    validate = reader.template.validate_source_contract
-
-    def record(contract, mask):
-        calls.append(mask)
-        validate(contract, mask)
-
-    monkeypatch.setattr(reader.template, "validate_source_contract", record)
-    reader[0]
-    assert len(calls) == 2
-    reader[1]
-    assert len(calls) == 2
 
 
 def test_result_uses_parent_video_format_and_keeps_absolute_targets(monkeypatch):

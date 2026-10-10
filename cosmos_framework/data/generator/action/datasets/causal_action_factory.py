@@ -93,15 +93,11 @@ def get_causal_action_dataset(
         log.info(f"Action source group: {source['root']}; datasets={len(roots)}")
         for root in roots:
             profile = source["reader"]
-            info = json.loads((root / "meta/info.json").read_text())
             options = replace(READERS[profile].default_read_options, **source.get("read_options", {}))
             reader = READERS[profile](
                 root=root,
                 template=template,
                 planner=planner,
-                source_contract=template.source_contract(
-                    profile, source=str(root), info=info, target_semantics=source["target_semantics"]
-                ),
                 read_options=options,
                 use_subtask=source.get("use_subtask", False),
                 viewpoint=source["viewpoint"],

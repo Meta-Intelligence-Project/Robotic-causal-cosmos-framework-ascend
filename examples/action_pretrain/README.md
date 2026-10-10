@@ -52,7 +52,7 @@ set -o pipefail
 ```bash
 TORCH_DEVICE_BACKEND_AUTOLOAD=0 LD_LIBRARY_PATH='' \
   python -m tools.compute_causal_action_stats_parallel \
-  --dataset-root "$AGIBOT_ROOT" --profile agibot \
+  --dataset-root "$AGIBOT_ROOT" \
   --state-key state_unified --state-mask-key mask_state \
   --action-from-state --action-time-offset-steps 1 \
   --split-val-ratio 0 --split-seed 42 \
@@ -118,7 +118,7 @@ OUTPUT_ROOT="$RUN_DIR/smoke_agibot" \
 ```bash
 TORCH_DEVICE_BACKEND_AUTOLOAD=0 LD_LIBRARY_PATH='' \
   python -m tools.compute_causal_action_stats_parallel \
-  --dataset-root "$EGOSUITE_ROOT" --profile egosuite \
+  --dataset-root "$EGOSUITE_ROOT" \
   --state-key state_unified --action-key action_unified \
   --state-mask-key mask_state --action-mask-key mask_action \
   --action-time-offset-steps 0 \

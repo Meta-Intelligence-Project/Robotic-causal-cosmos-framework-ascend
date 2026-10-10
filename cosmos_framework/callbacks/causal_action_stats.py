@@ -67,7 +67,7 @@ class CausalActionStats(Callback):
             m = plan.causal_action_metadata
             clipping.append(
                 dict(
-                    source=m.contract.source,
+                    source=m.source,
                     block_size=m.block_size,
                     action_steps=int(m.action_mask.shape[0]),
                     state_blocks=int(m.anchors.shape[0]),
