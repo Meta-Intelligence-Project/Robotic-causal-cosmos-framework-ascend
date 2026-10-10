@@ -123,6 +123,31 @@ def get_safe_default_codec():
         return "pyav"
 
 
+def query_videos(
+    meta,
+    query_timestamps: dict[str, list[float]],
+    ep_idx: int,
+    *,
+    tolerance_s: float,
+    video_backend: str,
+) -> dict[str, torch.Tensor]:
+    """Query episode video frames using metadata and explicit decoding options."""
+    ep = meta.episodes[ep_idx]
+    item = {}
+    for vid_key, query_ts in query_timestamps.items():
+        # Episodes are stored sequentially on a single mp4 to reduce the number of files.
+        # Thus we load the start timestamp of the episode on this mp4 and,
+        # shift the query timestamp accordingly.
+        from_timestamp = ep[f"videos/{vid_key}/from_timestamp"]
+        shifted_query_ts = [from_timestamp + ts for ts in query_ts]
+
+        video_path = meta.root / meta.get_video_file_path(ep_idx, vid_key)
+        frames = decode_video_frames(video_path, shifted_query_ts, tolerance_s, video_backend)
+        item[vid_key] = frames.squeeze(0)
+
+    return item
+
+
 def decode_video_frames(
     video_path: Path | str,
     timestamps: list[float],

@@ -35,21 +35,24 @@ def test_missing_camera_or_frame_is_an_error():
         view.compose({"head": torch.zeros(32, 3, 8, 8)}, 33, viewpoint="ego_view")
 
 
-def test_only_selected_cameras_receive_same_timestamps(tmp_path):
+def test_only_selected_cameras_receive_same_timestamps(tmp_path, monkeypatch):
+    from lerobot.datasets import video_utils
+
     view = VideoViewConfig(cameras={"head": "head", "left": "left", "right": "right"})
-    meta = SimpleNamespace(get_video_file_path=lambda episode, key: f"{key}.mp4")
+    meta = SimpleNamespace(root=tmp_path, get_video_file_path=lambda episode, key: f"{key}.mp4")
     calls = []
 
-    def query(times, episode):
+    def query(metadata, times, episode, *, tolerance_s, video_backend):
+        assert metadata is meta and tolerance_s == 1e-4 and video_backend == "pyav"
         calls.append((times, episode))
         return {key: torch.zeros(len(ts), 3, 8, 8) for key, ts in times.items()}
 
-    ds = SimpleNamespace(root=tmp_path, meta=meta, _query_videos=query)
+    monkeypatch.setattr(video_utils, "query_videos", query)
     with pytest.raises(FileNotFoundError, match="Required camera head"):
-        view.read(ds, 7, [0.5, 0.6], viewpoint="concat_view")
+        view.read(meta, 7, [0.5, 0.6], viewpoint="concat_view", tolerance_s=1e-4, video_backend="pyav")
     for key in view.camera_keys(viewpoint="concat_view"):
         (tmp_path / f"{key}.mp4").touch()
-    view.read(ds, 7, [0.5, 0.6], viewpoint="concat_view")
+    view.read(meta, 7, [0.5, 0.6], viewpoint="concat_view", tolerance_s=1e-4, video_backend="pyav")
     assert calls == [({key: [0.5, 0.6] for key in view.camera_keys(viewpoint="concat_view")}, 7)]
 
 
@@ -90,6 +93,7 @@ def test_resized_layout_offsets_and_instance_isolation(tmp_path, monkeypatch, vi
     view = VideoViewConfig(cameras={"head": "head", "left": "left", "right": "right"})
     offsets = {"head": 1000.0, "left": 2000.0, "right": 3000.0}
     meta = SimpleNamespace(
+        root=tmp_path,
         features={"head": {"names": names, "shape": shape}},
         episodes=[{f"videos/{key}/from_timestamp": value for key, value in offsets.items()}],
         get_video_file_path=lambda episode, key: f"{key}.mp4",
@@ -107,15 +111,15 @@ def test_resized_layout_offsets_and_instance_isolation(tmp_path, monkeypatch, vi
     times = [0.0, 1 / 30, 2 / 30]
     legacy_calls = []
 
-    def query(timestamps, episode):
+    def query(metadata, timestamps, episode, *, tolerance_s, video_backend):
+        assert metadata is meta and tolerance_s == 1e-4 and video_backend == "pyav"
         legacy_calls.append((timestamps, episode))
         return {key: torch.full((3, 3, 8, 11), 0.5) for key in timestamps}
 
-    legacy = SimpleNamespace(root=tmp_path, meta=meta, video_backend="pyav", _query_videos=query)
-    fast = SimpleNamespace(root=tmp_path, meta=meta, video_backend="pyav_resize", tolerance_s=1e-4)
-    before = view.read(legacy, 0, times, viewpoint=viewpoint)
-    result = view.read(fast, 0, times, viewpoint=viewpoint)
-    after = view.read(legacy, 0, times, viewpoint=viewpoint)
+    monkeypatch.setattr(video_utils, "query_videos", query)
+    before = view.read(meta, 0, times, viewpoint=viewpoint, tolerance_s=1e-4, video_backend="pyav")
+    result = view.read(meta, 0, times, viewpoint=viewpoint, tolerance_s=1e-4, video_backend="pyav_resize")
+    after = view.read(meta, 0, times, viewpoint=viewpoint, tolerance_s=1e-4, video_backend="pyav")
     assert torch.equal(before, after) and len(legacy_calls) == 2
     assert result.dtype == torch.uint8
     assert result.shape == (3, 3, 8 if viewpoint == "ego_view" else 12, 11)
@@ -214,13 +218,15 @@ def test_new_layout_only_changes_declaration(tmp_path, monkeypatch, backend):
     for key in ("front", "wrist"):
         (tmp_path / f"{key}.mp4").touch()
     meta = SimpleNamespace(
+        root=tmp_path,
         features={"front": {"names": ["height", "width", "rgb"], "shape": [8, 11, 3]}},
         episodes=[{"videos/front/from_timestamp": 0, "videos/wrist/from_timestamp": 1}],
         get_video_file_path=lambda episode, key: f"{key}.mp4",
     )
     decode_calls, query_calls = [], []
 
-    def query(timestamps, episode):
+    def query(metadata, timestamps, episode, *, tolerance_s, video_backend):
+        assert metadata is meta and tolerance_s == 1e-4 and video_backend == "pyav"
         query_calls.append(timestamps)
         # Metadata is irrelevant to the legacy path; actual head dimensions win.
         return {key: torch.full((2, 3, 8, 11), 0.25 if key == "front" else 0.75) for key in timestamps}
@@ -230,7 +236,7 @@ def test_new_layout_only_changes_declaration(tmp_path, monkeypatch, backend):
         return torch.full((2, 3, resize_h, resize_w), 64 if path.stem == "front" else 192, dtype=torch.uint8)
 
     monkeypatch.setattr(video_utils, "decode_video_frames", decode)
-    ds = SimpleNamespace(root=tmp_path, meta=meta, video_backend=backend, tolerance_s=1e-4, _query_videos=query)
+    monkeypatch.setattr(video_utils, "query_videos", query)
     if backend == "pyav":
         meta.features = {}  # Legacy must not start depending on head metadata.
     else:
@@ -239,7 +245,7 @@ def test_new_layout_only_changes_declaration(tmp_path, monkeypatch, backend):
             pytest.fail("PyAV preparation and composition must not call legacy resize")
 
         monkeypatch.setattr(module.F, "interpolate", forbidden)
-    result = view.read(ds, 0, [0, 1 / 30], viewpoint="wrists_above_head")
+    result = view.read(meta, 0, [0, 1 / 30], viewpoint="wrists_above_head", tolerance_s=1e-4, video_backend=backend)
     assert result.shape == (3, 2, 12, 11)
     assert (result[:, :, :4] == (0.75 if backend == "pyav" else 192)).all()
     assert (result[:, :, 4:] == (0.25 if backend == "pyav" else 64)).all()
