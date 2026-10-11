@@ -182,21 +182,19 @@ def test_reservoir_moments_are_full_population_and_ignore_invalid_rows():
     assert acc.summary()["sampled_counts"] == [7, 7]
 
 
-def test_discover_parent_roots_and_deduplicate(tmp_path):
-    import json
-
+def test_discover_parent_roots_and_deduplicate(tmp_path, monkeypatch):
     for name in ["b/nested", "a"]:
         root = tmp_path / name
         (root / "meta").mkdir(parents=True)
         (root / "data").mkdir()
-        (root / "meta/info.json").write_text(json.dumps({"codebase_version": "v3.0"}))
+        (root / "meta/info.json").write_text("")
+    monkeypatch.setattr(
+        "pathlib.Path.read_text", lambda *args, **kwargs: pytest.fail("Discovery must not read metadata")
+    )
     expected = [tmp_path / "a", tmp_path / "b/nested"]
     assert discover_dataset_roots([tmp_path, tmp_path / "a"]) == expected
     with pytest.raises(ValueError, match="No LeRobot"):
         discover_dataset_roots([tmp_path / "a/data"])
-    (tmp_path / "a/meta/info.json").write_text(json.dumps({"codebase_version": "v2.1"}))
-    with pytest.raises(ValueError, match="v3"):
-        discover_dataset_roots([tmp_path])
 
 
 def test_merge_multiple_datasets_and_quaternion_bounds():
