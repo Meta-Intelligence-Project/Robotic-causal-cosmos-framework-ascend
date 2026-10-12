@@ -1,4 +1,4 @@
-# AgiBot / EgoSuite：从组统计到训练
+# AgiBot / EgoSuite / RoboTwin：从组统计到训练
 
 本文面向其他 Ascend 机器，所有命令从 `cosmos-framework` 仓库根目录执行。先替换 `/path/to/xxx`，再在同一个 Bash 会话中按顺序运行。要求已安装本仓库、`cosmos-framework-py312` 环境和匹配的 CANN/torch_npu。
 
@@ -6,6 +6,7 @@
 
 - **路线 A：只训练 AgiBot。** 计算一份 AgiBot 组统计，然后启动单组训练。
 - **路线 B：AgiBot + EgoSuite 混合训练。** 分别计算两份组统计，按训练片段数设置组权重，再启动 mix。
+- **路线 C：只训练 RoboTwin。** 完成公共环境准备后，直接执行路线 C，计算独立组统计并启动单组训练。
 
 ## 1. 公共准备：环境与路径
 
@@ -16,7 +17,7 @@ export ASCEND_ENV=/path/to/Ascend/ascend-toolkit/set_env.sh
 source "$CONDA_ROOT/etc/profile.d/conda.sh"
 conda activate "$CONDA_ENV"
 
-# 父目录下可以有任意多个子数据集；只训练 AgiBot 时不需要设置 EGOSUITE_ROOT。
+# 父目录下可以有任意多个子数据集；只需设置所选路线的数据路径。
 export AGIBOT_ROOT=/path/to/agibot_processed
 export EGOSUITE_ROOT=/path/to/egosuite_processed
 
@@ -205,7 +206,64 @@ bash examples/action_pretrain/launch_midtrain_template.sh
 
 与单组训练共用相同 TOML。混合的是数据来源，任务仍为 `mode=joint`，默认 Policy / ID / FD 按 1:1:1 采样，每个样本选择一种任务。
 
-## 4. 常用训练参数在哪里改
+## 4. 路线 C：RoboTwin 单组训练
+
+### C1. 配置路径与读取规则
+
+完成第 1 节的公共环境、模型路径和输出目录准备；只训练 RoboTwin 时无需配置 AgiBot / EgoSuite 的数据及统计路径。所有部署路径通过环境变量传入，换服务器时替换下面的占位路径即可，无需修改 Reader、来源 JSON 或公共 TOML。
+
+```bash
+export ROBOTWIN_ROOT=/path/to/robotwin_processed
+export ROBOTWIN_GROUP_STATS_PATH="$RUN_DIR/stats/robotwin_group_stats.json"
+```
+
+`ROBOTWIN_ROOT` 指向包含多个 `RoboTwin__<task>` 子集的父目录，也可以指向一个子集。要求使用已处理的 LeRobot v3 数据，包含 55 维 `state_unified`、`action_unified`、`mask_state`、`mask_action`。有效维度为双臂各 6 个关节和两个夹爪，共 14 维（`0:6`、`7:13`、`28:30`）；其余维度通过 mask 屏蔽。
+
+RoboTwin 直接读取 `action_unified[t]`，它保留原始绝对命令目标，随后由公共模板计算 block delta，夹爪保持绝对值。**不要加 `--action-from-state`，也不要再次移位。** 数据元数据将 state 标记为命令目标代理，未确认是真实测量 qpos；解释 FD / ID 结果时应保留这一语义区别。
+
+默认 `concat_view`：上方为 `observation.images.cam_high`，下方为 `observation.images.cam_left_wrist` 和 `observation.images.cam_right_wrist`。需要单路主相机时，将来源 JSON 中的 `viewpoint` 改为 `ego_view`。当前标注是整段任务指令，没有时序子任务标注，因此配置使用 `use_subtask=false`。
+
+### C2. 计算独立组统计
+
+```bash
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 LD_LIBRARY_PATH='' \
+  python -m tools.compute_causal_action_stats_parallel \
+  --dataset-root "$ROBOTWIN_ROOT" \
+  --state-key state_unified --action-key action_unified \
+  --state-mask-key mask_state --action-mask-key mask_action \
+  --action-time-offset-steps 0 \
+  --split-val-ratio 0 --split-seed 42 \
+  --method exact --seed 42 \
+  --dataset-processes 4 --num-workers 4 --batch-size 512 \
+  --bounds q01_q99 \
+  --output "$ROBOTWIN_GROUP_STATS_PATH" \
+  2>&1 | tee "$RUN_DIR/stats/robotwin.log"
+```
+
+**命令成功退出且组统计的 `provenance.partial=false` 后再训练；正式统计不要加 `--limit`。** 各子集统计写入自己的 `meta/causal_action_stats.json`，因此子集 `meta` 目录需要可写；不会覆盖原始 `meta/stats.json`。组统计写入 `ROBOTWIN_GROUP_STATS_PATH`，逐通道 q01/q99 使用各子集分位数的包络，与路线 A 相同。不要直接使用原始 `meta/stats.json` 或其他数据组统计替代。
+
+### C3. 接入统计并启动训练
+
+```bash
+export SOURCE_SET=robotwin
+export ACTION_SOURCES_FILE="$PWD/examples/action_pretrain/sources/robotwin.json"
+export OUTPUT_ROOT="$RUN_DIR/train_robotwin"
+
+# 只打印命令，不读取数据或启动训练。
+PRINT_ONLY=1 bash examples/action_pretrain/launch_midtrain_template.sh
+
+# 使用独立输出目录先进行 10 步短测。
+OUTPUT_ROOT="$RUN_DIR/smoke_robotwin" \
+  bash examples/action_pretrain/launch_midtrain_template.sh \
+  trainer.max_iter=10 checkpoint.save_iter=10
+
+# 正式训练，默认 FD / ID / Policy 联训。
+bash examples/action_pretrain/launch_midtrain_template.sh
+```
+
+显式设置 `ACTION_SOURCES_FILE` 可覆盖当前会话先前选择的来源清单。该 JSON 通过 `ROBOTWIN_ROOT` 和 `ROBOTWIN_GROUP_STATS_PATH` 绑定数据与统计；训练沿用公共 TOML 的切片、视频后端和任务模式，无需新增启动脚本。
+
+## 5. 常用训练参数在哪里改
 
 文件：`examples/action_pretrain/action_midtrain_edge_causal_tnd.toml`。
 
@@ -237,11 +295,11 @@ Action 来源未指定 `video_backend` 时，默认使用 `pyav_resize`，启用
 
 显式设置 `"video_backend": "pyav"` 并重新启动、重建 DataLoader 即回到原路径（移除该字段会使用新默认值 `pyav_resize`），无需转换数据或 checkpoint。昨晚约 14.8 秒/iter 是实验配置结果，不能作为新后端在所有来源上的速度保证。
 
-## 5. 文件分工与结果位置
+## 6. 文件分工与结果位置
 
 - `tools/compute_causal_action_stats_parallel.py`：按子集多进程计算，内部复用现有多线程统计，并自动聚合。
 - `tools/aggregate_causal_action_stats.py`：单独聚合已保存的子集统计。
-- `sources/agibot.json`、`sources/egosuite.json`、`sources/mixed.json`：来源、读取规则、组统计路径和权重。
+- `sources/agibot.json`、`sources/egosuite.json`、`sources/robotwin.json`、`sources/mixed.json`：来源、读取规则、组统计路径和权重。
 - `action_midtrain_edge_causal_tnd.toml`：公共训练参数。
 - `launch_midtrain_template.sh`：跨机器环境模板，路径为 `/path/to/xxx`；调用通用训练启动脚本。
 - `launch_midtrain_local.sh`：原开发机器的独立副本，已经填入本机路径；其他机器使用 template。

@@ -23,8 +23,13 @@ from .causal_action_dataset_group import CausalActionDatasetGroup
 from .causal_action_mixture import CausalActionMixture
 from .causal_action_sft_dataset import CausalActionSFTDataset
 from .egosuite_segment_lerobot_dataset import EgoSuiteSegmentLeRobotDataset
+from .robotwin_segment_lerobot_dataset import RoboTwinSegmentLeRobotDataset
 
-READERS = {"agibot": AgiBotSegmentLeRobotDataset, "egosuite": EgoSuiteSegmentLeRobotDataset}
+READERS = {
+    "agibot": AgiBotSegmentLeRobotDataset,
+    "egosuite": EgoSuiteSegmentLeRobotDataset,
+    "robotwin": RoboTwinSegmentLeRobotDataset,
+}
 
 
 def _build_reader(root, *, profile, **kwargs):
