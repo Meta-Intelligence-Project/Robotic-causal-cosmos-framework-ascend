@@ -148,7 +148,9 @@ def test_action_transform_pipeline_json_prompt_toggle() -> None:
         "idle_frames": torch.tensor(3),  # []
     }
 
-    result = pipeline(data_dict, resolution="256")
+    result = pipeline(data_dict)
+    assert result["video"] is video
+    torch.testing.assert_close(result["image_size"], torch.tensor([192, 320, 192, 320], dtype=torch.float32))
 
     prompt = result["ai_caption"]
     assert isinstance(prompt, dict)
@@ -167,9 +169,32 @@ def test_action_transform_pipeline_json_prompt_toggle() -> None:
     assert prompt["duration"] == "2s"
     assert prompt["fps"] == 8.0
     assert prompt["resolution"] == {"H": 192, "W": 320}
-    assert prompt["aspect_ratio"] == "16,9"
+    assert prompt["aspect_ratio"] == "5,3"
     assert result["action"].shape == (16, 4)
     torch.testing.assert_close(result["action_raw"], action)
+
+
+@pytest.mark.parametrize("height,width", [(384, 320), (720, 640), (528, 640)])
+def test_action_transform_preserves_composite_and_records_full_content(height, width):
+    video = torch.randint(256, (3, 5, height, width), dtype=torch.uint8)
+    pipeline = ActionTransformPipeline(max_action_dim=4, format_prompt_as_json=True)
+    result = pipeline(
+        {
+            "video": video,
+            "image_size": torch.tensor([1, 1, 0, 0]),
+            "action": torch.zeros(4, 2),
+            "mode": "policy",
+            "ai_caption": "Pick up the cup.",
+            "viewpoint": "concat_view",
+            "conditioning_fps": torch.tensor(30),
+        }
+    )
+    assert result["video"] is video
+    assert result["image_size"].dtype == torch.float32
+    assert result["image_size"].tolist() == [height, width, height, width]
+    prompt = result["ai_caption"]
+    assert prompt["resolution"] == {"H": height, "W": width}
+    assert prompt["aspect_ratio"] == {384: "5,6", 720: "8,9", 528: "40,33"}[height]
 
 
 @pytest.mark.L0
@@ -193,7 +218,7 @@ def test_action_transform_pipeline_keeps_ai_caption_string_path() -> None:
         "idle_frames": torch.tensor(3),  # []
     }
 
-    result = pipeline(data_dict, resolution="256")
+    result = pipeline(data_dict)
 
     assert result["ai_caption"] == (
         "Open the drawer. "
@@ -226,7 +251,7 @@ def test_action_transform_pipeline_keeps_idle_frames_for_forward_dynamics() -> N
         "idle_frames": torch.tensor(3),  # []
     }
 
-    result = pipeline(data_dict, resolution="256")
+    result = pipeline(data_dict)
 
     assert "IdleFrames: 3 out of 16." in result["ai_caption"]
     assert result["action"].shape == (16, 4)
@@ -253,7 +278,7 @@ def test_action_transform_pipeline_skips_idle_frames_for_inverse_dynamics_string
         "idle_frames": torch.tensor(3),  # []
     }
 
-    result = pipeline(data_dict, resolution="256")
+    result = pipeline(data_dict)
 
     assert "IdleFrames" not in result["ai_caption"]
     assert result["action"].shape == (16, 4)
@@ -279,7 +304,7 @@ def test_action_transform_pipeline_skips_idle_frames_for_inverse_dynamics_json_p
         "idle_frames": torch.tensor(3),  # []
     }
 
-    result = pipeline(data_dict, resolution="256")
+    result = pipeline(data_dict)
 
     prompt = result["ai_caption"]
     assert isinstance(prompt, dict)
@@ -325,7 +350,7 @@ def test_action_prompt_json_formatter_matches_video_json_common_metadata() -> No
         "video": video,
         "conditioning_fps": fps,
         "image_size": image_size,
-        "__url__": SimpleNamespace(meta=SimpleNamespace(opts={"aspect_ratio": "16,9"})),
+        "__url__": SimpleNamespace(meta=SimpleNamespace(opts={"aspect_ratio": "5,3"})),
     }
     duration_augmentor = DurationFPSTextTimeStamps(
         input_keys=["ai_caption", "video", "conditioning_fps"],

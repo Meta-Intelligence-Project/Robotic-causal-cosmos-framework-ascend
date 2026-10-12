@@ -427,17 +427,9 @@ class VideoResize:
 
 
 class ActionTransformPipeline:
-    """A composable transform pipeline that chains ``VideoResize``, text
-    tokenization, and automatic sequence plan construction.
-
-    Reflection padding snaps each sample to the closest predefined aspect
-    ratio from ``VIDEO_RES_SIZE_INFO[resolution]``, resizes
-    (aspect-preserving) to fit within the target, then reflection-pads to
-    the exact target size.  This guarantees a bounded set of output shapes
-    (5 per resolution tier), all multiples of 16.  Resolution is supplied
-    at call time via the required ``resolution`` argument to ``__call__``;
-    when ``resolution`` is ``None``, the tier is auto-detected from the
-    video's spatial dimensions via ``get_vision_data_resolution``.
+    """A composable transform pipeline that records spatial metadata, applies text
+    tokenization, and constructs sequence plans. Camera resize and composition
+    are completed by the reader; this pipeline preserves the spatial input.
 
     Text tokenization is enabled when ``tokenizer_config`` is provided.
 
@@ -448,8 +440,6 @@ class ActionTransformPipeline:
     ``None``.
 
     Args:
-        pad_keys: Data-dict keys whose values should be resized and padded. Pass
-            an empty list to disable padding entirely. Defaults to ``["video"]``.
         tokenizer_config: A lazy-instantiable config dict for the VLM tokenizer. When
             ``None``, text tokenization is skipped. Defaults to ``None``.
         cfg_dropout_rate: Probability of replacing the caption with an empty string for
@@ -500,8 +490,6 @@ class ActionTransformPipeline:
 
     def __init__(
         self,
-        pad_keys: list[str] | None = None,
-        keep_aspect_ratio: bool = True,
         tokenizer_config: dict | None = None,
         cfg_dropout_rate: float = 0.0,
         caption_key: str = "ai_caption",
@@ -524,15 +512,6 @@ class ActionTransformPipeline:
             max_action_dim=max_action_dim,
             action_channel_masking=action_channel_masking,
         )
-
-        # --- Spatial resize/padding stage (resolution supplied at call time) ---
-        self.video_resize: VideoResize = VideoResize(
-            pad_keys=pad_keys,
-            keep_aspect_ratio=keep_aspect_ratio,
-            log_prefix="ActionTransformPipeline",
-        )
-        self.pad_keys: list[str] = self.video_resize.pad_keys
-        self.keep_aspect_ratio: bool = self.video_resize.keep_aspect_ratio
 
         self.prompt_json_formatter: ActionPromptJsonFormatter | None = None
         if format_prompt_as_json:
@@ -597,19 +576,13 @@ class ActionTransformPipeline:
     def __call__(
         self,
         data_dict: dict,
-        resolution: str | None,
         action_normalizer: ActionNormalizer | None = None,
     ) -> dict:
         """Apply the transform pipeline to a single data dictionary.
 
-        Resolution is required at call time and is the only source of truth
-        for this sample. When ``resolution`` is ``None``, the tier is
-        auto-detected from the video's spatial dimensions.
-
         The pipeline runs in order:
 
-        1. Resize + reflection-pad spatial dimensions to the closest
-           predefined target from ``VIDEO_RES_SIZE_INFO[resolution]``.
+        1. Record actual spatial dimensions without resizing or padding.
         2. Format the caption as a structured JSON prompt (if enabled).
         3. Otherwise, append viewpoint type metadata to caption (if enabled).
         4. Append duration/FPS metadata to caption (if enabled).
@@ -627,22 +600,21 @@ class ActionTransformPipeline:
 
         Args:
             data_dict: A sample dictionary as returned by a Action dataset.
-            resolution: Resolution tier key (e.g. ``"256"``, ``"480"``, ``"720"``)
-                for this sample. When ``None``, auto-detected from video dimensions.
             action_normalizer: Optional source-provided action normalizer. When
                 present, only unpadded real action channels are normalized
                 before model-space channel padding.
 
         Returns:
-            The same dictionary, mutated in-place with padded tensors,
+            The same dictionary, mutated in-place with padded actions,
             ``image_size``, tokenized text IDs, a ``"sequence_plan"`` entry,
             and action processing metadata added.
         """
         mode = data_dict.get("mode")
         assert mode is not None, "mode is required"
 
-        # 1. Resize + reflection-pad spatial dimensions to the closest predefined target from ``VIDEO_RES_SIZE_INFO[resolution]``.
-        data_dict = self.video_resize(data_dict, resolution)
+        # 1. Record the complete RGB image as its effective content region.
+        height, width = data_dict["video"].shape[-2:]
+        data_dict["image_size"] = torch.tensor([height, width, height, width], dtype=torch.float32)
 
         # 2. Format the caption as structured JSON when requested; otherwise run the legacy string appenders.
         if self.prompt_json_formatter is not None:

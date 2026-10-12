@@ -32,7 +32,7 @@ transform 保留空间尺寸，填写元数据并处理时间、action、文本
 - 每个相机直接缩放到指定尺寸，允许放大和轻量宽高比变化；不保留比例后补边，不裁剪画面。
 - 保持先拼接 RGB、再统一 VAE 编码的顺序。
 
-主要验收对象为当前 `causal_action_factory` 接入的 AgiBot / EgoSuite，以及 `inference/action.py` 的通用 action 推理入口。DROID / LIBERO 训练工厂作为共享 pipeline 的直接调用方，按必要范围调整。
+按用户最新确认，本次只迁移当前 `causal_action_factory` 接入的 AgiBot / EgoSuite，以及 `inference/action.py` 中对应布局的通用 action 推理入口。旧 DROID / LIBERO 等 Dataset 的空间处理不在本次范围内；共享 adapter 删除参数时，仅同步其调用签名，不改旧 Reader 或扩展来源布局。旧工厂的空间输出不作为本阶段验收对象。
 
 LIBERO 和 Robolab policy 服务端由用户后续重写，本次不修改其预处理、请求接口和测试，不要求对其旧行为保持兼容。本文的训推一致性验收针对当前训练链路与通用 action 推理。
 
@@ -40,19 +40,19 @@ LIBERO 和 Robolab policy 服务端由用户后续重写，本次不修改其预
 
 ## 2. 当前代码与改造位置
 
-| 位置                                                                                                                              | 当前职责                                              | 本次调整                                                             |
-| --------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- | -------------------------------------------------------------------- |
-| [utils.py](../cosmos_framework/data/generator/utils.py#L76)                                                                       | 已有用户编写的 `ACTION_RES_SIZE_INFO`                 | 将此表接入 action 读取端，保留当前配置值                             |
-| [causal_action_factory.py](../cosmos_framework/data/generator/action/datasets/causal_action_factory.py#L55)                       | 持有训练 resolution，构建来源 Reader 与共用 transform | 构造来源级 video_view，将 resolution 经已有参数传入；统一启用新链路  |
-| [agibot_segment_lerobot_dataset.py](../cosmos_framework/data/generator/action/datasets/agibot_segment_lerobot_dataset.py#L31)     | 定义 AgiBot 相机映射与读取默认项                      | 暴露默认 video_view，方便工厂按来源配置                              |
-| [egosuite_segment_lerobot_dataset.py](../cosmos_framework/data/generator/action/datasets/egosuite_segment_lerobot_dataset.py#L28) | 定义 EgoSuite 相机映射与读取默认项                    | 同上                                                                 |
-| [video_view.py](../cosmos_framework/data/generator/action/video_view.py#L93)                                                      | 选择相机、准备尺寸、拼接布局                          | 新增可选 resolution；依据原始 head 宽高决定各相机读取尺寸            |
-| [segment_lerobot_dataset.py](../cosmos_framework/data/generator/action/datasets/segment_lerobot_dataset.py#L308)                  | 将元数据、时间戳交给 video_view 读取                  | 继续转发，不新增独立 resolution 字段或选桶逻辑                       |
-| [transforms.py](../cosmos_framework/data/generator/action/transforms.py#L645)                                                     | 拼接后再 resize、补边并填写 image_size                | 删除空间变换阶段，始终记录实际尺寸                                   |
-| [json_formatter.py](../cosmos_framework/data/generator/action/json_formatter.py#L115)                                             | 从 image_size 生成 prompt 分辨率与宽高比              | 新链路使用最终图像实际宽高比                                         |
-| [inference/action.py](../cosmos_framework/inference/action.py#L78)                                                                | 推理 batch 构建时对整张媒体选桶、resize 和补边        | 接入共用相机预处理，batch 构建只组装数据                             |
-| [inference/inference.py](../cosmos_framework/inference/inference.py#L652)                                                         | 转发 action 推理参数                                  | 传递明确的 action 档位和相机布局，不将拼接尺寸当相机尺寸             |
-| [action_sft_dataset.py](../cosmos_framework/data/generator/action/datasets/action_sft_dataset.py#L139)                            | DROID / LIBERO 等工厂依赖共用 pipeline 的空间阶段     | 将必要空间准备移到来源读取阶段，删除无效的 transform resolution 传递 |
+| 位置                                                                                                                              | 当前职责                                              | 本次调整                                                            |
+| --------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- | ------------------------------------------------------------------- |
+| [utils.py](../cosmos_framework/data/generator/utils.py#L76)                                                                       | 已有用户编写的 `ACTION_RES_SIZE_INFO`                 | 将此表接入 action 读取端，保留当前配置值                            |
+| [causal_action_factory.py](../cosmos_framework/data/generator/action/datasets/causal_action_factory.py#L55)                       | 持有训练 resolution，构建来源 Reader 与共用 transform | 构造来源级 video_view，将 resolution 经已有参数传入；统一启用新链路 |
+| [agibot_segment_lerobot_dataset.py](../cosmos_framework/data/generator/action/datasets/agibot_segment_lerobot_dataset.py#L31)     | 定义 AgiBot 相机映射与读取默认项                      | 暴露默认 video_view，方便工厂按来源配置                             |
+| [egosuite_segment_lerobot_dataset.py](../cosmos_framework/data/generator/action/datasets/egosuite_segment_lerobot_dataset.py#L28) | 定义 EgoSuite 相机映射与读取默认项                    | 同上                                                                |
+| [video_view.py](../cosmos_framework/data/generator/action/video_view.py#L93)                                                      | 选择相机、准备尺寸、拼接布局                          | 提交 1 增加 resolution；提交 2 去掉过渡的 None，按原始 head 选桶    |
+| [segment_lerobot_dataset.py](../cosmos_framework/data/generator/action/datasets/segment_lerobot_dataset.py#L308)                  | 将元数据、时间戳交给 video_view 读取                  | 继续转发，不新增独立 resolution 字段或选桶逻辑                      |
+| [transforms.py](../cosmos_framework/data/generator/action/transforms.py#L645)                                                     | 拼接后再 resize、补边并填写 image_size                | 删除空间变换阶段，始终记录实际尺寸                                  |
+| [json_formatter.py](../cosmos_framework/data/generator/action/json_formatter.py#L115)                                             | 从 image_size 生成 prompt 分辨率与宽高比              | 新链路使用最终图像实际宽高比                                        |
+| [inference/action.py](../cosmos_framework/inference/action.py#L78)                                                                | 推理 batch 构建时对整张媒体选桶、resize 和补边        | 接入共用相机预处理，batch 构建只组装数据                            |
+| [inference/inference.py](../cosmos_framework/inference/inference.py#L652)                                                         | 转发 action 推理参数                                  | 传递明确的 action 档位和相机布局，不将拼接尺寸当相机尺寸            |
+| [action_sft_dataset.py](../cosmos_framework/data/generator/action/datasets/action_sft_dataset.py#L139)                            | 共用 adapter 将 Reader 样本交给 transform             | 删除 transform resolution 传递；旧工厂只同步调用签名                |
 
 ### 配置归属
 
@@ -99,12 +99,6 @@ LIBERO 和 Robolab policy 服务端由用户后续重写，本次不修改其预
 不能从任意 concat 图的整体宽高比猜来源或视图边界，也不能把它当作 ego 输入悄悄重缩放。布局未知或包含不明确补边的输入不纳入标准拼接输入支持范围。拆分适配不允许复用旧整图 resize 路径。
 
 批请求逐项执行相同规则；不同样本可能选择不同宽高比桶。沿用模型支持的变长空间输入组装方式，或按目标尺寸分组执行，不能为了拼 batch 再对整图 resize / padding。单请求和批请求中同一样本的空间输入应一致。
-
-### 其他直接调用方的布局
-
-AgiBot 的三视图规则不自动推广到所有数据源。DROID 训练当前是 wrist 在上、两个外部相机在下；LIBERO 训练当前是 third-person 在左、wrist 在右，两个相机均为完整大小。调整这些训练调用方时保留相机含义和拼接顺序，以其主要相机原始宽高选目标，各相机在拼接前完成缩放。
-
-来源布局必须显式指定，不仅凭 `viewpoint="concat_view"` 判断相机排列。LIBERO 横向布局的最终尺寸为 `2W×H`，不套用 AgiBot 的 `W×(H+H//2)` 尺寸表。相关训练调用检查不扩展为旧 policy 服务端的迁移或验收。
 
 ### 当前配置产生的尺寸
 
@@ -173,7 +167,7 @@ image_size = torch.tensor(
 - `VideoViewConfig` 增加 resolution 配置；在现有 `_VideoLayout.sizes_to_resize` 中先选择 head 目标，再复用已有腕部半尺寸规则。
 - `_prepare_pyav_resized` 把目标尺寸直接传给现有解码接口；`_prepare_legacy` 使用实际 RGB head 尺寸选桶，在原 resize 循环中处理 head 和腕部。
 - `_get_layout`、相机映射、`_compose_prepared` 保持原实现。同尺寸 RGB 在配置档位时跳过插值。
-- 不新增 resize / 准备 / 已准备图像校验函数，不提前增加 DROID / LIBERO 专用布局。相关来源适配及推理输入校验随提交 2 的实际调用方实现。
+- 不新增 resize / 准备 / 已准备图像校验函数，不提前增加 DROID / LIBERO 专用布局。AgiBot / EgoSuite 接入及推理输入校验随提交 2 实现；旧来源不迁移。
 - 在已有 `video_view_test.py` 中验证读取与 RGB 准备，不修改已有插值方式。
 
 **提交边界：** 只扩展已有准备能力，训练工厂和推理入口尚未切换。本阶段配置的默认 `resolution=None` 让尚未接入的调用方保持现状；提交 2 接入明确档位后去掉此过渡默认，不作为最终的新旧行为开关。
@@ -195,7 +189,7 @@ image_size = torch.tensor(
 #### 修改范围
 
 - AgiBot / EgoSuite 暴露来源默认 video_view；工厂将明确的 resolution 经已有 video_view 参数传入，不给 Segment Reader 新增独立字段。
-- DROID / LIBERO 的直接调用方将空间准备放到逐相机读取阶段；来源特有布局和 action 语义保持明确。
+- 旧 Dataset 不迁移；共享 adapter 签名变化所涉及的旧工厂只同步移除无效参数，不新增布局或 resize。
 - 删除 `ActionTransformPipeline` 的空间变换，统一填写 `image_size=[H,W,H,W]`，同步调整 adapter / 训练工厂 / 通用推理调用签名。
 - 通用 action 推理适配 ego、标准 concat 拆分和已准备输入；更新顶层参数转发及使用示例。
 - 共用 formatter 使用实际尺寸宽高比；训练与推理统一空间字段、布局描述及基于最终尺寸的模型档位处理。
@@ -285,4 +279,64 @@ LD_LIBRARY_PATH='' TORCH_DEVICE_BACKEND_AUTOLOAD=0 OMP_NUM_THREADS=2 \
   --confcutdir=cosmos_framework/data/generator/action \
   cosmos_framework/data/generator/action/video_view_test.py \
   cosmos_framework/data/generator/action/transforms_test.py -q --tb=short --disable-warnings
+```
+
+## 9. 提交 2 实施记录
+
+本阶段经用户 Review 后授权提交，只接入 AgiBot / EgoSuite。复用提交 1 的选桶、读取 resize 和 RGB 拼接，没有新增空间准备函数或旧来源布局。
+
+- 工厂按来源用 `replace(default_video_view, resolution=resolution)` 构造配置，经已有 `video_view` 参数和 `Pool(8)` 传入 Reader。直接构造来源 Reader 默认使用 `256`；训练工厂显式传入其配置档位（工厂默认 `480`）。不支持的档位在配置初始化时报错。
+- `ActionTransformPipeline` 和推理 `build_action_batch` 不再对 RGB 做空间变换，只填写 `[H,W,H,W]`。Adapter 移除原来的 resolution 传递，时间处理、state / action / mask 和统计归一化不变。
+- 通用推理按明确的 `ego_view` / 标准 AgiBot `concat_view` 准备相机，复用 `VideoViewConfig.compose`；`action_video_prepared=true` 校验目标尺寸后直接透传。该字段声明输入是否已准备，不选择旧的补边行为。
+- action 推理要求显式提供 `image_size=256` 或 `480`，删除三个 action 默认 JSON 中独立的 `256` 默认值；顶层入口转发已准备标记。多个输出各自携带对应的 `image_size`。
+- Prompt 使用最终图像实际宽高比和来源布局描述；例如 AgiBot `480` 的最终尺寸为 `640×720`，宽高比为 `8:9`。
+
+### 推理输入示例
+
+在现有 action 输入 JSON 中明确填写以下字段（其余模型、媒体路径和 action 参数沿用当前入口）：
+
+```json
+{
+  "image_size": 480,
+  "view_point": "concat_view",
+  "action_video_prepared": false,
+  "shift": 5.0
+}
+```
+
+EgoSuite 使用 `view_point="ego_view"`。标准无补边 AgiBot concat 图作为待处理输入，上方 `2/3` 是 head、下方两半是 wrists；如果媒体已经按目标尺寸准备好，改为 `action_video_prepared=true`，空间像素直接透传。
+
+`shift` 是独立的采样参数，本阶段不重写 sampler。当前 Edge 训练 recipe 对模型 `256` / `480` 档分别使用 `3` / `5`；上例使用相机 `480` 档，最终图像归为模型 `480` 档，因此显式填写 `5`，覆盖 action 默认的 `10`。相机 `256` 档的 concat 仍可能归为模型 `480` 档，需要按最终图像和 checkpoint recipe 选择 shift，而不能仅按相机档位设置。
+
+### 已执行验证
+
+- CPU 训练读取与 transform 相关测试 **199 项通过**，覆盖 VideoView、transform、causal block adapter 和 Segment Reader；action 推理及参数测试 **17 项通过**。
+- 从本地真实 AgiBot / EgoSuite v3 数据构造 Reader，经真实 `Pool(8)` 返回到主进程，读取视频、应用 transform；将 PNG 媒体交给真实 `read_media_frames` 和通用 action 推理准备，核对最终尺寸、dtype 和完整有效区域。
+- 另外直接调用 `get_causal_action_dataset`，两档都完成真实 `Pool(8)`、来源分组、`CausalActionSFTDataset` 取样，再与已准备 PNG 的推理空间元数据核对。该预处理 smoke 显式使用 mock placeholder 统计，不据此声称真实统计或完整模型验证通过。
+- AgiBot 原始 head 与两腕均为 `640×480`：相机 `480` 档最终 `640×720`，`256` 档最终 `320×384`。EgoSuite 原始 head 为 `960×728`：最终分别为 `640×480` 和 `320×256`。
+- 已准备输入透传、两档 ego / concat、视图顺序、时间补齐 / 截断、批输出空间元数据和 prompt 均有相关测试。不同解码插值方式没有要求逐像素一致。
+- 验证图像保存在 `/tmp/action_resize_stage2/`，没有修改原始数据。本阶段没有运行 VAE、完整训练优化步骤或 checkpoint 推理；这些仍属于提交 3 的完整链路验证。
+
+功能 lint 与 Markdown 格式检查通过，`git diff --check` 通过。保留三处既有 import 排列，相关文件 lint 忽略原有 `I001`；`args.py` / `args_test.py` 的既有无关格式差异未重写。
+
+本地环境的可选 `torch_npu` 无法加载 `libhccl.so`，直接扩展运行整组 inference 测试会在原有模型导入处失败；这与 action 空间预处理测试结果分开记录，没有修改环境依赖或扩大本次实现范围。
+
+执行 CPU 功能测试：
+
+```bash
+LD_LIBRARY_PATH='' TORCH_DEVICE_BACKEND_AUTOLOAD=0 OMP_NUM_THREADS=2 \
+  /mnt/sfs_turbo/public/apps/miniforge3/envs/cosmos-framework-py312/bin/python -m pytest \
+  --confcutdir=cosmos_framework/data/generator/action \
+  cosmos_framework/data/generator/action/video_view_test.py \
+  cosmos_framework/data/generator/action/transforms_test.py \
+  cosmos_framework/data/generator/action/block_state_test.py \
+  cosmos_framework/data/generator/action/datasets/segment_lerobot_dataset_test.py \
+  -q --tb=short --disable-warnings
+
+LD_LIBRARY_PATH='' TORCH_DEVICE_BACKEND_AUTOLOAD=0 OMP_NUM_THREADS=2 \
+  /mnt/sfs_turbo/public/apps/miniforge3/envs/cosmos-framework-py312/bin/python -m pytest \
+  --confcutdir=cosmos_framework/inference \
+  cosmos_framework/inference/inference_test.py \
+  cosmos_framework/inference/args_test.py \
+  -k action -q --tb=short --disable-warnings
 ```
