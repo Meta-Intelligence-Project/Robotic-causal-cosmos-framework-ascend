@@ -6,7 +6,7 @@
 The base ``DROIDLeRobotDataset.__getitem__`` returns the raw sample
 (``video``/``action``/``ai_caption``/``viewpoint``/``mode``/``domain_id``/
 ``idle_frames``). The model expects each sample to be passed through
-``ActionTransformPipeline`` (spatial resize/pad, text tokenization, action
+``ActionTransformPipeline`` (spatial metadata, text tokenization, action
 padding to ``max_action_dim``, and ``sequence_plan`` construction). This thin
 wrapper composes the two so the experiment can hand a single map-style dataset
 to ``RankPartitionedDataLoader`` (mirroring how the vision recipe uses
@@ -28,17 +28,16 @@ from cosmos_framework.data.generator.action.transforms import ActionTransformPip
 class ActionSFTDataset(Dataset):
     """Wraps a map-style action dataset and applies ``ActionTransformPipeline`` per sample."""
 
-    def __init__(self, dataset: Dataset, transform: ActionTransformPipeline, resolution: str | int | None):
+    def __init__(self, dataset: Dataset, transform: ActionTransformPipeline):
         super().__init__()
         self._dataset = dataset
         self._transform = transform
-        self._resolution = resolution
 
     def __len__(self) -> int:
         return len(self._dataset)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
-        return self._transform(self._dataset[idx], self._resolution)
+        return self._transform(self._dataset[idx])
 
     def get_shuffle_blocks(self):
         """Delegate to the inner DROIDLeRobotDataset (per-episode/segment flat-index blocks)."""
@@ -146,7 +145,7 @@ def get_action_droid_sft_dataset(
         append_idle_frames=append_idle_frames,
         format_prompt_as_json=format_prompt_as_json,
     )
-    sft = ActionSFTDataset(dataset, transform, resolution)
+    sft = ActionSFTDataset(dataset, transform)
     if iterable_shuffle:
         return ActionIterableShuffleDataset(sft, seed=episode_shuffle_seed)
     return sft
@@ -207,7 +206,7 @@ def get_action_droid_merged_lerobot_sft_dataset(
         idle_frames_dropout=idle_frames_dropout,
         format_prompt_as_json=format_prompt_as_json,
     )
-    sft = ActionSFTDataset(dataset, transform, resolution)
+    sft = ActionSFTDataset(dataset, transform)
     if iterable_shuffle:
         return ActionIterableShuffleDataset(sft, seed=episode_shuffle_seed)
     return sft
@@ -278,7 +277,7 @@ def get_action_libero_sft_dataset(
         append_idle_frames=append_idle_frames,
         format_prompt_as_json=format_prompt_as_json,
     )
-    sft = ActionSFTDataset(dataset, transform, resolution)
+    sft = ActionSFTDataset(dataset, transform)
     if iterable_shuffle:
         return ActionIterableShuffleDataset(sft, seed=episode_shuffle_seed)
     return sft

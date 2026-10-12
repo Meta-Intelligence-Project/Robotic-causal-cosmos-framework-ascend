@@ -36,6 +36,7 @@ class AgiBotSegmentLeRobotDataset(SegmentLeRobotDataset):
     """
 
     default_read_options = _DEFAULT_READ_OPTIONS
+    default_video_view = VideoViewConfig(cameras=_CAMERA_MAPPING)
 
     def __init__(
         self,
@@ -47,5 +48,5 @@ class AgiBotSegmentLeRobotDataset(SegmentLeRobotDataset):
     ):
         # 配置只声明来源相机映射；每次读取由显式 viewpoint 选择布局。
         if video_view is None:
-            video_view = VideoViewConfig(cameras=_CAMERA_MAPPING.copy())
+            video_view = self.default_video_view
         super().__init__(read_options=read_options, video_view=video_view, viewpoint=viewpoint, **kwargs)

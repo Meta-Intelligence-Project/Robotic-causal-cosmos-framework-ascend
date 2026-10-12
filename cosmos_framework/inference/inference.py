@@ -662,6 +662,7 @@ def get_sample_data(
             domain_name=sample_args.domain_name,
             view_point=sample_args.view_point,
             resolution=str(sample_args.image_size),
+            action_video_prepared=sample_args.action_video_prepared,
             action_chunk_size=sample_args.action_chunk_size,
             max_action_dim=model.config.max_action_dim,
             fps=sample_args.fps,

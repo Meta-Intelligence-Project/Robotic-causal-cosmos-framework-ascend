@@ -246,7 +246,7 @@ def test_sft_adapter_uses_fixed_geometry_and_template(mode):
     )
 
     dataset = CausalActionSFTDataset(
-        ActionSFTDataset(reader, transform, "256"), mode=mode, statistics=statistics(raw, planner)
+        ActionSFTDataset(reader, transform), mode=mode, statistics=statistics(raw, planner)
     )
     result = dataset[0]
     plan = result["sequence_plan"]

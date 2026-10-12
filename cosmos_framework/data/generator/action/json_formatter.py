@@ -9,7 +9,6 @@ import torch
 
 from cosmos_framework.utils import log
 from cosmos_framework.data.generator.action.viewpoint_utils import DEFAULT_VIEWPOINT_TEMPLATES
-from cosmos_framework.data.generator.utils import VIDEO_RES_SIZE_INFO
 
 
 def _should_append_idle_frame_info(mode: object) -> bool:
@@ -113,12 +112,7 @@ class ActionPromptJsonFormatter:
         return f"{minutes}:{remaining_seconds:02d}"
 
     def _get_aspect_ratio(self, width: int, height: int) -> str:
-        """Return the canonical width,height aspect ratio string when known."""
-        for aspect_ratio_sizes in VIDEO_RES_SIZE_INFO.values():
-            for aspect_ratio, (candidate_w, candidate_h) in aspect_ratio_sizes.items():
-                if width == candidate_w and height == candidate_h:
-                    return aspect_ratio
-
+        """Return the reduced aspect ratio of the actual image dimensions."""
         divisor = math.gcd(width, height)
         if divisor == 0:
             raise ValueError(
@@ -147,7 +141,7 @@ class ActionPromptJsonFormatter:
         return template
 
     def _get_resolution(self, data_dict: dict) -> tuple[int, int]:
-        """Resolve ``(height, width)`` from the post-padding image size."""
+        """Resolve ``(height, width)`` from the actual image size."""
         image_size = data_dict.get(self.image_size_key)
         if image_size is None:
             raise ValueError(f"ActionPromptJsonFormatter: missing '{self.image_size_key}' in data_dict.")
