@@ -272,3 +272,25 @@ causal action 训练和统计脚本默认使用 `table_backend="parquet"`：直�
 没有跨样本文件 LRU。初始化保留元数据、行号索引，首次取样后保留原有数据集级 mask；每次读取后只留下样本数据，释放文件级表格，并在当前读取进程调用 `pa.default_memory_pool().release_unused()`，尝试将空闲 Arrow 内存归还操作系统。每个窗口调用一次，跨文件也只调用一次。该操作增加释放与后续重新分配的开销，不保证 RSS 全部归还；内存峰值仍包含单个文件必要列的解压结果，并会随并行 worker 数增加。连续访问同一文件会重复解压，吞吐需在实际存储上测量。视频后端与采样、归一化规则不变，其他非 causal action 数据集仍沿用原路径。
 
 训练 TOML 的 `[action].table_backend = "parquet"` 显式选择默认表格后端。需要对照旧实现时，将其改为 `"hf"`；`sources/*.json` 中对应 source 的同名字段优先于 TOML，可单独覆盖。统计脚本默认直接读取 Parquet，不读取训练 TOML。旧后端仍会生成磁盘缓存；切换后端不会自动删除历史缓存。
+
+## Action 图像尺寸与离线推理
+
+训练的 `[action].resolution` 表示相机目标档位，支持 `"256"` / `"480"`。读取时按 head 原始宽高从 `ACTION_RES_SIZE_INFO` 选尺寸：head 缩放到 `W×H`，AgiBot 两腕各缩放到 `(W//2)×(H//2)`，再拼接 RGB；EgoSuite ego 只使用 head。拼接后的图像直接进入 VAE，不再整图 resize 或补边。
+
+例如 AgiBot 原始 head 为 `640×480` 时，`480` 档最终为 `640×720`，`256` 档最终为 `320×384`。Prompt 的 resolution / aspect_ratio 描述最终图像，空间元数据为 `[H,W,H,W]`。
+
+离线 causal action 推理读取相同的来源清单并复用训练工厂。使用训练得到的 checkpoint，明确传入与训练相同的相机档位：
+
+```bash
+export CHECKPOINT_ROOT="$OUTPUT_ROOT/cosmos3_action/midtrain/action_causal_midtrain_edge/checkpoints/iter_000000002"
+
+OUTPUT_ROOT="$RUN_DIR/inference_agibot" SOURCE_INDEX=0 MODE=policy \
+  bash examples/action_pretrain/inference_causal_action.sh \
+  --resolution 480 --decode-video
+```
+
+将 checkpoint 路径中的 iteration 换成实际保存的步数；上例的 `480` 对应当前训练 TOML。混合清单中的 `SOURCE_INDEX=1` 选择 EgoSuite。`actions-per-block` / `video-stride` 需与训练保持一致，推理输出保存到新的目录。
+
+通用媒体 action 推理入口使用 `image_size=256/480` 表示同一相机档位，并显式设置 `view_point`。`ego_view` 输入单相机媒体；标准 AgiBot `concat_view` 输入上方 head 占 `2/3` 高度、下方左右腕占 `1/3` 高度的无补边媒体。输入已按目标规则准备好时设置 `action_video_prepared=true`，校验尺寸后直接透传。该标记只用于通用媒体入口，causal action CLI 直接从来源 Reader 准备图像。
+
+本地 resize 完整链路的验证范围、结果和未执行项见 [实施记录](../../docs/action_resize_implementation_plan_zh.md#10-提交-3-实施记录)。

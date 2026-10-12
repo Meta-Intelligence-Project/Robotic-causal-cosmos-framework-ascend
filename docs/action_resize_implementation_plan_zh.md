@@ -340,3 +340,91 @@ LD_LIBRARY_PATH='' TORCH_DEVICE_BACKEND_AUTOLOAD=0 OMP_NUM_THREADS=2 \
   cosmos_framework/inference/args_test.py \
   -k action -q --tb=short --disable-warnings
 ```
+
+## 10. 提交 3 实施记录
+
+### 清理范围
+
+删除已无调用的 `VideoResize` 类、其 `_log_shapes` 方法及只服务该类的 import。更新 `transforms.py` 模块说明，明确当前 action pipeline 保留读取端准备好的空间尺寸；移除指向已不存在的 `unified_dataset` 的说明。
+
+全仓检查后保留以下实际使用的能力：
+
+- `find_closest_target_size`：action 相机准备和 LIBERO policy 服务端仍使用，保留原位置。
+- `reflection_pad_to_target` / `remove_reflection_padding`：LIBERO 服务端仍在调用，并有已有往返测试；本次不迁移该服务端。
+- 模型共享 `_remove_padding_from_latent` 和 latent patch 补齐：继续服务通用模型，不修改。本次 action 的有效区域等于整幅图像。
+
+补充 `examples/action_pretrain/README.md` 的空间尺寸与推理示例，明确训练档位、causal Reader 推理与通用媒体推理入口的参数区别。没有改旧 Dataset、服务端或 VAE 编译预热形状。
+
+### 两档真实数据与 VAE 验证
+
+输出目录：`/mnt/sfs_turbo/zheng/cosmos-ascend-profile/outputs/action_resize_stage3_20261012`。
+
+- AgiBot：`agibot_processed/v0/task_376/canonical_55d`，启用 subtask，目标读取 `state[t+1]`，使用该子集已有的完整实测统计。
+- EgoSuite：`EgoStandard-body__Adhesive_Roller_Paper_Roll_Replacement`，启用 subtask，读取预处理后的 action。为本次 smoke 从 16 个真实片段拟合统计，明确标记 `partial=true`；不将这份统计当作生产全量统计，也不修改原始数据。
+- 每片段 32 action、33 原始 observation，读取时 stride=4，VAE 输入 9 帧、FPS=7.5。核对 action 帧索引长度、prompt 实际尺寸及宽高比、模型档位、完整有效区域，并将已准备 PNG 交给真实媒体推理入口核对首帧透传。
+- 在 NPU 上使用本地 Wan2.2 VAE 权重、`encode_exact_durations=[9]` 和与模型一致的 `uint8 / 127.5 - 1` 归一化，执行编码与解码。以下全部是实测结果；解码尺寸恢复到输入尺寸，latent / RGB 均为有限值。
+
+| 来源     | 相机档位 | 输入 C×T×H×W | Latent B×C×T×H×W | 视觉 token | Packing 估算（不含文本） |
+| -------- | -------- | ------------ | ---------------- | ---------- | ------------------------ |
+| AgiBot   | 256      | 3×9×384×320  | 1×48×3×24×20     | 360        | 753                      |
+| EgoSuite | 256      | 3×9×256×320  | 1×48×3×16×20     | 240        | 513                      |
+| AgiBot   | 480      | 3×9×720×640  | 1×48×3×45×40     | 1380       | 2793                     |
+| EgoSuite | 480      | 3×9×480×640  | 1×48×3×30×40     | 900        | 1833                     |
+
+视觉 token 按实际 latent 空间尺寸与现有 `2×2` patch 计算，包含全部 3 个 latent 帧。AgiBot `480` 的 latent 高度 45 会由网络补齐为 46，计算使用 `ceil(45/2)`；没有增加 RGB 补边。Packing 估算调用现有 `JointDataLoader._compute_num_tokens_per_sample`，包含 causal clean vision 和 action 等项；表中明确不含文本，不能与训练日志的完整 token 总数直接比较。
+
+实际调用模型 `_remove_padding_from_latent` 后，4 组 latent 均保持原尺寸和数值。VAE 输入首帧、重建首帧分别保存为 `*_vae_input.png`、`*_vae_reconstruction.png`，详细数据为 `spatial_metadata.json` 和 `vae_verification.json`。
+
+### 本地短训练
+
+使用当前 `action_midtrain_edge_causal_tnd.toml`、本地 Cosmos3-Edge DCP 和两条真实来源，在 NPU 0–3 执行 `480` 档两步训练。只为 smoke 覆盖片段长度、历史长度、worker、单样本批大小和保存间隔；保留正常模型、optimizer、前后向和更新流程。
+
+- rank 0 第 1 步：EgoSuite / policy，loss `23.2093`，vision loss `0.79957`，action loss `1.52136`。
+- rank 0 第 2 步：AgiBot / inverse_dynamics，loss `13.5043`，action loss `1.35043`。
+- 两步 `state2llm`、`action2llm`、`llm2action` 梯度范数均为有限非零值，完成 optimizer 更新。四个 rank 均完成两步；rank 0 峰值约 `10.49 GiB`。
+- 正常退出并保存 `train_480/cosmos3_action/midtrain/action_causal_midtrain_edge/checkpoints/iter_000000002`。
+
+启动参数（先激活现有 PyTorch/CANN 环境，配置本地模型路径与本目录 `sources.json`）：
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NPROC_PER_NODE=4 \
+  OUTPUT_ROOT="$RUN_DIR/train_480" \
+  bash examples/action_pretrain/launch_midtrain_action_causal.sh \
+  trainer.max_iter=2 checkpoint.save_iter=2 \
+  data_setting.action.max_action_steps=32 data_setting.action.overlap_action_steps=0 \
+  data_setting.action.resolution=480 model.config.teacher_forcing_history_blocks_max=1 \
+  dataloader_train.max_sequence_length=null dataloader_train.max_samples_per_batch=1 \
+  dataloader_train.dataloader.num_workers=1
+```
+
+首次启动时同时设置了 token 预算和单样本批大小，触发已有互斥检查；已改为上述单样本参数重新执行。初次日志单独保留为 `train_first_attempt.log`，成功运行记录在 `train_console.log`。没有为此修改框架。
+
+### 对应 checkpoint 的真实推理
+
+使用上述两步训练保存的 checkpoint，在 NPU 5 分别执行 AgiBot / EgoSuite 的 causal action policy 推理。通过现有 `inference_causal_action.sh` 从同一 `sources.json` 读取真实片段，启用 KV cache，执行 2 步采样、guidance=1 和 VAE 解码。使用默认 sampler shift=5，与本次 `480` 档训练一致；没有使用预览或模拟模型。
+
+- AgiBot：生成 action `32×55`、latent `1×48×3×45×40`，实际解码视频 9 帧、`640×720`。
+- EgoSuite：生成 action `32×55`、latent `1×48×3×30×40`，实际解码视频 9 帧、`640×480`。
+- 两组 action / latent 均为有限值，输出 prompt 分辨率及宽高比分别为 `640×720 / 8:9`、`640×480 / 4:3`。两个进程均正常退出；验证为当前块生成，不包含环境执行反馈或后续块 rollout。
+
+推理参数（沿用训练来源清单、本地 processor / VAE 路径及上述 checkpoint）：
+
+```bash
+for source_index in 0 1; do
+  ASCEND_RT_VISIBLE_DEVICES=5 COSMOS_DEVICE=npu \
+    SOURCE_INDEX="$source_index" MODE=policy NUM_STEPS=2 GUIDANCE=1 \
+    MAX_ACTION_STEPS=32 OVERLAP_ACTION_STEPS=0 HISTORY_BLOCKS=1 \
+    OUTPUT_ROOT="$RUN_DIR/inference_source_${source_index}_480" \
+    bash examples/action_pretrain/inference_causal_action.sh \
+    --resolution 480 --decode-video
+done
+```
+
+每组输出包含 `metrics.json`、`prompt.json`、`sample.pt` 和 `video.mp4`。实际读取保存的 Tensor 和解码 MP4 核对形状与有限值，结果记录为 `inference_verification.json`；运行日志为 `inference_source_0_480.log`、`inference_source_1_480.log`。
+
+### 功能测试与验收边界
+
+- 清理后 CPU 训练读取 / transform 相关测试 **199 项通过**，action 推理 / 参数测试 **17 项通过**。
+- 使用已有 CANN 环境扩展运行 inference / args 测试（排除远程 checkpoint 检查），**43 项通过、1 项失败**。失败为已有 reasoner 测试在 CPU 版 PyTorch 中创建 CUDA tensor，超出本次 action 范围；没有修改测试实现或放宽断言。
+- `256` 档完成真实预处理和 VAE 编解码，没有执行完整训练或 checkpoint action 推理。`480` 档完成上述两步训练及两条来源的 checkpoint policy 推理。
+- 真实短训练与少步推理验证链路能运行，不评价动作质量或长片段效果。未更新数值回归基线；VAE AOT 形状扩展仍为可选后续工作。

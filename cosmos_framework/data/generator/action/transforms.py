@@ -3,15 +3,9 @@
 
 """Dataset transform wrappers for the Action project.
 
-This module provides the ``ActionTransformPipeline`` and spatial padding utilities.
-
-The reflection padding snaps each sample to the closest predefined resolution from
-``VIDEO_RES_SIZE_INFO`` (matching VFM's approach), guaranteeing a bounded set of
-output shapes that are all multiples of 16.
-
-See :func:`~.unified_dataset.wrap_dataset` for the convenience factory that
-combines datasets with transforms, and :class:`~.unified_dataset.MapToIterableAdapter`
-for the map-to-iterable wrapper.
+This module provides the ``ActionTransformPipeline`` and shared spatial helpers.
+Camera resize and composition are completed before the pipeline, which preserves
+the input spatial dimensions. Padding helpers remain for the LIBERO policy server.
 """
 
 from __future__ import annotations
@@ -19,7 +13,6 @@ from __future__ import annotations
 import torch
 import torchvision.transforms.functional as transforms_F
 
-from cosmos_framework.utils import log
 from cosmos_framework.data.generator.action.action_processing import (
     ActionNormalizer,
     ActionProcessor,
@@ -32,7 +25,6 @@ from cosmos_framework.data.generator.augmentors.resolution_text_info import Reso
 from cosmos_framework.data.generator.augmentors.text_tokenizer import TextTokenizerTransform
 from cosmos_framework.data.generator.utils import VIDEO_RES_SIZE_INFO
 from cosmos_framework.data.generator.sequence_packing import SequencePlan
-from cosmos_framework.utils.generator.data_utils import get_vision_data_resolution
 
 
 def _should_append_idle_frame_info(mode: object) -> bool:
@@ -363,67 +355,6 @@ def build_sequence_plan_from_mode(
         condition_frame_indexes_action=condition_frame_indexes_action,
         action_start_frame_offset=action_start_frame_offset,
     )
-
-
-class VideoResize:
-    """Resize and reflection-pad video-aligned tensors for a single sample.
-
-    Resolution is supplied at call time. When ``resolution`` is ``None``, the
-    tier is auto-detected from the sample's ``"video"`` spatial dimensions.
-
-    Args:
-        pad_keys: Data-dict keys whose values should be resized and padded.
-            Pass an empty list to disable padding entirely. Defaults to
-            ``["video"]``.
-        keep_aspect_ratio: Whether to resize aspect-preservingly to the closest
-            predefined target size before padding. Defaults to ``True``.
-        log_prefix: Prefix used in debug logging.
-    """
-
-    def __init__(
-        self,
-        pad_keys: list[str] | None = None,
-        keep_aspect_ratio: bool = True,
-        log_prefix: str = "VideoResize",
-    ) -> None:
-        self.pad_keys = pad_keys if pad_keys is not None else ["video"]
-        self.keep_aspect_ratio = keep_aspect_ratio
-        self.log_prefix = log_prefix
-
-    def __call__(self, data_dict: dict, resolution: str | int | None) -> dict:
-        """Resize and pad a sample in-place.
-
-        Args:
-            data_dict: Sample dictionary containing a ``"video"`` entry.
-            resolution: Resolution tier key (e.g. ``"256"``, ``"480"``,
-                ``"720"``). When ``None``, auto-detected from video dimensions.
-
-        Returns:
-            The same dictionary, mutated in-place with padded tensors and an
-            ``"image_size"`` entry.
-        """
-        video = data_dict.get("video")
-        assert isinstance(video, torch.Tensor), "video is required for reflection padding"
-        h, w = video.shape[-2:]
-
-        if resolution is None:
-            resolution = get_vision_data_resolution((h, w))
-
-        if self.keep_aspect_ratio:
-            target_w, target_h = find_closest_target_size(h, w, resolution)
-        else:
-            target_w = int(resolution)
-            target_h = int(resolution)
-        reflection_pad_to_target(data_dict, self.pad_keys, self.keep_aspect_ratio, target_w, target_h)
-
-        return data_dict
-
-    def _log_shapes(self, data_dict: dict, when: str) -> None:
-        """Log tensor shapes for the configured pad keys."""
-        for key in self.pad_keys:
-            val = data_dict.get(key)
-            if isinstance(val, torch.Tensor):
-                log.debug(f"{self.log_prefix}: {when} padding '{key}' shape = {tuple(val.shape)}")
 
 
 class ActionTransformPipeline:
