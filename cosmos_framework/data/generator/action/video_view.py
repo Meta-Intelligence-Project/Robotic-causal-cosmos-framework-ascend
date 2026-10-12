@@ -7,6 +7,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
+from cosmos_framework.data.generator.utils import ACTION_RES_SIZE_INFO
+
 
 @dataclass(frozen=True)
 class _VideoLayout:
@@ -19,9 +21,18 @@ class _VideoLayout:
     def roles(self) -> tuple[str, ...]:
         return tuple(dict.fromkeys(role for row in self.rows for role in row))
 
-    def sizes_to_resize(self, height: int, width: int) -> dict[str, tuple[int, int]]:
+    def sizes_to_resize(
+        self, height: int, width: int, resolution: str | int | None = None
+    ) -> dict[str, tuple[int, int]]:
+        if resolution is not None:
+            from cosmos_framework.data.generator.action.transforms import find_closest_target_size
+
+            width, height = find_closest_target_size(height, width, resolution, size_info=ACTION_RES_SIZE_INFO)
         # A role absent here keeps its original pixels on the legacy path.
-        return self.resize_targets(height, width) if self.resize_targets is not None else {}
+        sizes = self.resize_targets(height, width) if self.resize_targets is not None else {}
+        if resolution is not None:
+            sizes["head"] = (height, width)
+        return sizes
 
 
 def _concat_resize_targets(height: int, width: int) -> dict[str, tuple[int, int]]:
@@ -84,6 +95,7 @@ class VideoViewConfig:
     """相机角色映射与布局名称分开配置；布局由调用方显式传入，缺失相机或文件直接报错。"""
 
     cameras: Mapping[str, str]  # 布局中的 head/left/right → 来源视频字段。
+    resolution: str | int | None = None
 
     def camera_roles(self, viewpoint):
         """每种布局明确声明需要的相机，不由行列数量推断。"""
@@ -148,12 +160,14 @@ class VideoViewConfig:
         for role in layout.roles:
             key = self.cameras[role]
             video = frames[key]
-            if video.ndim != 4 or video.shape[:2] != (count, 3):
+            if video.ndim != 4 or video.shape[:2] != (count, 3) or min(video.shape[-2:]) <= 0:
                 raise ValueError(f"Camera {key} must have shape [{count},3,H,W]")
             prepared[role] = video
-        # Keep actual decoded dimensions and the original float interpolation order.
+        # Select target sizes from the actual decoded head dimensions.
         height, width = prepared["head"].shape[-2:]
-        for role, size in layout.sizes_to_resize(height, width).items():
+        for role, size in layout.sizes_to_resize(height, width, self.resolution).items():
+            if self.resolution is not None and prepared[role].shape[-2:] == size:
+                continue
             prepared[role] = F.interpolate(prepared[role], size=size, mode="bilinear", align_corners=False)
         return prepared
 
@@ -170,7 +184,7 @@ class VideoViewConfig:
         height, width = shape[names.index("height")], shape[names.index("width")]
         if any(type(size) is not int or size <= 0 for size in (height, width)):
             raise ValueError("Invalid head video dimensions")
-        sizes = {"head": (height, width), **layout.sizes_to_resize(height, width)}
+        sizes = {"head": (height, width), **layout.sizes_to_resize(height, width, self.resolution)}
         episode = meta.episodes[episode_id]
         prepared = {}
         for role in layout.roles:

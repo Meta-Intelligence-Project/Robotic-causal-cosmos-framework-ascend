@@ -40,31 +40,32 @@ def _should_append_idle_frame_info(mode: object) -> bool:
     return mode != "inverse_dynamics"
 
 
-def find_closest_target_size(h: int, w: int, resolution: str | int) -> tuple[int, int]:
+def find_closest_target_size(h: int, w: int, resolution: str | int, size_info=VIDEO_RES_SIZE_INFO) -> tuple[int, int]:
     """Find the closest predefined target size for a given input resolution.
 
-    Looks up ``VIDEO_RES_SIZE_INFO[resolution]`` and selects the aspect ratio
+    Looks up ``size_info[resolution]`` and selects the aspect ratio
     whose ``H/W`` ratio is closest to the input ``h/w``.
 
     Args:
         h: Input height in pixels.
         w: Input width in pixels.
         resolution: Resolution tier key (e.g. ``"256"``, ``"480"``, ``"720"``).
+        size_info: Resolution table; defaults to ``VIDEO_RES_SIZE_INFO``.
 
     Returns:
         ``(target_w, target_h)`` from the predefined table.
 
     Raises:
-        ValueError: If *resolution* is not a key in ``VIDEO_RES_SIZE_INFO``.
+        ValueError: If *resolution* is not a key in *size_info*.
     """
     if isinstance(resolution, int):
         resolution = str(resolution)
-    if resolution not in VIDEO_RES_SIZE_INFO:
+    if resolution not in size_info:
         raise ValueError(
-            f"Resolution '{resolution}' not found in VIDEO_RES_SIZE_INFO. Available: {list(VIDEO_RES_SIZE_INFO.keys())}"
+            f"Resolution '{resolution}' not found in resolution table. Available: {list(size_info.keys())}"
         )
 
-    candidates = VIDEO_RES_SIZE_INFO[resolution]
+    candidates = size_info[resolution]
     input_ratio = h / w
 
     best_key: str | None = None

@@ -80,17 +80,20 @@ def test_same_camera_config_supports_different_sample_layouts():
     assert view.compose(frames, 2, viewpoint="concat_view").shape == (3, 2, 12, 10)
     assert "wrist" not in view.describe(viewpoint="ego_view")
     assert "wrist" in view.describe(viewpoint="concat_view")
-    assert set(vars(view)) == {"cameras"}
+    assert set(vars(view)) == {"cameras", "resolution"}
 
 
+@pytest.mark.parametrize("resolution,target_size", [(None, (8, 11)), (256, (256, 320)), ("480", (480, 640))])
 @pytest.mark.parametrize("viewpoint", ["ego_view", "concat_view"])
 @pytest.mark.parametrize(
     "names,shape", [(["height", "width", "rgb"], [8, 11, 3]), (["rgb", "height", "width"], [3, 8, 11])]
 )
-def test_resized_layout_offsets_and_instance_isolation(tmp_path, monkeypatch, viewpoint, names, shape):
+def test_resized_layout_offsets_and_instance_isolation(
+    tmp_path, monkeypatch, viewpoint, names, shape, resolution, target_size
+):
     from lerobot.datasets import video_utils
 
-    view = VideoViewConfig(cameras={"head": "head", "left": "left", "right": "right"})
+    view = VideoViewConfig(cameras={"head": "head", "left": "left", "right": "right"}, resolution=resolution)
     offsets = {"head": 1000.0, "left": 2000.0, "right": 3000.0}
     meta = SimpleNamespace(
         root=tmp_path,
@@ -118,19 +121,27 @@ def test_resized_layout_offsets_and_instance_isolation(tmp_path, monkeypatch, vi
 
     monkeypatch.setattr(video_utils, "query_videos", query)
     before = view.read(meta, 0, times, viewpoint=viewpoint, tolerance_s=1e-4, video_backend="pyav")
-    result = view.read(meta, 0, times, viewpoint=viewpoint, tolerance_s=1e-4, video_backend="pyav_resize")
+    with monkeypatch.context() as patch:
+
+        def forbidden(*args, **kwargs):
+            pytest.fail("Direct PyAV resize must not interpolate the decoded tensors again")
+
+        patch.setattr("cosmos_framework.data.generator.action.video_view.F.interpolate", forbidden)
+        result = view.read(meta, 0, times, viewpoint=viewpoint, tolerance_s=1e-4, video_backend="pyav_resize")
     after = view.read(meta, 0, times, viewpoint=viewpoint, tolerance_s=1e-4, video_backend="pyav")
     assert torch.equal(before, after) and len(legacy_calls) == 2
     assert result.dtype == torch.uint8
-    assert result.shape == (3, 3, 8 if viewpoint == "ego_view" else 12, 11)
-    assert (result[:, :, :8] == 0).all()
+    h, w = target_size
+    assert result.shape == (3, 3, h if viewpoint == "ego_view" else h + h // 2, w)
+    assert before.shape == result.shape
+    assert (result[:, :, :h] == 0).all()
     if viewpoint == "concat_view":
-        assert (result[:, :, 8:, :5] == 1).all()
-        assert (result[:, :, 8:, 5:] == 2).all()
+        assert (result[:, :, h:, : w // 2] == 1).all()
+        assert (result[:, :, h:, w // 2 :] == 2).all()
     for key, shifted, tolerance, backend, height, width in calls:
         assert shifted == [offsets[key] + t for t in times]
         assert tolerance == 1e-4 and backend == "pyav_resize"
-        assert (height, width) == {"head": (8, 11), "left": (4, 5), "right": (4, 6)}[key]
+        assert (height, width) == {"head": (h, w), "left": (h // 2, w // 2), "right": (h // 2, w - w // 2)}[key]
     assert [call[0] for call in calls] == list(view.camera_roles(viewpoint))
 
 
@@ -316,3 +327,63 @@ def test_prepared_layout_rejects_invalid_inputs(error):
         frames["left"] = torch.zeros(shape)
     with pytest.raises(TypeError if error == "dtype" else ValueError):
         module._compose_prepared(frames, 2, module._get_layout("concat_view"))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.uint8])
+@pytest.mark.parametrize(
+    "resolution,source_size,target_size",
+    [
+        ("256", (240, 240), (256, 256)),
+        (256, (240, 320), (256, 320)),
+        ("256", (320, 240), (320, 256)),
+        ("256", (480, 600), (256, 320)),
+        ("256", (600, 480), (320, 256)),
+        ("256", (360, 640), (256, 448)),
+        ("256", (640, 360), (448, 256)),
+        (480, (240, 240), (512, 512)),
+        ("480", (480, 640), (480, 640)),
+        ("480", (640, 480), (640, 480)),
+        ("480", (360, 640), (352, 640)),
+        ("480", (640, 360), (640, 352)),
+    ],
+)
+def test_action_resolution_resizes_cameras_before_composition(dtype, resolution, source_size, target_size):
+    view = VideoViewConfig(cameras={"head": "front", "left": "wrist_l", "right": "wrist_r"}, resolution=resolution)
+    frames = {
+        "front": torch.full((1, 3, *source_size), 10, dtype=dtype),
+        "wrist_l": torch.full((1, 3, 32, 48), 20, dtype=dtype),
+        "wrist_r": torch.full((1, 3, 64, 32), 30, dtype=dtype),
+    }
+    h, w = target_size
+    ego = view.compose({"front": frames["front"]}, 1, viewpoint="ego_view")
+    concat = view.compose(frames, 1, viewpoint="concat_view")
+    assert ego.shape == (3, 1, h, w) and concat.shape == (3, 1, h + h // 2, w)
+    assert ego.dtype == concat.dtype == dtype
+    torch.testing.assert_close(concat[:, :, :h], ego)
+    torch.testing.assert_close(concat[:, :, h:, : w // 2], torch.full((3, 1, h // 2, w // 2), 20, dtype=dtype))
+    torch.testing.assert_close(concat[:, :, h:, w // 2 :], torch.full((3, 1, h // 2, w // 2), 30, dtype=dtype))
+    assert frames["front"].shape[-2:] == source_size
+
+
+def test_action_resolution_does_not_resize_cameras_already_at_target(monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail("Cameras already at their targets must retain their pixels")
+
+    monkeypatch.setattr("cosmos_framework.data.generator.action.video_view.F.interpolate", forbidden)
+    view = VideoViewConfig(cameras={role: role for role in ("head", "left", "right")}, resolution="256")
+    frames = {
+        "head": torch.randint(256, (1, 3, 256, 320), dtype=torch.uint8),
+        "left": torch.randint(256, (1, 3, 128, 160), dtype=torch.uint8),
+        "right": torch.randint(256, (1, 3, 128, 160), dtype=torch.uint8),
+    }
+    result = view.compose(frames, 1, viewpoint="concat_view")
+    assert torch.equal(result[:, :, :256], frames["head"].permute(1, 0, 2, 3))
+    assert torch.equal(result[:, :, 256:, :160], frames["left"].permute(1, 0, 2, 3))
+    assert torch.equal(result[:, :, 256:, 160:], frames["right"].permute(1, 0, 2, 3))
+
+
+@pytest.mark.parametrize("resolution", [720, "unknown"])
+def test_action_resolution_rejects_unsupported_tiers(resolution):
+    view = VideoViewConfig(cameras={"head": "front"}, resolution=resolution)
+    with pytest.raises(ValueError, match="Resolution"):
+        view.compose({"front": torch.zeros(1, 3, 8, 8)}, 1, viewpoint="ego_view")
