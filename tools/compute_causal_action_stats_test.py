@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: OpenMDW-1.1
 """Numerical and population checks for the standalone stride-one statistics tool."""
 
-from dataclasses import replace
-
 import numpy as np
 import pytest
 import torch
@@ -26,7 +24,7 @@ class SyntheticBlocks:
         self.planner = SegmentPlanner(
             max_action_steps=32, overlap_action_steps=31, geometry=CausalBlockGeometry(temporal_compression_factor=4)
         )
-        self.contract = self.template.source_contract("agibot", source="test", info={}, target_semantics="next state")
+        self.split = "train"
         self.episodes = []
         self.index = []
         for episode, length in enumerate((35, 33, 32)):
@@ -58,7 +56,8 @@ class SyntheticBlocks:
             action_target=state[1:],
             state_mask=sm,
             action_mask=am,
-            source_contract=self.contract,
+            source="test",
+            split=self.split,
             conditioning_fps=30.0,
         )
 
@@ -102,7 +101,7 @@ def test_partial_and_validation_split():
         dataset = SyntheticBlocks()
     result = compute_statistics(dataset, method="exact", limit=2)
     assert result.provenance["partial"] and result.provenance["blocks"] == 2
-    dataset.contract = replace(dataset.contract, split="val")
+    dataset.split = "val"
     with pytest.raises(ValueError, match="training split"):
         compute_statistics(dataset)
 
@@ -183,21 +182,19 @@ def test_reservoir_moments_are_full_population_and_ignore_invalid_rows():
     assert acc.summary()["sampled_counts"] == [7, 7]
 
 
-def test_discover_parent_roots_and_deduplicate(tmp_path):
-    import json
-
+def test_discover_parent_roots_and_deduplicate(tmp_path, monkeypatch):
     for name in ["b/nested", "a"]:
         root = tmp_path / name
         (root / "meta").mkdir(parents=True)
         (root / "data").mkdir()
-        (root / "meta/info.json").write_text(json.dumps({"codebase_version": "v3.0"}))
+        (root / "meta/info.json").write_text("")
+    monkeypatch.setattr(
+        "pathlib.Path.read_text", lambda *args, **kwargs: pytest.fail("Discovery must not read metadata")
+    )
     expected = [tmp_path / "a", tmp_path / "b/nested"]
     assert discover_dataset_roots([tmp_path, tmp_path / "a"]) == expected
     with pytest.raises(ValueError, match="No LeRobot"):
         discover_dataset_roots([tmp_path / "a/data"])
-    (tmp_path / "a/meta/info.json").write_text(json.dumps({"codebase_version": "v2.1"}))
-    with pytest.raises(ValueError, match="v3"):
-        discover_dataset_roots([tmp_path])
 
 
 def test_merge_multiple_datasets_and_quaternion_bounds():
@@ -243,7 +240,7 @@ def test_bounds_selection_preserves_measured_statistics_and_quaternions():
 def test_bounds_cli(monkeypatch, value):
     import sys
 
-    argv = ["stats", "--dataset-root", "/unused", "--profile", "egosuite", "--output", "/unused.json"]
+    argv = ["stats", "--dataset-root", "/unused", "--output", "/unused.json"]
     if value is not None:
         argv += ["--bounds", value]
     monkeypatch.setattr(sys, "argv", argv)
@@ -255,8 +252,7 @@ def test_bounds_cli(monkeypatch, value):
 def test_parallel_batches_preserve_episode_anchors_and_limit(monkeypatch, method, offset, from_state):
     from cosmos_framework.data.generator.action.datasets.segment_lerobot_dataset_test import make_reader
 
-    reader, queries = make_reader(monkeypatch, lengths=(39, 38), offset=offset, from_state=from_state)
-    reader.source_contract = replace(reader.source_contract, split="train")
+    reader, queries = make_reader(monkeypatch, lengths=(39, 38), offset=offset, from_state=from_state, split="train")
     reader.planner = SegmentPlanner(max_action_steps=32, overlap_action_steps=31, geometry=reader.planner.geometry)
     reader._segments.clear()
     reader._episode_cum_ends.clear()

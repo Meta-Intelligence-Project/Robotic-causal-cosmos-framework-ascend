@@ -31,7 +31,7 @@ _CAMERA_MAPPING = {"head": _HEAD_KEY, "left": _HAND_LEFT_KEY, "right": _HAND_RIG
 class AgiBotSegmentLeRobotDataset(SegmentLeRobotDataset):
     """处理后 AgiBot：只声明列和相机，不执行 FK、维度重排或归一化。
 
-    template/source_contract/planner 由调用方传入，替换模板无需修改本类。
+    template/planner 由调用方传入，替换模板无需修改本类。
     默认使用原始 action；state 下一步目标需显式传入 read_options。
     """
 

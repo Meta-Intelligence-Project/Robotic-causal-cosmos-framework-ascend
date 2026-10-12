@@ -34,7 +34,7 @@ def test_session_absolute_field_and_history_reset():
         calls.append(kwargs)
         return torch.ones(32, template.width)
 
-    session = CausalActionSession(None, planner, history_blocks=1, template=template)
+    session = CausalActionSession(planner, history_blocks=1, template=template)
     out = session.generate_current_block(**data)
     assert torch.isfinite(calls[0]["state"]).all()
     torch.testing.assert_close(calls[0]["action_mask"], data["action_mask"])
@@ -47,7 +47,7 @@ def test_session_absolute_field_and_history_reset():
         session.generate_current_block(**data)
         assert len(calls[-1]["history"]) == 1
     assert calls[-1]["revision"] == 2
-    fresh = CausalActionSession(None, planner, template=template)
+    fresh = CausalActionSession(planner, template=template)
     fresh.generate_current_block(**data)
     assert calls[-1]["history"] == []
     data["action_mask"][1] = True
@@ -58,7 +58,6 @@ def test_session_absolute_field_and_history_reset():
 
 def test_model_session_decodes_with_current_template():
     template, data = inputs()
-    contract = template.source_contract("agibot", source="test", info={}, target_semantics="absolute")
     planner = SegmentPlanner(
         max_action_steps=32, overlap_action_steps=0, geometry=CausalBlockGeometry(temporal_compression_factor=4)
     )
@@ -71,7 +70,6 @@ def test_model_session_decodes_with_current_template():
         action_target=target,
         state_mask=data["state_mask"],
         action_mask=data["action_mask"],
-        source_contract=contract,
         conditioning_fps=30.0,
     )
     low, high = torch.full((template.width,), -100.0), torch.full((template.width,), 100.0)
@@ -89,6 +87,6 @@ def test_model_session_decodes_with_current_template():
             assert kwargs["causal_block_size"] == 2
             return dict(action=[sample["action"]])
 
-    session = CausalActionSession.for_model(contract, Model(), batch_builder, template=template)
+    session = CausalActionSession.for_model(Model(), batch_builder, template=template)
     decoded = session.generate_current_block(**data)
     torch.testing.assert_close(decoded, target, atol=1e-5, rtol=1e-5)

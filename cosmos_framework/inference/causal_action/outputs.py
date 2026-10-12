@@ -9,7 +9,7 @@ def real_actions(result, batch):
     for i, action in enumerate(result["action"]):
         metadata = batch["sequence_plan"][i].causal_action_metadata
         if metadata is None or metadata.statistics is None or metadata.template is None:
-            raise ValueError("Action export requires its source contract, block anchors and delta statistics")
+            raise ValueError("Action export requires its template, block anchors and delta statistics")
         mask = metadata.action_mask.to(action.device)
         keep = mask.any(-1)
         if "generated_action_mask" in result:
@@ -21,7 +21,6 @@ def real_actions(result, batch):
                 delta,
                 metadata.anchors.to(action.device)[blocks],
                 mask[0],
-                source_contract=metadata.contract,
             )
         )
     return outputs

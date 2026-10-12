@@ -2,7 +2,7 @@
 """Run one existing statistics CLI process per dataset, then aggregate results.
 
 python -m tools.compute_causal_action_stats_parallel --dataset-root /data/parent \
-    --profile agibot --dataset-processes 4 --num-workers 4 --output outputs/stats.json
+    --dataset-processes 4 --num-workers 4 --output outputs/stats.json
 Each child writes meta/causal_action_stats.json; meta/stats.json is untouched.
 Existing child results are recomputed, never silently reused after data changes.
 """
@@ -44,7 +44,7 @@ def compute_child(root, args):
             continue
         command.append("--" + key.replace("_", "-"))
         if value is not True:
-            command.append(str(Path(value).resolve()) if key == "source_contract" else str(value))
+            command.append(str(value))
     try:
         logging.info("Starting %s", root)
         subprocess.run(command, check=True, cwd=Path(__file__).resolve().parents[1])

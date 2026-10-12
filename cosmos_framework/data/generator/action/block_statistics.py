@@ -12,7 +12,7 @@ def collect_statistics(dataset, *, indices):
     states, smasks, actions, amasks = [], [], [], []
     for i in indices:
         raw = dataset[i]
-        if raw["source_contract"].split != "train":
+        if raw["split"] != "train":
             raise ValueError("Quantiles must be collected on the training split")
         data, metadata = build_block_sample(
             raw,

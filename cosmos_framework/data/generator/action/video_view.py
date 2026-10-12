@@ -114,18 +114,26 @@ class VideoViewConfig:
             )
         raise ValueError(f"Unsupported viewpoint: {viewpoint}")
 
-    def read(self, ds, episode_id, timestamps, *, viewpoint):
+    def read(self, meta, episode_id, timestamps, *, viewpoint, tolerance_s, video_backend):
         """Prepare cameras with the selected backend, then compose using the shared layout."""
+        from lerobot.datasets.video_utils import query_videos
+
         layout = _get_layout(viewpoint)
         keys = self.camera_keys(viewpoint=viewpoint)
         for key in keys:
-            path = ds.root / ds.meta.get_video_file_path(episode_id, key)
+            path = meta.root / meta.get_video_file_path(episode_id, key)
             if not path.is_file():
                 raise FileNotFoundError(f"Required camera {key}, episode {episode_id}: {path}")
-        if getattr(ds, "video_backend", None) == "pyav_resize":
-            prepared = self._prepare_pyav_resized(ds, episode_id, timestamps, layout)
+        if video_backend == "pyav_resize":
+            prepared = self._prepare_pyav_resized(meta, episode_id, timestamps, layout, tolerance_s=tolerance_s)
         else:
-            frames = ds._query_videos({key: timestamps for key in keys}, episode_id)
+            frames = query_videos(
+                meta,
+                {key: timestamps for key in keys},
+                episode_id,
+                tolerance_s=tolerance_s,
+                video_backend=video_backend,
+            )
             prepared = self._prepare_legacy(frames, len(timestamps), layout)
         return _compose_prepared(prepared, len(timestamps), layout)
 
@@ -149,11 +157,11 @@ class VideoViewConfig:
             prepared[role] = F.interpolate(prepared[role], size=size, mode="bilinear", align_corners=False)
         return prepared
 
-    def _prepare_pyav_resized(self, ds, episode_id, timestamps, layout):
+    def _prepare_pyav_resized(self, meta, episode_id, timestamps, layout, *, tolerance_s):
         """Decode each role to its layout size; leave all concatenation to the caller."""
         from lerobot.datasets.video_utils import decode_video_frames
 
-        feature = ds.meta.features[self.cameras["head"]]
+        feature = meta.features[self.cameras["head"]]
         names, shape = feature.get("names"), feature["shape"]
         if not isinstance(names, (list, tuple)) or len(names) != len(shape):
             raise ValueError("pyav_resize requires named head video dimensions")
@@ -163,7 +171,7 @@ class VideoViewConfig:
         if any(type(size) is not int or size <= 0 for size in (height, width)):
             raise ValueError("Invalid head video dimensions")
         sizes = {"head": (height, width), **layout.sizes_to_resize(height, width)}
-        episode = ds.meta.episodes[episode_id]
+        episode = meta.episodes[episode_id]
         prepared = {}
         for role in layout.roles:
             key = self.cameras[role]
@@ -171,9 +179,9 @@ class VideoViewConfig:
             shifted = [offset + timestamp for timestamp in timestamps]
             resize_h, resize_w = sizes[role]
             video = decode_video_frames(
-                ds.root / ds.meta.get_video_file_path(episode_id, key),
+                meta.root / meta.get_video_file_path(episode_id, key),
                 shifted,
-                ds.tolerance_s,
+                tolerance_s,
                 backend="pyav_resize",
                 resize_h=resize_h,
                 resize_w=resize_w,

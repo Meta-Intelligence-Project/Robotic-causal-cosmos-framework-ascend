@@ -2,7 +2,6 @@
 """Regression checks for template geometry, independent masks and statistics."""
 
 import json
-from dataclasses import replace
 
 import pytest
 import torch
@@ -31,9 +30,8 @@ def sample(n=96, *, offset=0, steps=32, stride=4):
         action_target=state[1:].clone(),
         state_mask=mask,
         action_mask=mask.clone(),
-        source_contract=replace(
-            template.source_contract("agibot", source="test", info={}, target_semantics="next state"), split="train"
-        ),
+        source="test",
+        split="train",
         read_options=ActionReadOptions(action_from_state=True, action_time_offset_steps=1),
         state_timestamps=torch.arange(offset, offset + n + 1, dtype=torch.float64) / 30,
         action_timestamps=torch.arange(offset, offset + n, dtype=torch.float64) / 30,
@@ -74,7 +72,6 @@ def test_geometry_anchors_and_absolute_fields(offset, steps, stride):
         result["action"],
         m.anchors.repeat_interleave(steps, 0),
         raw["action_mask"],
-        source_contract=raw["source_contract"],
     )
     torch.testing.assert_close(decoded, raw["action_target"])
 
@@ -128,7 +125,7 @@ def test_statistics_contract_normalization_and_roundtrip(tmp_path):
     build(raw, template, different, statistics=stats)
     short, _, _ = sample(n=32)
     build(short, template, planner, statistics=stats)  # 尾部长度不同，不需要另一份统计。
-    validation = dict(raw, source_contract=replace(raw["source_contract"], split="val"))
+    validation = dict(raw, split="val")
     build(validation, template, planner, statistics=stats)
 
 
@@ -165,7 +162,7 @@ def test_collect_uses_same_block_encoding_and_training_split():
     stats = collect_statistics(ds, indices=[0])
     expected = torch.quantile(torch.arange(1, 33).float().repeat(3), torch.tensor([0.01, 0.99]))
     torch.testing.assert_close(torch.stack([stats.action.low[0], stats.action.high[0]]), expected)
-    raw["source_contract"] = replace(raw["source_contract"], split="val")
+    raw["split"] = "val"
     with pytest.raises(ValueError, match="training split"):
         collect_statistics(ds, indices=[0])
 
@@ -177,7 +174,7 @@ def test_rejects_incomplete_block():
 
 
 def test_replaceable_template_and_nonstandard_compression():
-    from cosmos_framework.data.generator.action.action_state_template import ActionStateTemplate, TemplateSourceContract
+    from cosmos_framework.data.generator.action.action_state_template import ActionStateTemplate
 
     class ScalarTemplate(ActionStateTemplate):
         template_id = "scalar-test-v1"
@@ -188,20 +185,18 @@ def test_replaceable_template_and_nonstandard_compression():
             assert mask.shape == (self.width,)
             return mask
 
-        def validate_source_contract(self, contract, mask):
-            assert contract.template_id == self.template_id
-
         def sanitize(self, values, mask):
             assert values.shape[-1] == self.width
             return values.masked_fill(~mask, 0)
 
-        def validate(self, state, action, valid_mask, source_contract):
-            self.validate_source_contract(source_contract, valid_mask)
+        def validate(self, state, action, valid_mask):
+            self.sanitize(state, valid_mask)
+            self.sanitize(action, valid_mask)
 
-        def encode_action_delta(self, absolute_action, anchor_state, valid_mask, *, source_contract):
+        def encode_action_delta(self, absolute_action, anchor_state, valid_mask):
             return self.sanitize(absolute_action - anchor_state, valid_mask)
 
-        def decode_action_delta(self, action_delta, anchor_state, valid_mask, *, source_contract):
+        def decode_action_delta(self, action_delta, anchor_state, valid_mask):
             return self.sanitize(action_delta + anchor_state, valid_mask)
 
     raw, _, _ = sample()
@@ -210,7 +205,6 @@ def test_replaceable_template_and_nonstandard_compression():
         raw[key] = raw[key][:, :3]
     for key in ("state_mask", "action_mask"):
         raw[key] = raw[key][:3]
-    raw["source_contract"] = TemplateSourceContract(template.template_id, "test", "world", {}, {}, {}, "next state")
     planner = SegmentPlanner(
         max_action_steps=96,
         overlap_action_steps=16,

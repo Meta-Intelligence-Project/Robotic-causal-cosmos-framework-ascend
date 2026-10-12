@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from cosmos_framework.data.generator.action.action_state_template import ActionStateTemplate, TemplateSourceContract
+from cosmos_framework.data.generator.action.action_state_template import ActionStateTemplate
 
 
 def prediction_block_ids(frame_ids, block_size):
@@ -118,8 +118,8 @@ class BlockStateMetadata:
     state_mask: torch.Tensor
     state_action_indexes: torch.Tensor
     anchors: torch.Tensor
-    contract: TemplateSourceContract
     state_latent_indexes: torch.Tensor
+    source: str = ""
     state_clip_fraction: torch.Tensor | None = None
     action_clip_fraction: torch.Tensor | None = None
     statistics: BlockStatistics | None = None
@@ -145,11 +145,8 @@ def build_block_sample(raw, *, template, planner, history_blocks, statistics=Non
     if n != len(state) - 1:
         raise ValueError("Expected T action targets and T+1 observations")
     # 两套 mask 独立；相对字段必须有有效 anchor，绝对字段不要求对应 state 有效。
-    contract = raw["source_contract"]
     sm = template.validate_valid_mask(raw["state_mask"]).to(state.device)
     am = template.validate_valid_mask(raw["action_mask"]).to(target.device)
-    template.validate_source_contract(contract, sm)
-    template.validate_source_contract(contract, am)
     if not sm.any() or not am.any():
         raise ValueError("Block training requires valid state and action channels")
     if (template.required_anchor_mask(am) & ~sm).any():
@@ -164,7 +161,7 @@ def build_block_sample(raw, *, template, planner, history_blocks, statistics=Non
     # 每个 block 内共用起始 state，下一个 block 切换 anchor。
     anchor_per_action = anchors.repeat_interleave(geometry.actions_per_block, dim=0)
     # 模板决定字段使用差值、相对旋转还是绝对目标。
-    encoded = template.encode_action_delta(target, anchor_per_action, am, source_contract=contract)
+    encoded = template.encode_action_delta(target, anchor_per_action, am)
     state_mask = sm.expand(blocks, -1)
     action_mask = am.expand(n, -1)
     states = anchors
@@ -187,7 +184,7 @@ def build_block_sample(raw, *, template, planner, history_blocks, statistics=Non
         state_mask=state_mask,
         state_action_indexes=starts,
         anchors=anchors,
-        contract=contract,
+        source=raw.get("source", ""),
         state_clip_fraction=state_clip,
         action_clip_fraction=action_clip,
         statistics=statistics,

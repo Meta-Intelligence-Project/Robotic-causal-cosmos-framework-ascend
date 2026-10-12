@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: OpenMDW-1.1
 """Discover LeRobot v3 dataset roots without scanning their data files."""
 
-import json
 import os
 from pathlib import Path
 
@@ -20,9 +19,6 @@ def discover_dataset_roots(paths):
             info_path = root / "meta/info.json"
             if not info_path.is_file():
                 continue
-            info = json.loads(info_path.read_text())
-            if not str(info.get("codebase_version", "")).startswith("v3."):
-                raise ValueError(f"Expected LeRobot v3 metadata: {info_path}")
             if not (root / "data").is_dir():
                 raise ValueError(f"Missing data directory: {root}")
             roots.add(root.resolve())

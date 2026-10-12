@@ -27,31 +27,6 @@ class ValidMaskSpec:
     version: str = "v1"
 
 
-@dataclass(frozen=True)
-class TemplateSourceContract:
-    """Explicit declaration for already-template-mapped absolute quantities.
-
-    ``units`` and ``scalar_semantics`` are keyed by field name. Scalars can
-    only use block subtraction when declared ``absolute``. In particular,
-    velocity commands must not be silently interpreted as mobile pose.
-    """
-
-    template_id: str
-    source: str
-    frame: str
-    # A source must state the physical EEF endpoint for each active side.
-    endpoints: Mapping[str, str]
-    units: Mapping[str, str]
-    scalar_semantics: Mapping[str, str]
-    target_semantics: str
-    quaternion_order: str = "xyzw"
-    data_version: str = "processed-v1"
-    split: str = "train"
-    fps: float = 0.0
-    valid_dimensions: tuple[int, ...] = ()
-    sampling_signature: str = ""
-
-
 class ActionStateTemplate(ABC):
     template_id: str
     width: int
@@ -71,13 +46,6 @@ class ActionStateTemplate(ABC):
     @abstractmethod
     def sanitize(self, values, valid_mask): ...
 
-    @abstractmethod
-    def validate_source_contract(self, contract, valid_mask): ...
-
-    def source_contract(self, profile, *, source, info, target_semantics):
-        """已有产物缺少契约时，由所选模板明确解释来源字段。"""
-        raise ValueError("This template requires an explicit source contract")
-
     def mock_quantiles(self, state_stats, delta_stats, valid_mask):
         """返回模板表示的模拟范围；具体字段映射只能由模板定义。"""
         raise ValueError("This template does not define an AgiBot mock statistics mapping")
@@ -92,23 +60,23 @@ class ActionStateTemplate(ABC):
         ...
 
     @abstractmethod
-    def validate(self, state, action, valid_mask, source_contract) -> None:
-        """检查 state/action 数值、形状及来源契约是否符合模板。"""
+    def validate(self, state, action, valid_mask) -> None:
+        """检查 state/action 数值和形状是否符合模板。"""
         ...
 
     @abstractmethod
-    def encode_action_delta(self, absolute_action, anchor_state, valid_mask, *, source_contract) -> torch.Tensor:
+    def encode_action_delta(self, absolute_action, anchor_state, valid_mask) -> torch.Tensor:
         """按模板逐字段策略编码目标；相对字段使用块起点 state。"""
         ...
 
     @abstractmethod
-    def decode_action_delta(self, action_delta, anchor_state, valid_mask, *, source_contract) -> torch.Tensor:
+    def decode_action_delta(self, action_delta, anchor_state, valid_mask) -> torch.Tensor:
         """使用编码时的同一 anchor，将相对 action 还原为绝对量。"""
         ...
 
 
 class ActionStateTemplate55(ActionStateTemplate):
-    """55D layout. Waist/head/mobile component meanings remain source-declared.
+    """55D layout for processed state/action data.
 
     No dataset masks or quantiles are stored on the template. A dataset owns
     one [55] mask, broadcast at runtime over any leading tensor dimensions.
@@ -164,28 +132,6 @@ class ActionStateTemplate55(ActionStateTemplate):
                 raise ValueError("A quaternion rotation group must be entirely valid or invalid")
         return mask
 
-    def validate_source_contract(self, contract, valid_mask):
-        """检查有效字段的单位、坐标系、端点及绝对量语义声明。"""
-        mask = self.validate_valid_mask(valid_mask)
-        if not isinstance(contract, TemplateSourceContract):
-            raise ValueError("An explicit TemplateSourceContract is required")
-        if contract.template_id != self.template_id or contract.quaternion_order != "xyzw":
-            raise ValueError("Source template version/quaternion order mismatch")
-        if not all((contract.source, contract.frame, contract.target_semantics)):
-            raise ValueError("Source, frame and target semantics must be declared")
-        for name, slots in self.fields.items():
-            if not mask[slots].any():
-                continue
-            if not contract.units.get(name):
-                raise ValueError(f"Declare units for active field {name}")
-            if name.endswith("_eef"):
-                if contract.units[name] != "metres,unit_quaternion":
-                    raise ValueError("EEF units must be metres,unit_quaternion")
-                if not contract.endpoints.get(name):
-                    raise ValueError(f"Declare physical endpoint for {name}")
-            if contract.scalar_semantics.get(name) != "absolute":
-                raise ValueError(f"{name} must declare absolute semantics for block-anchor deltas")
-
     def sanitize(self, values, valid_mask):
         """清零无效维，拒绝非法数值，并统一 state/target 四元数的长度和符号。"""
         mask = self.validate_valid_mask(valid_mask)
@@ -206,9 +152,8 @@ class ActionStateTemplate55(ActionStateTemplate):
                 result[..., list(group)] = self._unit_quaternion(q)
         return result
 
-    def validate(self, state, action, valid_mask, source_contract):
-        """校验来源与有效数值，并确认 state/action 可通过广播对齐。"""
-        self.validate_source_contract(source_contract, valid_mask)
+    def validate(self, state, action, valid_mask):
+        """校验有效数值，并确认 state/action 可通过广播对齐。"""
         state, action = self.sanitize(state, valid_mask), self.sanitize(action, valid_mask)
         try:
             torch.broadcast_shapes(state.shape, action.shape)
@@ -231,9 +176,9 @@ class ActionStateTemplate55(ActionStateTemplate):
             (aw * bv + bw * av + torch.linalg.cross(av, bv), aw * bw - (av * bv).sum(-1, keepdim=True)), -1
         )
 
-    def _convert(self, values, anchor, valid_mask, source_contract, *, decode):
+    def _convert(self, values, anchor, valid_mask, *, decode):
         """相对标量做加减，夹爪与灵巧手绝对保留，四元数复合，清零无效维。"""
-        self.validate(anchor, values, valid_mask, source_contract)
+        self.validate(anchor, values, valid_mask)
         values = self.sanitize(values, valid_mask)
         anchor = self.sanitize(anchor, valid_mask)
         values, anchor = torch.broadcast_tensors(values, anchor)
@@ -251,42 +196,13 @@ class ActionStateTemplate55(ActionStateTemplate):
                 result[..., indexes] = self._unit_quaternion(self._multiply(a, b))
         return result.masked_fill(~mask, 0)
 
-    def encode_action_delta(self, absolute_action, anchor_state, valid_mask, *, source_contract):
+    def encode_action_delta(self, absolute_action, anchor_state, valid_mask):
         """编码块相对目标；旋转采用 inverse(anchor) * target。"""
-        return self._convert(absolute_action, anchor_state, valid_mask, source_contract, decode=False)
+        return self._convert(absolute_action, anchor_state, valid_mask, decode=False)
 
-    def decode_action_delta(self, action_delta, anchor_state, valid_mask, *, source_contract):
+    def decode_action_delta(self, action_delta, anchor_state, valid_mask):
         """还原绝对目标；旋转采用 anchor * delta，输入应已反归一化。"""
-        return self._convert(action_delta, anchor_state, valid_mask, source_contract, decode=True)
-
-    def source_contract(self, profile, *, source, info, target_semantics):
-        """声明已处理产物的来源语义；不在 reader 中解释物理槽位。"""
-        units = {name: "source_native" for name in self.fields if name != "reserved"}
-        for name in ("left_eef", "right_eef"):
-            units[name] = "metres,unit_quaternion"
-        if profile == "egosuite":
-            custom = info["custom"]
-            if "state_unified eef quats: xyzw" not in custom["coordinate_frames"]["quat_orders"]:
-                raise ValueError("EgoSuite must declare unified EEF xyzw quaternions")
-            frame = custom["coordinate_frames"]["torso"]
-            endpoints = dict(left_eef="left_hand_wrist_joint_0", right_eef="right_hand_wrist_joint_0")
-            units.update(left_gripper="unit_interval", right_gripper="unit_interval", head="radians")
-        elif profile == "agibot":
-            # 先沿用预处理表示；不擅自声明 flange/TCP 或转换物理坐标。
-            frame = "processed_export_reference_frame"
-            endpoints = dict(left_eef="exported_left_end", right_eef="exported_right_end")
-            units.update(left_arm_joint="radians", right_arm_joint="radians")
-        else:
-            raise ValueError(f"Unknown source profile: {profile}")
-        return TemplateSourceContract(
-            template_id=self.template_id,
-            source=source,
-            frame=frame,
-            endpoints=endpoints,
-            units=units,
-            scalar_semantics=dict.fromkeys(units, "absolute"),
-            target_semantics=target_semantics,
-        )
+        return self._convert(action_delta, anchor_state, valid_mask, decode=True)
 
     def mock_quantiles(self, state_stats, delta_stats, valid_mask):
         """AgiBot 具名统计映射到本模板；未确认的旋转顺序不猜测。"""

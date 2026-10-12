@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: OpenMDW-1.1
-"""Mix source contracts before max_tokens packing on every training rank."""
+"""Mix source datasets before max_tokens packing on every training rank."""
 
 import logging
 import math

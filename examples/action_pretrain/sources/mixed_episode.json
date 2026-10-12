@@ -5,7 +5,6 @@
       "use_subtask": false,
       "root": "${AGIBOT_ROOT}",
       "viewpoint": "concat_view",
-      "target_semantics": "next_state",
       "read_options": {
         "state_key": "state_unified",
         "action_key": "action_unified",
@@ -23,7 +22,6 @@
       "use_subtask": false,
       "root": "${EGOSUITE_ROOT}",
       "viewpoint": "ego_view",
-      "target_semantics": "preprocessed_next_state",
       "read_options": {
         "state_key": "state_unified",
         "action_key": "action_unified",

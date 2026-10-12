@@ -69,11 +69,11 @@ from lerobot.datasets.video_utils import (
     StreamingVideoEncoder,
     VideoFrame,
     concatenate_video_files,
-    decode_video_frames,
     encode_video_frames,
     get_safe_default_codec,
     get_video_duration_in_s,
     get_video_info,
+    query_videos,
     resolve_vcodec,
 )
 from lerobot.utils.constants import HF_LEROBOT_HOME
@@ -1051,20 +1051,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
         Segmentation Fault. This probably happens because a memory reference to the video loader is created in
         the main process and a subprocess fails to access it.
         """
-        ep = self.meta.episodes[ep_idx]
-        item = {}
-        for vid_key, query_ts in query_timestamps.items():
-            # Episodes are stored sequentially on a single mp4 to reduce the number of files.
-            # Thus we load the start timestamp of the episode on this mp4 and,
-            # shift the query timestamp accordingly.
-            from_timestamp = ep[f"videos/{vid_key}/from_timestamp"]
-            shifted_query_ts = [from_timestamp + ts for ts in query_ts]
-
-            video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
-            frames = decode_video_frames(video_path, shifted_query_ts, self.tolerance_s, self.video_backend)
-            item[vid_key] = frames.squeeze(0)
-
-        return item
+        return query_videos(
+            self.meta, query_timestamps, ep_idx, tolerance_s=self.tolerance_s, video_backend=self.video_backend
+        )
 
     def _ensure_hf_dataset_loaded(self):
         """Lazy load the HF dataset only when needed for reading."""

@@ -3,7 +3,7 @@
 
 Run from the repository root, in the training Python environment:
     python -m tools.compute_causal_action_stats \
-        --dataset-root /path/to/canonical_55d --profile agibot \
+        --dataset-root /path/to/canonical_55d \
         --output /path/to/block_stats.json
 
 The default reservoir method scans ALL training blocks but estimates quantiles
@@ -19,20 +19,19 @@ Windows keep their original anchors; neither option changes the sampling stride.
 """
 
 import argparse
-import json
 import logging
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from copy import copy
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from datetime import timedelta
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from cosmos_framework.data.generator.action.action_state_template import TemplateSourceContract, resolve_action_template
+from cosmos_framework.data.generator.action.action_state_template import resolve_action_template
 from cosmos_framework.data.generator.action.block_state import BlockStatistics, Quantiles, build_block_sample
 from cosmos_framework.data.generator.action.causal_block_geometry import CausalBlockGeometry
 from cosmos_framework.data.generator.action.lerobot_discovery import discover_dataset_roots
@@ -188,12 +187,13 @@ def _iter_encoded_batches(dataset, stop, *, batch_size, num_workers):
                 action_target=raw["action_target"][indexes].flatten(0, 1),
                 state_mask=raw["state_mask"],
                 action_mask=raw["action_mask"],
-                source_contract=raw["source_contract"],
+                source=raw["source"],
+                split=raw["split"],
                 conditioning_fps=raw["conditioning_fps"],
             )
         else:
             raw = dataset[index]
-        if raw["source_contract"].split != "train":
+        if raw["split"] != "train":
             raise ValueError("Statistics must be fitted on the training split")
         data, metadata = build_block_sample(raw, template=dataset.template, planner=dataset.planner, history_blocks=1)
         return count, metadata.states, metadata.state_mask, data["action"], metadata.action_mask
@@ -268,8 +268,9 @@ def compute_statistics(
             "skipped_ranges": dataset.planner.skipped_ranges,
             "discarded_action_steps": dataset.planner.discarded_action_steps,
         }
-        if hasattr(dataset, "source_contract"):
-            source["source_contract"] = asdict(dataset.source_contract)
+        if hasattr(dataset, "root"):
+            source["source"] = str(dataset.root)
+        source["split"] = dataset.split
         if hasattr(dataset, "read_options"):
             source["read_options"] = asdict(dataset.read_options)
         source_started = time.monotonic()
@@ -355,9 +356,6 @@ def parse_args(*, parallel=False):
         required=True,
         help="LeRobot v3 roots or parent directories; all children are merged",
     )
-    source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--profile", choices=("agibot", "egosuite"))
-    source.add_argument("--source-contract", type=Path, help="Explicit TemplateSourceContract JSON")
     parser.add_argument("--template", help="Fully qualified ActionStateTemplate class (default: unified55)")
     parser.add_argument("--state-key", default="state_unified")
     parser.add_argument("--action-key", default="action_unified")
@@ -422,23 +420,11 @@ def main():
         # 顺序构造子集，避免同时保留全部来源的 parquet 缓存与片段索引。
         for source_index, root in enumerate(roots, 1):
             logging.info("Preparing source %d/%d: %s", source_index, len(roots), root)
-            if args.source_contract:
-                contract = replace(
-                    TemplateSourceContract(**json.loads(args.source_contract.read_text())), source=str(root)
-                )
-            else:
-                contract = template.source_contract(
-                    args.profile,
-                    source=str(root),
-                    info=json.loads((root / "meta/info.json").read_text()),
-                    target_semantics=f"absolute target from {options.target_key}, offset={options.action_time_offset_steps} steps",
-                )
             geometry = CausalBlockGeometry(temporal_compression_factor=4)
             # 32-action block、overlap=31，对应 stride=1；仅读数值，不解码视频。
             yield SegmentLeRobotDataset(
                 root=root,
                 template=template,
-                source_contract=contract,
                 planner=SegmentPlanner(
                     max_action_steps=geometry.actions_per_block,
                     overlap_action_steps=geometry.actions_per_block - 1,
