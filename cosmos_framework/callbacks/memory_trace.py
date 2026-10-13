@@ -19,6 +19,7 @@ import torch
 
 from cosmos_framework.utils import distributed, log
 from cosmos_framework.utils.callback import Callback
+from cosmos_framework.utils.memory_trace import set_memory_recorder
 
 _PROC_STATUS_KEYS = {
     "VmLck": "process_locked_bytes",
@@ -100,6 +101,8 @@ class MemoryTrace(Callback):
         self._last: dict[str, int] = {}
         self._previous_python_type_counts: Counter[str] | None = None
         self._warned = False
+        self._trace_iteration = 0
+        self._trace_stage = "forward"
 
     def _should_record(self, iteration: int) -> bool:
         return self.every_n > 0 and iteration % self.every_n == 0
@@ -132,6 +135,19 @@ class MemoryTrace(Callback):
                     result[target] = stats[source]
         except Exception as error:  # Monitoring must never terminate training.
             result["accelerator_error"] = str(error)
+        # Device-wide usage includes allocations outside this process's allocator.
+        # Keep failures separate so allocator statistics remain available.
+        try:
+            device = backend.current_device()
+            free, total = backend.mem_get_info(device)
+            result.update(
+                accelerator_device_index=int(device),
+                accelerator_device_total_bytes=int(total),
+                accelerator_device_free_bytes=int(free),
+                accelerator_device_used_bytes=int(total - free),
+            )
+        except Exception as error:
+            result["accelerator_device_error"] = str(error)
         return result
 
     def _process_memory(self) -> dict[str, Any]:
@@ -176,7 +192,15 @@ class MemoryTrace(Callback):
             result["children"] = sorted(workers, key=lambda worker: worker["pid"])
         return result
 
-    def _record(self, phase: str, iteration: int, tensors: Any = None) -> None:
+    def _record(
+        self,
+        phase: str,
+        iteration: int,
+        tensors: Any = None,
+        *,
+        metadata: dict[str, Any] | None = None,
+        accelerator_only: bool = False,
+    ) -> None:
         if self._file is None or not self._should_record(iteration):
             return
         try:
@@ -190,16 +214,20 @@ class MemoryTrace(Callback):
                 "gc_count": list(gc.get_count()),
                 "gc_enabled": gc.isenabled(),
             }
-            virtual_memory = psutil.virtual_memory()
-            record["system_memory_available_bytes"] = virtual_memory.available
-            record["system_memory_used_bytes"] = virtual_memory.used
-            try:
-                shm_usage = psutil.disk_usage("/dev/shm")
-                record["system_shm_used_bytes"] = shm_usage.used
-            except FileNotFoundError:
-                pass
-            record.update(self._process_memory())
+            if not accelerator_only:
+                virtual_memory = psutil.virtual_memory()
+                record["system_memory_available_bytes"] = virtual_memory.available
+                record["system_memory_used_bytes"] = virtual_memory.used
+                try:
+                    shm_usage = psutil.disk_usage("/dev/shm")
+                    record["system_shm_used_bytes"] = shm_usage.used
+                except FileNotFoundError:
+                    pass
+                record.update(self._process_memory())
             record.update(self._accelerator_memory())
+            if metadata is not None:
+                record["detail"] = metadata
+                record["training_stage"] = self._trace_stage
             if self.track_python_objects and phase in {"iteration_end", "iteration_end_after_trim"}:
                 tracked_objects = gc.get_objects()
                 type_counts = Counter(f"{type(item).__module__}.{type(item).__qualname__}" for item in tracked_objects)
@@ -227,6 +255,7 @@ class MemoryTrace(Callback):
                 "children_fds",
                 "accelerator_allocated_bytes",
                 "accelerator_reserved_bytes",
+                "accelerator_device_used_bytes",
             ):
                 value = record.get(key)
                 if isinstance(value, int) and key in self._last:
@@ -243,7 +272,17 @@ class MemoryTrace(Callback):
                 self._warned = True
             self._close()
 
+    def _record_detail(self, phase: str, metadata: dict[str, Any]) -> None:
+        # Fine-grained markers must not repeatedly scan CPU workers or retain tensors.
+        self._record(phase, self._trace_iteration, metadata=metadata, accelerator_only=True)
+
+    def _start_details(self, iteration: int, stage: str) -> None:
+        self._trace_iteration = iteration
+        self._trace_stage = stage
+        set_memory_recorder(self._record_detail if self._file is not None and self._should_record(iteration) else None)
+
     def _close(self) -> None:
+        set_memory_recorder(None)
         if self._file is not None:
             self._file.close()
             self._file = None
@@ -268,18 +307,22 @@ class MemoryTrace(Callback):
         self._record("batch_on_device", iteration, data)
 
     def on_before_forward(self, iteration: int = 0) -> None:
+        self._start_details(iteration, "forward")
         self._record("before_forward", iteration)
 
     def on_after_forward(self, iteration: int = 0) -> None:
         self._record("after_forward", iteration)
+        set_memory_recorder(None)
 
     def on_before_backward(self, model, loss, iteration: int = 0) -> None:
         del model, loss
+        self._start_details(iteration, "backward")
         self._record("before_backward", iteration)
 
     def on_after_backward(self, model, iteration: int = 0) -> None:
         del model
         self._record("after_backward", iteration)
+        set_memory_recorder(None)
 
     def on_before_optimizer_step(self, model, optimizer, scheduler, grad_scaler, iteration: int = 0) -> None:
         del model, optimizer, scheduler, grad_scaler

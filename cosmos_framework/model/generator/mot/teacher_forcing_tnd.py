@@ -13,6 +13,7 @@ from cosmos_framework.model.attention.npu_fusion_attention.functions import (
     NPU_FUSION_ATTENTION_TND_MAX_SEQUENCES,
     NPU_FUSION_ATTENTION_TND_MAX_TOKENS,
 )
+from cosmos_framework.utils.memory_trace import record_memory_phase
 
 
 @dataclass(frozen=True)
@@ -127,6 +128,22 @@ class _NPUTeacherForcing(torch.autograd.Function):
     def forward(ctx, query, key, value, plan, scale):
         import torch_npu
 
+        record_memory_phase(
+            "tnd_forward_before",
+            query_shape=list(query.shape),
+            key_shape=list(key.shape),
+            dtype=str(query.dtype),
+            chunks=len(plan.chunks),
+            chunk_kv_tokens=[chunk.kv_indexes.numel() for chunk in plan.chunks],
+            max_group_kv_tokens=max(
+                (
+                    end - start
+                    for chunk in plan.chunks
+                    for start, end in zip((0,) + chunk.kv_ends[:-1], chunk.kv_ends, strict=True)
+                ),
+                default=0,
+            ),
+        )
         outputs, statistics, rng = [], [], []
         for chunk in plan.chunks:
             q = query.index_select(0, chunk.query_indexes)
@@ -152,15 +169,18 @@ class _NPUTeacherForcing(torch.autograd.Function):
         output = torch.cat(outputs)
         ctx.save_for_backward(query, key, value, output, *statistics)
         ctx.plan, ctx.scale, ctx.rng = plan, scale, rng
+        record_memory_phase("tnd_forward_after")
         return output
 
     @staticmethod
     @torch.autograd.function.once_differentiable
     def backward(ctx, grad_output):
+        record_memory_phase("tnd_backward_before", grad_output_shape=list(grad_output.shape))
         query, key, value, output, *statistics = ctx.saved_tensors
         dq = torch.empty_like(query)
         dk = torch.zeros_like(key, dtype=torch.float32)
         dv = torch.zeros_like(value, dtype=torch.float32)
+        record_memory_phase("tnd_backward_buffers_ready")
         offset = 0
         for i, chunk in enumerate(ctx.plan.chunks):
             end = offset + chunk.query_ends[-1]
@@ -193,7 +213,9 @@ class _NPUTeacherForcing(torch.autograd.Function):
             dv.index_add_(0, chunk.kv_indexes, gradients[2].float())
             offset = end
             del q, k, v, gradients
-        return dq, dk.to(key.dtype), dv.to(value.dtype), None, None
+        result = dq, dk.to(key.dtype), dv.to(value.dtype), None, None
+        record_memory_phase("tnd_backward_after")
+        return result
 
 
 def teacher_forcing_tnd_attention(query, key, value, plan: TNDPlan, *, scale=None):

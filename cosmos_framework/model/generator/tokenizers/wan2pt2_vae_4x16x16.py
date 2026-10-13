@@ -21,6 +21,7 @@ from cosmos_framework.utils.easy_io import easy_io
 from cosmos_framework.data.generator.utils import VIDEO_RES_SIZE_INFO
 from cosmos_framework.model.generator.tokenizers.interface import VideoTokenizerInterface
 from cosmos_framework.utils.generator.data_utils import get_vision_data_resolution
+from cosmos_framework.utils.memory_trace import record_memory_phase
 
 # For sequential decoding, CACHE_T is the number of frames to cache.
 CACHE_T = 2
@@ -1203,10 +1204,12 @@ class WanVAE:
         Returns:
             Tensor of shape ``[B, z_dim, T//4, H//16, W//16]``.
         """
+        record_memory_phase("vae_encode_before", input_shape=list(videos.shape), input_dtype=str(videos.dtype))
         in_dtype = videos.dtype
         videos = videos.to(self.dtype)
         latent = self.model.encode(videos, self.scale)
         latent = latent.to(in_dtype)
+        record_memory_phase("vae_encode_after", latent_shape=list(latent.shape))
         return latent
 
     @torch.no_grad()

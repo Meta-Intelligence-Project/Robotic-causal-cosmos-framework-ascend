@@ -6,6 +6,8 @@ import math
 import torch
 from torch import nn
 
+from cosmos_framework.utils.memory_trace import record_memory_phase
+
 from .cosmos3_vfm_network import Cosmos3VFMNetwork
 
 
@@ -32,15 +34,26 @@ class CausalActionNetwork(Cosmos3VFMNetwork):
         nn.init.normal_(self.state_modality_embed, std=1.0 / math.sqrt(self.hidden_size))
 
     def _encode_vision(self, packed_seq, packed_sequence, target_dtype):
+        record_memory_phase(
+            "vision_projection_before",
+            packed_shape=list(packed_sequence.shape),
+            vision_token_shapes=[list(shape) for shape in packed_seq.vision.token_shapes],
+            condition_mask_shapes=[list(mask.shape) for mask in packed_seq.vision.condition_mask],
+            vision_tokens=packed_seq.vision.sequence_indexes.numel(),
+        )
         original_shapes = super()._encode_vision(packed_seq, packed_sequence, target_dtype)
+        record_memory_phase("vision_projection_after")
         vision = packed_seq.vision
         cond = torch.cat([
             mask.reshape(-1).bool().repeat_interleave(h * w)
             for mask, (_, h, w) in zip(vision.condition_mask, vision.token_shapes, strict=True)
         ])
+        record_memory_phase("vision_condition_mask_after", mask_tokens=cond.numel())
         indexes = vision.sequence_indexes[cond]
+        record_memory_phase("vision_condition_embedding_before", condition_tokens=indexes.numel())
         zeros = torch.zeros(indexes.numel(), device=packed_sequence.device, dtype=torch.float32)
         packed_sequence[indexes] += self._embed_packed_timesteps(zeros, packed_seq).to(target_dtype)
+        record_memory_phase("vision_condition_embedding_after")
         return original_shapes
 
     def _encode_action(self, packed_seq, packed_sequence, target_dtype):
