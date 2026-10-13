@@ -80,12 +80,12 @@ class ActionPromptJsonFormatter:
             },
             "actions": [
                 {
-                    "time": f"0:00-{self._format_time_mss(action_end_time)}",
+                    # "time": f"0:00-{self._format_time_mss(action_end_time)}",
                     "description": self._ensure_sentence(caption),
-                    "idle_frame": self._get_idle_frame_info(data_dict),
+                    # "idle_frame": self._get_idle_frame_info(data_dict),
                 }
             ],
-            "duration": f"{duration}s",
+            # "duration": f"{duration}s",
             "fps": float(fps),
             "resolution": {"H": height, "W": width},
             "aspect_ratio": self._get_aspect_ratio(width, height),
