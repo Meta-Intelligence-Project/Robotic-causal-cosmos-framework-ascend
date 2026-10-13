@@ -33,6 +33,7 @@ class EgoSuiteSegmentLeRobotDataset(SegmentLeRobotDataset):
     """
 
     default_read_options = _DEFAULT_READ_OPTIONS
+    default_video_view = VideoViewConfig(cameras=_CAMERA_MAPPING)
 
     def __init__(
         self,
@@ -44,5 +45,5 @@ class EgoSuiteSegmentLeRobotDataset(SegmentLeRobotDataset):
     ):
         # ego_view 的 head 角色映射到左相机，不解码右相机。
         if video_view is None:
-            video_view = VideoViewConfig(cameras=_CAMERA_MAPPING.copy())
+            video_view = self.default_video_view
         super().__init__(read_options=read_options, video_view=video_view, viewpoint=viewpoint, **kwargs)

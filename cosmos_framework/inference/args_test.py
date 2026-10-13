@@ -267,7 +267,7 @@ def test_edge_num_frames_default(tmp_path: Path):
     # the reasoner (which reports VIDEO vision_mode) keeps its inert 1 -- none of
     # these should be rewritten to 121.
     assert _num_frames("Cosmos3-Edge", "edge_t2i", model_mode=ModelMode.TEXT2IMAGE) == 1
-    assert _num_frames("Cosmos3-Edge", "edge_policy", model_mode=ModelMode.POLICY) == 189
+    assert _num_frames("Cosmos3-Edge", "edge_policy", model_mode=ModelMode.POLICY, image_size=480) == 189
     assert _num_frames("Cosmos3-Edge", "edge_reasoner", model_mode=ModelMode.REASONER, prompt="Describe.") == 1
 
 
@@ -368,3 +368,29 @@ def test_reasoner_video_fps_accepts_positive_float():
     from cosmos_framework.inference.args import ReasonerDataOverrides
 
     assert ReasonerDataOverrides(video_fps=2.0).video_fps == 2.0
+
+
+@pytest.mark.parametrize("image_size", [None, 720])
+def test_action_data_requires_a_supported_explicit_camera_tier(image_size):
+    from cosmos_framework.inference.args import ActionDataOverrides, _load_modality_defaults
+
+    overrides = ActionDataOverrides(image_size=image_size)
+    with pytest.raises(ValueError, match="image_size"):
+        overrides._build_action_data(
+            model_config=types.SimpleNamespace(action_gen=True),
+            sample_meta=types.SimpleNamespace(model_mode=ModelMode.POLICY),
+        )
+    assert "image_size" not in _load_modality_defaults("policy")
+
+
+def test_action_data_preserves_prepared_flag_and_camera_layout():
+    from cosmos_framework.inference.args import ActionDataOverrides
+
+    overrides = ActionDataOverrides(image_size=480, view_point="concat_view", action_video_prepared=True)
+    overrides._build_action_data(
+        model_config=types.SimpleNamespace(action_gen=True),
+        sample_meta=types.SimpleNamespace(model_mode=ModelMode.POLICY),
+    )
+    assert overrides.image_size == 480
+    assert overrides.view_point == "concat_view"
+    assert overrides.action_video_prepared is True
