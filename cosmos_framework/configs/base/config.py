@@ -24,6 +24,7 @@ class ActionDataSetting:
     resolution: str = "480"
     mode: str = "joint"
     seed: int = 42
+    sampling_strategy: str = "shuffle_cycle"
     allow_mock_statistics: bool = False
     mock_state_stats_path: str = ""
     mock_delta_stats_path: str = ""

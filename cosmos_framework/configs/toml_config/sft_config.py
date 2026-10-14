@@ -117,6 +117,7 @@ class ActionConfig(BaseModel):
     resolution: str = "480"
     mode: Literal["joint", "policy", "forward_dynamics", "inverse_dynamics"] = "joint"
     seed: int = 42
+    sampling_strategy: Literal["shuffle_cycle", "sample_uniform"] = "shuffle_cycle"
     allow_mock_statistics: bool = False
     mock_state_stats_path: str = ""
     mock_delta_stats_path: str = ""

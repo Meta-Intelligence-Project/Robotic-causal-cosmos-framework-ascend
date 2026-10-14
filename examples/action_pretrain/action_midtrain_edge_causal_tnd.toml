@@ -32,6 +32,9 @@ overlap_action_steps = 161
 resolution = "480"
 mode = "joint"
 seed = 42
+# 每条有效训练片段独立等概率、有放回采样；来源 JSON 的 weight 不参与此模式。
+# 改为 shuffle_cycle 可恢复来源加权、block 内顺序遍历。
+sampling_strategy = "sample_uniform"
 allow_mock_statistics = false
 
 [model]

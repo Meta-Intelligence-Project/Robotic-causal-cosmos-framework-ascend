@@ -236,6 +236,7 @@ cfg = LazyDict(
                             overlap_action_steps="${data_setting.action.overlap_action_steps}",
                             mode="${data_setting.action.mode}",
                             seed="${data_setting.action.seed}",
+                            sampling_strategy="${data_setting.action.sampling_strategy}",
                             resolution="${data_setting.action.resolution}",
                             history_blocks_min="${model.config.teacher_forcing_history_blocks_min}",
                             history_blocks_max="${model.config.teacher_forcing_history_blocks_max}",

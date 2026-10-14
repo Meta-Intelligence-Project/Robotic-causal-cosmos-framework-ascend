@@ -31,6 +31,23 @@ _CUSTOM_PAYLOAD = {
 # 1. pydantic schema validation                                               #
 # --------------------------------------------------------------------------- #
 class TestSchemaValidation:
+    @pytest.mark.parametrize("strategy", ["shuffle_cycle", "sample_uniform"])
+    def test_action_sampling_strategy_schema_and_override(self, strategy):
+        raw = {
+            "job": {"task": "vfm", "experiment": "action_causal_midtrain_edge"},
+            "action": {"sampling_strategy": strategy},
+        }
+        config = SFTExperimentConfig.model_validate(raw)
+        assert config.action.sampling_strategy == strategy
+        assert f"data_setting.action.sampling_strategy={strategy}" in build_hydra_overrides(raw)
+
+    def test_action_sampling_strategy_default_and_invalid_value(self):
+        raw = {"job": {"task": "vfm", "experiment": "action_causal_midtrain_edge"}}
+        assert SFTExperimentConfig.model_validate(raw).action.sampling_strategy == "shuffle_cycle"
+        raw["action"] = {"sampling_strategy": "unknown"}
+        with pytest.raises(ValidationError, match="sampling_strategy"):
+            SFTExperimentConfig.model_validate(raw)
+
     def test_vfm_fsdp_mixed_precision_fields_validate(self) -> None:
         raw = {
             "job": {"task": "vfm", "experiment": "vision_sft_edge"},
@@ -330,6 +347,7 @@ class TestEndToEndLoader:
         assert source.max_action_steps == maximum
         assert source.overlap_action_steps == overlap
         assert source.sources_file == "/tmp/sources.json"
+        assert source.sampling_strategy == "sample_uniform"
 
     def test_load_lerobot_resolution_tiers(self, _dummy_recipe_env: None) -> None:
         recipe_path = Path(__file__).parents[3] / "examples/toml/sft_config/vision_sft_edge.toml"

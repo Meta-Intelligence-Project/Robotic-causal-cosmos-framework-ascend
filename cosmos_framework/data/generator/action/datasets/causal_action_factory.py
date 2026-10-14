@@ -66,6 +66,7 @@ def get_causal_action_dataset(
     history_blocks_min=1,
     history_blocks_max=8,
     seed=42,
+    sampling_strategy="shuffle_cycle",
     resolution="480",
     tokenizer_config=None,
     cfg_dropout_rate=0.1,
@@ -154,4 +155,4 @@ def get_causal_action_dataset(
                 log.info(f"Action dataset: {root}; segments={len(dataset)}")
             datasets.append(CausalActionDatasetGroup(children))
             weights.append(source.get("weight", 1.0))
-    return CausalActionMixture(datasets, weights, seed=seed)
+    return CausalActionMixture(datasets, weights, seed=seed, sampling_strategy=sampling_strategy)
