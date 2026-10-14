@@ -27,6 +27,7 @@ early_video_sampling = true
 actions_per_block = 32
 video_stride = 4
 # 最多 896 action / 897 observation，抽帧后 225 个视频帧。
+# 设为 -1 时每个完整 subtask/episode 一条片段，尾部重复补齐到 action block；overlap 不参与切分。
 max_action_steps = 896
 overlap_action_steps = 161
 resolution = "480"

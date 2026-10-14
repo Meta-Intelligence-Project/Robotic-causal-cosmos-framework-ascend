@@ -112,7 +112,7 @@ class ActionConfig(BaseModel):
     table_backend: Literal["parquet", "hf"] = "parquet"
     early_video_sampling: bool = True
     actions_per_block: int = Field(default=32, ge=1)
-    max_action_steps: int = Field(default=96, ge=1)
+    max_action_steps: int = Field(default=96, ge=-1)
     overlap_action_steps: int = Field(default=16, ge=0)
     resolution: str = "480"
     mode: Literal["joint", "policy", "forward_dynamics", "inverse_dynamics"] = "joint"
@@ -121,6 +121,13 @@ class ActionConfig(BaseModel):
     allow_mock_statistics: bool = False
     mock_state_stats_path: str = ""
     mock_delta_stats_path: str = ""
+
+    @field_validator("max_action_steps")
+    @classmethod
+    def validate_max_action_steps(cls, value):
+        if value == 0:
+            raise ValueError("max_action_steps must be -1 or a positive integer")
+        return value
 
 
 # ---------------------------------------------------------------- model

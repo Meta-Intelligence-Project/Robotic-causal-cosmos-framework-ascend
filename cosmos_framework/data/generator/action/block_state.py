@@ -124,6 +124,7 @@ class BlockStateMetadata:
     action_clip_fraction: torch.Tensor | None = None
     statistics: BlockStatistics | None = None
     template: ActionStateTemplate | None = None
+    full_range: tuple[int, int] | None = None
 
     def __post_init__(self):
         if self.history_blocks < 1:
@@ -190,6 +191,7 @@ def build_block_sample(raw, *, template, planner, history_blocks, statistics=Non
         statistics=statistics,
         state_latent_indexes=latent_indexes,
         template=template,
+        full_range=raw.get("full_range"),
     )
     # 保留首帧并按 stride 抽视频帧；action 不抽帧，此处不执行 VAE 编码。
     video = raw.get("video")

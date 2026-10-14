@@ -19,9 +19,13 @@ class SegmentPlanner:
         # 只保留防止非法长度和零/负推进间隔所需的配置检查。
         if type(max_action_steps) is not int:
             raise ValueError("max_action_steps must be an integer")
-        geometry.validate_observation_frames(max_action_steps + 1)
-        if type(overlap_action_steps) is not int or not 0 <= overlap_action_steps < max_action_steps:
-            raise ValueError("overlap_action_steps must be an integer in [0, max_action_steps)")
+        if max_action_steps == -1:
+            if type(overlap_action_steps) is not int or overlap_action_steps < 0:
+                raise ValueError("overlap_action_steps must be a nonnegative integer")
+        else:
+            geometry.validate_observation_frames(max_action_steps + 1)
+            if type(overlap_action_steps) is not int or not 0 <= overlap_action_steps < max_action_steps:
+                raise ValueError("overlap_action_steps must be an integer in [0, max_action_steps)")
 
         # 保存切片配置；计数器累计所有 episode/segment 的跳过与丢弃情况。
         self.geometry = geometry
@@ -47,10 +51,20 @@ class SegmentPlanner:
         丢弃计数仅含未覆盖的 action 间隔，不包含 overlap 的重复部分。
         preserve_tail 用于 subtask：短范围有余量时，首尾各取一个最大合法窗口。
         """
-        # 计算完整 block 能容纳的最大帧数，只算长度，此处不截断长 episode。
-        usable_frames = self.geometry.max_complete_observation_frames(num_observation_frames)
         if type(observation_start) is not int or observation_start < 0:
             raise ValueError("observation_start must be a nonnegative integer")
+        if self.max_action_steps == -1:
+            if type(num_observation_frames) is not int:
+                raise ValueError("num_observation_frames must be an integer")
+            if num_observation_frames < 2:
+                raise ValueError(
+                    f"Full range source={source_id!r}, episode={episode_id}, segment={segment_id!r}, "
+                    f"observations=[{observation_start}, {observation_start + num_observation_frames}): "
+                    "at least one action and two observations are required"
+                )
+            return [(observation_start, num_observation_frames - 1)]
+        # 计算完整 block 能容纳的最大帧数，只算长度，此处不截断长 episode。
+        usable_frames = self.geometry.max_complete_observation_frames(num_observation_frames)
         available_actions = max(0, num_observation_frames - 1)
 
         # 不足一个完整 block：告警并跳过，记录未参与训练的 action 数。

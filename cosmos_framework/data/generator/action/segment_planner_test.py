@@ -100,6 +100,32 @@ def test_invalid_range_is_rejected(frames, start):
         planner().plan(frames, observation_start=start)
 
 
+@pytest.mark.parametrize("frames", [2, 17, 33, 34, 961, 4098])
+@pytest.mark.parametrize("overlap", [0, 16, 10000])
+def test_full_range_is_one_record_without_truncation_or_overlap(frames, overlap):
+    p = planner(-1, overlap)
+    assert p.plan(frames, observation_start=11, preserve_tail=True) == [(11, frames - 1)]
+    assert p.discarded_action_steps == p.skipped_ranges == 0
+
+
+@pytest.mark.parametrize("frames", [0, 1])
+def test_full_range_without_actions_is_an_explicit_error(frames):
+    with pytest.raises(ValueError, match="source='root'.*episode=7.*segment='task'.*at least one action"):
+        planner(-1).plan(frames, observation_start=11, source_id="root", episode_id=7, segment_id="task")
+
+
+@pytest.mark.parametrize("frames,start", [(33, -1), (33, True), (33.0, 0), ("33", 0)])
+def test_full_range_rejects_invalid_indexes(frames, start):
+    with pytest.raises(ValueError):
+        planner(-1).plan(frames, observation_start=start)
+
+
+@pytest.mark.parametrize("maximum,overlap", [(-2, 0), (-1, -1), (-1, True), (-1, 1.5)])
+def test_full_range_configuration_rejects_other_negative_lengths_and_invalid_overlap(maximum, overlap):
+    with pytest.raises(ValueError):
+        planner(maximum, overlap)
+
+
 def test_alternative_geometry_controls_length_and_warning_threshold():
     geometry = CausalBlockGeometry(actions_per_block=12, video_stride=2, temporal_compression_factor=3)
     p = planner(24, 5, geometry)

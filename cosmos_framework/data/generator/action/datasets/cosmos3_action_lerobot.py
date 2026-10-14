@@ -309,7 +309,7 @@ class BaseActionLeRobotDataset(Dataset):
         self,
         *,
         fps: float,
-        chunk_length: int,
+        chunk_length: int | None,
         split_seed: int,
         split_val_ratio: float,
         split: str,
@@ -420,7 +420,7 @@ class BaseActionLeRobotDataset(Dataset):
         return self._fps
 
     @property
-    def chunk_length(self) -> int:
+    def chunk_length(self) -> int | None:
         return self._chunk_length
 
     @property

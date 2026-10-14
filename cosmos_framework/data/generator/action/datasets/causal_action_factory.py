@@ -48,6 +48,9 @@ def video_durations(max_action_steps, actions_per_block, video_stride):
     geometry = CausalBlockGeometry(
         actions_per_block=actions_per_block, video_stride=video_stride, temporal_compression_factor=4
     )
+    if max_action_steps == -1:
+        # The VAE accepts actual lengths and trims internal chunk padding.
+        return None
     geometry.validate_observation_frames(max_action_steps + 1)
     return [1 + n // video_stride for n in range(actions_per_block, max_action_steps + 1, actions_per_block)]
 

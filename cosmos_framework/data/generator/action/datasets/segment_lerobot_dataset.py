@@ -80,7 +80,7 @@ class SegmentLeRobotDataset(BaseActionLeRobotDataset):
             raise ValueError("Source FPS must be finite and positive")
         super().__init__(
             fps=fps,
-            chunk_length=planner.max_action_steps,
+            chunk_length=None if planner.max_action_steps == -1 else planner.max_action_steps,
             split_seed=split_seed,
             split_val_ratio=split_val_ratio,
             split=split,
@@ -222,7 +222,7 @@ class SegmentLeRobotDataset(BaseActionLeRobotDataset):
         first = max(training_range.start, episode_first)
         # 包含标注末帧动作的终点，避免已整除的 subtask 仍漏掉衔接动作。
         stop = max(first, min(training_range.stop + 1, episode_stop))
-        if stop == first:
+        if stop == first or self.planner.max_action_steps == -1:
             return first, stop
 
         block_actions = self.planner.geometry.actions_per_block
@@ -363,6 +363,15 @@ class SegmentLeRobotDataset(BaseActionLeRobotDataset):
         # 先用存储 FPS 检查连续采样，再将输出 FPS 切换到真实训练时间尺度。
         if not torch.allclose(times[1:] - times[:-1], torch.full_like(times[1:], 1 / self.fps), atol=1e-5, rtol=1e-4):
             raise ValueError(f"Episode {episode_id}: timestamp intervals must match meta.fps={self.fps}")
+        real_actions = actions
+        if self.planner.max_action_steps == -1:
+            # Preserve every real row, then repeat the tail to complete a block.
+            padding = (-actions) % self.planner.geometry.actions_per_block
+            if padding:
+                state = torch.cat((state, state[-1:].expand(padding, -1)))
+                target = torch.cat((target, target[-1:].expand(padding, -1)))
+                times = torch.cat((times, times[-1] + torch.arange(1, padding + 1, dtype=times.dtype) / self.fps))
+                actions += padding
         # action 时间标记区间起点；目标实际读取时刻由 read_options 声明。
         # 当前使用默认布局；后续布局增强在此选择本次样本的 viewpoint。
         viewpoint = self._viewpoint
@@ -370,6 +379,9 @@ class SegmentLeRobotDataset(BaseActionLeRobotDataset):
             torch.arange(0, actions + 1, self.planner.geometry.video_stride) if self.early_video_sampling else None
         )
         video_times = times if video_indexes is None else times[video_indexes]
+        if self.planner.max_action_steps == -1:
+            # Padded timeline positions reuse the last real video frame.
+            video_times = video_times.clamp(max=times[real_actions])
         video = self._read_video(meta, episode_id, video_times.tolist(), viewpoint=viewpoint)
         caption = self._caption_for_index(idx)
         if caption is None:
@@ -399,6 +411,8 @@ class SegmentLeRobotDataset(BaseActionLeRobotDataset):
         )
         if video is not None and video_indexes is not None:
             sample["video_observation_indexes"] = video_indexes
+        if self.planner.max_action_steps == -1:
+            sample["full_range"] = (start, start + real_actions + 1)
         return sample
 
     def _read_parquet_segment(self, episode_id, start, actions):

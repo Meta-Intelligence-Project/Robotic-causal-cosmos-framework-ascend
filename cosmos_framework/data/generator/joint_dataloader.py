@@ -942,6 +942,18 @@ class PackingDataLoader(JointDataLoader):
 
                 num_tokens_in_current_sample = self._compute_num_tokens_per_sample(output)
 
+                if self.max_sequence_length is not None and num_tokens_in_current_sample >= self.max_sequence_length:
+                    plans = output.get("sequence_plan", [])
+                    for plan in plans if isinstance(plans, list) else [plans]:
+                        metadata = getattr(plan, "causal_action_metadata", None)
+                        full_range = getattr(metadata, "full_range", None)
+                        if full_range is not None:
+                            raise ValueError(
+                                f"Full segment source={metadata.source!r}, observations={full_range} "
+                                f"requires {num_tokens_in_current_sample} tokens; "
+                                f"packing requires fewer than {self.max_sequence_length} tokens per sample"
+                            )
+
                 if (
                     self.max_sequence_length is not None
                     and current_sequence_length + num_tokens_in_current_sample >= self.max_sequence_length

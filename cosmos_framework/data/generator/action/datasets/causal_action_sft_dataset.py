@@ -107,6 +107,7 @@ class CausalActionSFTDataset(ActionSFTDataset):
             "source",
             "split",
             "read_options",
+            "full_range",
         ):
             raw.pop(key, None)
         raw["mode"] = mode

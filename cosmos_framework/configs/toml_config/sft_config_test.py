@@ -31,6 +31,25 @@ _CUSTOM_PAYLOAD = {
 # 1. pydantic schema validation                                               #
 # --------------------------------------------------------------------------- #
 class TestSchemaValidation:
+    @pytest.mark.parametrize("maximum", [-1, 32, 96])
+    def test_full_action_length_schema_and_override(self, maximum):
+        raw = {
+            "job": {"task": "vfm", "experiment": "action_causal_midtrain_edge"},
+            "action": {"max_action_steps": maximum, "overlap_action_steps": 161},
+        }
+        assert SFTExperimentConfig.model_validate(raw).action.max_action_steps == maximum
+        assert f"data_setting.action.max_action_steps={maximum}" in build_hydra_overrides(raw)
+
+    @pytest.mark.parametrize("maximum", [0, -2, -100])
+    def test_full_action_length_rejects_other_nonpositive_values(self, maximum):
+        with pytest.raises(ValidationError, match="max_action_steps"):
+            SFTExperimentConfig.model_validate(
+                {
+                    "job": {"task": "vfm", "experiment": "action_causal_midtrain_edge"},
+                    "action": {"max_action_steps": maximum},
+                }
+            )
+
     @pytest.mark.parametrize("strategy", ["shuffle_cycle", "sample_uniform"])
     def test_action_sampling_strategy_schema_and_override(self, strategy):
         raw = {
@@ -313,6 +332,16 @@ def _dummy_recipe_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class TestEndToEndLoader:
+    def test_template_action_full_range_recipe(self, _dummy_recipe_env, monkeypatch):
+        monkeypatch.setenv("ACTION_SOURCES_FILE", "/tmp/sources.json")
+        path = Path(__file__).parents[3] / "examples/action_pretrain/action_midtrain_edge_causal_tnd.toml"
+        config = _load_or_skip(path, extra_overrides=["data_setting.action.max_action_steps=-1"])
+        source = config.dataloader_train.dataloader.datasets.robots.dataset
+        assert source.max_action_steps == -1
+        assert source.overlap_action_steps == 161
+        assert config.model.config.tokenizer.encode_exact_durations is None
+        assert config.model.config.teacher_forcing_block_size_min == 2
+
     @pytest.mark.parametrize(
         "steps,stride,maximum,overlap,block,durations",
         [

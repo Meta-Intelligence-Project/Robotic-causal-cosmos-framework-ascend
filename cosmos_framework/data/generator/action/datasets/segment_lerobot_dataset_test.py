@@ -2,10 +2,14 @@
 """Reader boundary and alignment checks without video/model dependencies."""
 
 import json
+from collections import deque
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 import torch
 from datasets import Dataset
@@ -18,7 +22,17 @@ from cosmos_framework.data.generator.action.segment_planner import SegmentPlanne
 
 
 def make_reader(
-    monkeypatch, *, lengths=(100, 50), offset=0, from_state=False, root="synthetic", use_subtask=False, split="full"
+    monkeypatch,
+    *,
+    lengths=(100, 50),
+    offset=0,
+    from_state=False,
+    root="synthetic",
+    use_subtask=False,
+    split="full",
+    maximum=64,
+    overlap=16,
+    table_backend="hf",
 ):
     template = ActionStateTemplate55()
     size = sum(lengths)
@@ -46,6 +60,19 @@ def make_reader(
         root=root,
         tasks=pd.DataFrame({"task_index": [0]}, index=["test task"]),
     )
+    if table_backend == "parquet":
+        root = Path(root)
+        root.mkdir(parents=True, exist_ok=True)
+        for episode in episodes:
+            episode.update({"data/chunk_index": 0, "data/file_index": 0})
+        meta.episodes = Dataset.from_list(episodes)
+        meta.get_data_file_path = lambda episode_id: Path("data.parquet")
+        for key, value in columns.items():
+            meta.features[key] = {
+                "dtype": "bool" if value.dtype == torch.bool else str(value.dtype).removeprefix("torch."),
+                "shape": tuple(value.shape[1:]) or (1,),
+            }
+        pq.write_table(pa.table({key: value.tolist() for key, value in columns.items()}), root / "data.parquet")
     monkeypatch.setattr(module, "LeRobotDatasetMetadata", lambda **kwargs: meta)
     queries = []
 
@@ -62,10 +89,12 @@ def make_reader(
     monkeypatch.setattr(module.SegmentLeRobotDataset, "_get_dataset", lambda self, index: ds)
     reader = module.SegmentLeRobotDataset(
         root=root,
-        table_backend="hf",
+        table_backend=table_backend,
         template=template,
         planner=SegmentPlanner(
-            max_action_steps=64, overlap_action_steps=16, geometry=CausalBlockGeometry(temporal_compression_factor=4)
+            max_action_steps=maximum,
+            overlap_action_steps=overlap,
+            geometry=CausalBlockGeometry(temporal_compression_factor=4),
         ),
         read_options=ActionReadOptions(action_from_state=from_state, action_time_offset_steps=offset),
         use_subtask=use_subtask,
@@ -357,3 +386,234 @@ def test_duplicate_episode_logs_error_and_uses_last_record(monkeypatch, tmp_path
     assert reader._range_captions == expected._range_captions
     for i in range(len(reader)):
         assert reader[i]["ai_caption"] == expected[i]["ai_caption"]
+
+
+@pytest.mark.parametrize("table_backend", ["hf", "parquet"])
+@pytest.mark.parametrize("frames,offset", [(2, 0), (17, 0), (33, 1), (34, 0), (98, -2), (98, 3), (961, 1)])
+@pytest.mark.parametrize("from_state", [False, True])
+def test_full_episode_retains_real_rows_and_repeats_tail(
+    monkeypatch, tmp_path, table_backend, frames, offset, from_state
+):
+    from cosmos_framework.data.generator.action.block_state import build_block_sample
+
+    reader, _ = make_reader(
+        monkeypatch,
+        lengths=(frames,),
+        offset=offset,
+        from_state=from_state,
+        root=tmp_path,
+        maximum=-1,
+        overlap=10000,
+        table_backend=table_backend,
+    )
+    first, stop = max(0, -offset), min(frames, frames + 1 - offset)
+    real_actions = stop - first - 1
+    padded_actions = ((real_actions + 31) // 32) * 32
+    assert reader._segments == [(0, 0, first, real_actions)]
+    assert reader.get_shuffle_blocks() == [(0, 1)]
+    assert reader.chunk_length is None
+    raw = reader[0]
+    assert raw["full_range"] == (first, stop)
+    assert raw["state_trajectory"].shape == (padded_actions + 1, reader.template.width)
+    expected_states = torch.arange(first, stop).float()
+    expected_targets = torch.arange(first + offset, first + offset + real_actions).float()
+    if not from_state:
+        expected_targets += 1000
+    torch.testing.assert_close(raw["state_trajectory"][: real_actions + 1, 0], expected_states)
+    torch.testing.assert_close(raw["action_target"][:real_actions, 0], expected_targets)
+    assert (raw["state_trajectory"][real_actions:, 0] == expected_states[-1]).all()
+    assert (raw["action_target"][real_actions - 1 :, 0] == expected_targets[-1]).all()
+    torch.testing.assert_close(
+        raw["state_timestamps"], torch.arange(first, first + padded_actions + 1, dtype=torch.float64) / 30
+    )
+    encoded, metadata = build_block_sample(raw, template=reader.template, planner=reader.planner, history_blocks=2)
+    assert metadata.full_range == raw["full_range"]
+    assert metadata.action_mask.shape == (padded_actions, reader.template.width)
+    assert metadata.action_mask[:, 0].all()  # Padding is supervised as requested.
+    decoded = reader.template.decode_action_delta(
+        encoded["action"], metadata.anchors.repeat_interleave(32, dim=0), raw["action_mask"]
+    )
+    torch.testing.assert_close(decoded[:, 0], raw["action_target"][:, 0])
+
+
+@pytest.mark.parametrize("table_backend", ["hf", "parquet"])
+@pytest.mark.parametrize("offset", [-2, 0, 1, 3])
+def test_full_subtask_uses_one_exact_legal_range_and_keeps_caption(monkeypatch, tmp_path, table_backend, offset):
+    annotations = [(1, 34), (45, 49), (70, 130)]
+    (tmp_path / "meta").mkdir()
+    (tmp_path / "meta/episodes.jsonl").write_text(
+        json.dumps(
+            {
+                "episode_index": 0,
+                "action_config": [
+                    {"start_frame": lo, "end_frame": hi, "action_text": str(i)}
+                    for i, (lo, hi) in enumerate(annotations)
+                ],
+            }
+        )
+    )
+    reader, _ = make_reader(
+        monkeypatch,
+        lengths=(131,),
+        offset=offset,
+        root=tmp_path,
+        use_subtask=True,
+        maximum=-1,
+        table_backend=table_backend,
+    )
+    assert len(reader) == len(annotations)
+    for i, (lo, hi) in enumerate(annotations):
+        first = max(lo, -offset)
+        stop = min(hi + 1, 131, 132 - offset)
+        assert reader._segments[i] == (0, 0, first, stop - first - 1)
+        assert reader._range_bounds[i] == (lo, hi, first, stop)
+        raw = reader[i]
+        assert raw["full_range"] == (first, stop)
+        assert raw["ai_caption"] == str(i)
+
+
+def test_full_invalid_subtask_still_falls_back_to_complete_episode(monkeypatch, tmp_path):
+    (tmp_path / "meta").mkdir()
+    (tmp_path / "meta/episodes.jsonl").write_text(json.dumps({"episode_index": 0, "action_config": None}))
+    with pytest.warns(UserWarning, match="falling back to episode mode"):
+        reader, _ = make_reader(monkeypatch, lengths=(98,), root=tmp_path, use_subtask=True, maximum=-1)
+    assert reader._segments == [(0, 0, 0, 97)]
+    assert reader[0]["ai_caption"] == "test task"
+
+
+@pytest.mark.parametrize("frames", [0, 1])
+def test_full_episode_without_an_action_fails_instead_of_skipping(monkeypatch, tmp_path, frames):
+    with pytest.raises(ValueError, match="Full range.*at least one action"):
+        make_reader(monkeypatch, lengths=(frames,), root=tmp_path, maximum=-1)
+
+
+@pytest.mark.parametrize("early", [False, True])
+def test_full_video_repeats_actual_last_frame_without_reading_past_episode(monkeypatch, tmp_path, early):
+    import av
+
+    from cosmos_framework.data.generator.action.video_view import VideoViewConfig
+
+    monkeypatch.setattr(
+        "cosmos_framework.data.generator.action.video_view.ACTION_RES_SIZE_INFO", {"256": {"square": (16, 16)}}
+    )
+    reader, _ = make_reader(monkeypatch, lengths=(34,), root=tmp_path, maximum=-1, table_backend="parquet")
+    meta = reader._direct_meta
+    meta.features["camera"] = {"dtype": "video", "shape": [16, 16, 3], "names": ["height", "width", "rgb"]}
+    episode = dict(meta.episodes[0], **{"videos/camera/from_timestamp": 0.0})
+    meta.episodes = Dataset.from_list([episode])
+    meta.get_video_file_path = lambda episode_id, key: Path("camera.mp4")
+    with av.open(str(tmp_path / "camera.mp4"), "w") as container:
+        stream = container.add_stream("mpeg4", rate=30)
+        stream.width, stream.height, stream.pix_fmt = 16, 16, "yuv420p"
+        for i in range(34):
+            frame = av.VideoFrame.from_ndarray(np.full((16, 16, 3), 3 * i, dtype=np.uint8), format="rgb24")
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+    reader.video_view = VideoViewConfig(cameras={"head": "camera"})
+    reader._viewpoint = "ego_view"
+    reader.video_backend, reader._pyav_resize = "pyav_resize", True
+    reader.early_video_sampling = early
+    original = reader.video_view.read(
+        meta, 0, [i / 30 for i in range(34)], viewpoint="ego_view", tolerance_s=1e-4, video_backend="pyav_resize"
+    )
+    raw = reader[0]
+    indexes = torch.arange(0, 65, 4 if early else 1)
+    torch.testing.assert_close(raw["video"], original[:, indexes.clamp(max=33)], rtol=0, atol=0)
+    assert raw["full_range"] == (0, 34)
+    if early:
+        assert torch.equal(raw["video_observation_indexes"], indexes)
+
+
+def full_sft_sample(monkeypatch, tmp_path, mode="policy"):
+    from cosmos_framework.data.generator.action.block_state import BlockStatistics, Quantiles
+    from cosmos_framework.data.generator.action.datasets.action_sft_dataset import ActionSFTDataset
+    from cosmos_framework.data.generator.action.datasets.causal_action_sft_dataset import CausalActionSFTDataset
+    from cosmos_framework.data.generator.action.transforms import ActionTransformPipeline
+
+    reader, _ = make_reader(monkeypatch, lengths=(34,), root=tmp_path, maximum=-1, table_backend="parquet")
+    monkeypatch.setattr(
+        module.SegmentLeRobotDataset,
+        "_read_video",
+        lambda self, meta, episode_id, times, **kwargs: torch.zeros(3, len(times), 64, 64),
+    )
+    raw = reader[0]
+    statistics = BlockStatistics(
+        Quantiles(torch.full((55,), -10000.0), torch.full((55,), 10000.0), raw["state_mask"]),
+        Quantiles(torch.full((55,), -10000.0), torch.full((55,), 10000.0), raw["action_mask"]),
+    )
+    transform = ActionTransformPipeline(
+        max_action_dim=55,
+        video_temporal_downsample=4,
+        append_viewpoint_info=False,
+        append_duration_fps_timestamps=False,
+        append_resolution_info=False,
+    )
+    adapter = CausalActionSFTDataset(ActionSFTDataset(reader, transform), mode=mode, statistics=statistics)
+    return adapter[0]
+
+
+@pytest.mark.parametrize("mode", ["policy", "forward_dynamics", "inverse_dynamics"])
+def test_full_sft_adapter_keeps_padding_supervised_and_carries_original_range(monkeypatch, tmp_path, mode):
+    from cosmos_framework.data.generator.joint_dataloader import custom_collate_fn
+
+    result = full_sft_sample(monkeypatch, tmp_path, mode)
+    metadata = result["sequence_plan"].causal_action_metadata
+    assert result["action"].shape == (64, 55)
+    assert result["video"].shape == (3, 17, 64, 64)
+    assert metadata.full_range == (0, 34)
+    assert metadata.action_frame_ids.shape == (64,)
+    assert metadata.action_mask[:, 0].all()
+    assert "full_range" not in result
+    batch = custom_collate_fn([result])
+    assert batch["sequence_plan"][0].causal_action_metadata.full_range == (0, 34)
+
+
+def full_range_packer(samples, budget):
+    from cosmos_framework.data.generator.joint_dataloader import PackingDataLoader, custom_collate_fn
+
+    # Exercise the real packing loop and collate without distributed loader initialization.
+    loader = object.__new__(PackingDataLoader)
+    loader.dataloader_list = [SimpleNamespace(dataset_name="test")]
+    loader.dataset_name_list = ["test"]
+    loader.dataloaders = [iter(custom_collate_fn([sample]) for sample in samples)]
+    loader.buffers = [deque()]
+    loader.lookahead_limits = [1]
+    loader.max_samples_per_batch = None
+    loader.max_sequence_length = budget
+    loader.tokenizer_spatial_compression_factor = 16
+    loader.tokenizer_temporal_compression_factor = 4
+    loader.patch_spatial = 2
+    loader.uniae_chunk_frames = None
+    loader.sound_latent_fps = 0
+    loader.data_len = len(samples)
+    loader.global_id = 0
+    return loader
+
+
+def test_full_range_packing_keeps_lookahead_sample_without_rereading(monkeypatch, tmp_path):
+    result = full_sft_sample(monkeypatch, tmp_path)
+    loader = full_range_packer([result] * 3, None)
+    tokens = loader._compute_num_tokens_per_sample(
+        {"video": [result["video"]], "action": [result["action"]], "sequence_plan": [result["sequence_plan"]]}
+    )
+    loader.max_sequence_length = 2 * tokens
+    batches = list(loader)
+    assert len(batches) == 3  # Existing packing uses a strict '< budget' boundary.
+    for batch in batches:
+        assert len(batch["action"]) == 1
+        assert batch["action"][0][0] is result["action"]
+        assert batch["sequence_plan"][0].causal_action_metadata.full_range == (0, 34)
+
+
+@pytest.mark.parametrize("budget_offset", [-1, 0])
+def test_full_range_over_packing_budget_is_an_error(monkeypatch, tmp_path, budget_offset):
+    result = full_sft_sample(monkeypatch, tmp_path)
+    loader = full_range_packer([result], None)
+    tokens = loader._compute_num_tokens_per_sample(
+        {"video": [result["video"]], "action": [result["action"]], "sequence_plan": [result["sequence_plan"]]}
+    )
+    loader.max_sequence_length = tokens + budget_offset
+    with pytest.raises(ValueError, match="Full segment source=.*observations=\\(0, 34\\).*tokens.*packing"):
+        next(iter(loader))
