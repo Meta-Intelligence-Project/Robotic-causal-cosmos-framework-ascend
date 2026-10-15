@@ -61,6 +61,7 @@ def get_causal_action_dataset(
     template,
     table_backend="parquet",
     early_video_sampling=True,
+    window_mode="segmented",
     actions_per_block=32,
     video_stride=4,
     max_action_steps=96,
@@ -82,9 +83,17 @@ def get_causal_action_dataset(
     geometry = CausalBlockGeometry(
         actions_per_block=actions_per_block, video_stride=video_stride, temporal_compression_factor=4
     )
+    if window_mode not in ("segmented", "frame_window"):
+        raise ValueError("window_mode must be segmented or frame_window")
+    if window_mode == "frame_window" and max_action_steps <= 0:
+        raise ValueError("frame_window requires positive max_action_steps")
     planner = SegmentPlanner(
-        max_action_steps=max_action_steps, overlap_action_steps=overlap_action_steps, geometry=geometry
+        max_action_steps=max_action_steps,
+        overlap_action_steps=0 if window_mode == "frame_window" else overlap_action_steps,
+        geometry=geometry,
     )
+    if window_mode == "frame_window":
+        log.info(f"Action frame_window: max_action_steps={max_action_steps}; overlap_action_steps ignored")
     manifest = Path(sources_file)
     # 环境变量仅用于部署路径；来源语义和读取选项保留在版本化 JSON 中。
     sources = json.loads(os.path.expandvars(manifest.read_text()))["sources"]
@@ -110,6 +119,7 @@ def get_causal_action_dataset(
                 profile=profile,
                 template=template,
                 planner=planner,
+                window_mode=window_mode,
                 read_options=options,
                 video_view=video_view,
                 use_subtask=source.get("use_subtask", False),

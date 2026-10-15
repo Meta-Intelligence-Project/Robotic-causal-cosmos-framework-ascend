@@ -18,6 +18,7 @@ class ActionDataSetting:
     sources_file: str = "examples/action_pretrain/sources/mixed.json"
     table_backend: str = "parquet"
     early_video_sampling: bool = True
+    window_mode: str = "segmented"
     actions_per_block: int = 32
     max_action_steps: int = 96
     overlap_action_steps: int = 16

@@ -125,6 +125,8 @@ class BlockStateMetadata:
     statistics: BlockStatistics | None = None
     template: ActionStateTemplate | None = None
     full_range: tuple[int, int] | None = None
+    real_action_steps: int | None = None
+    num_valid_video_latents: int | None = None
 
     def __post_init__(self):
         if self.history_blocks < 1:
@@ -145,6 +147,9 @@ def build_block_sample(raw, *, template, planner, history_blocks, statistics=Non
     n = len(target)
     if n != len(state) - 1:
         raise ValueError("Expected T action targets and T+1 observations")
+    real_actions = raw.get("real_action_steps", n)
+    if type(real_actions) is not int or not 1 <= real_actions <= n:
+        raise ValueError("Expected 1 <= real_action_steps <= output action steps")
     # 两套 mask 独立；相对字段必须有有效 anchor，绝对字段不要求对应 state 有效。
     sm = template.validate_valid_mask(raw["state_mask"]).to(state.device)
     am = template.validate_valid_mask(raw["action_mask"]).to(target.device)
@@ -171,6 +176,11 @@ def build_block_sample(raw, *, template, planner, history_blocks, statistics=Non
     if statistics is not None:
         states, state_clip = statistics.state.normalize(anchors, state_mask)
         encoded, action_clip = statistics.action.normalize(encoded, action_mask)
+    # 首帧独立，其余真实抽帧按 VAE 压缩倍率向上取整，保留真实帧与 padding 混合的组。
+    # 当前只有连续尾部 padding；这里只传有效长度，在 loss 入口构造 mask。
+    sampled_real_frames = real_actions // geometry.video_stride
+    compression = geometry.temporal_compression_factor
+    valid_latents = 1 + (sampled_real_frames + compression - 1) // compression
     # anchor 对应预测 block 前的视频边界 latent，默认得到 0、2、4……。
     latent_indexes = torch.tensor([geometry.block_latent_span(b)[0] - 1 for b in range(blocks)], device=state.device)
     metadata = BlockStateMetadata(
@@ -192,6 +202,8 @@ def build_block_sample(raw, *, template, planner, history_blocks, statistics=Non
         state_latent_indexes=latent_indexes,
         template=template,
         full_range=raw.get("full_range"),
+        real_action_steps=real_actions,
+        num_valid_video_latents=valid_latents,
     )
     # 保留首帧并按 stride 抽视频帧；action 不抽帧，此处不执行 VAE 编码。
     video = raw.get("video")

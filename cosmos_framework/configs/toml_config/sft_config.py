@@ -111,6 +111,7 @@ class ActionConfig(BaseModel):
     sources_file: str = "examples/action_pretrain/sources/mixed.json"
     table_backend: Literal["parquet", "hf"] = "parquet"
     early_video_sampling: bool = True
+    window_mode: Literal["segmented", "frame_window"] = "segmented"
     actions_per_block: int = Field(default=32, ge=1)
     max_action_steps: int = Field(default=96, ge=-1)
     overlap_action_steps: int = Field(default=16, ge=0)
@@ -128,6 +129,12 @@ class ActionConfig(BaseModel):
         if value == 0:
             raise ValueError("max_action_steps must be -1 or a positive integer")
         return value
+
+    @model_validator(mode="after")
+    def validate_window_mode(self):
+        if self.window_mode == "frame_window" and self.max_action_steps <= 0:
+            raise ValueError("frame_window requires positive max_action_steps")
+        return self
 
 
 # ---------------------------------------------------------------- model

@@ -2,6 +2,7 @@
 """Separate action training entry; the video-only causal entry remains unchanged."""
 
 from contextlib import contextmanager
+from dataclasses import replace
 
 import torch
 
@@ -144,26 +145,46 @@ class OmniMoTCausalActionModel(OmniMoTModel):
         causal_action_modes=None,
         action_sample_indices=None,
     ):
-        action = data_batch_packed.action
-        original_mask = action.condition_mask
-        action.condition_mask = [
-            1.0 - (1.0 - c) * m.action_mask.to(c.device)
-            for c, m in zip(original_mask, data_batch_packed.causal_action_metadata, strict=True)
-        ]
-        try:
-            return super()._compute_losses(
-                out_net,
-                data_batch_packed,
-                gen_data_noised,
-                timesteps,
-                is_image_batch,
-                timesteps_action=aligned_action_schedule(timesteps, data_batch_packed),
-                timesteps_sound=timesteps_sound,
-                causal_action_modes=causal_action_modes,
-                action_sample_indices=action_sample_indices,
-            )
-        finally:
-            action.condition_mask = original_mask
+        action_masks, video_masks = [], []
+        for ac, vc, metadata in zip(
+            data_batch_packed.action.condition_mask,
+            data_batch_packed.vision.condition_mask,
+            data_batch_packed.causal_action_metadata,
+            strict=True,
+        ):
+            action_loss_mask = 1.0 - (1.0 - ac) * metadata.action_mask.to(ac.device)
+            real_actions = getattr(metadata, "real_action_steps", None)
+            if real_actions is not None:
+                if type(real_actions) is not int or not 1 <= real_actions <= ac.shape[0]:
+                    raise ValueError("Real action length must be within the output action range")
+                if real_actions < ac.shape[0]:
+                    action_loss_mask[real_actions:] = 1.0
+            action_masks.append(action_loss_mask)
+            valid_latents = getattr(metadata, "num_valid_video_latents", None)
+            if valid_latents is not None:
+                if type(valid_latents) is not int or not 1 <= valid_latents <= vc.shape[0]:
+                    raise ValueError("Valid video latent count must be within the output video range")
+                if valid_latents < vc.shape[0]:
+                    vc = vc.clone()
+                    vc[valid_latents:] = 1.0
+            video_masks.append(vc)
+        # 只替换 loss 使用的视图，原始条件、加噪输入和 attention 数据保持不变。
+        loss_packed = replace(
+            data_batch_packed,
+            action=replace(data_batch_packed.action, condition_mask=action_masks),
+            vision=replace(data_batch_packed.vision, condition_mask=video_masks),
+        )
+        return super()._compute_losses(
+            out_net,
+            loss_packed,
+            gen_data_noised,
+            timesteps,
+            is_image_batch,
+            timesteps_action=aligned_action_schedule(timesteps, data_batch_packed),
+            timesteps_sound=timesteps_sound,
+            causal_action_modes=causal_action_modes,
+            action_sample_indices=action_sample_indices,
+        )
 
     def post_noise_packing_hook(self, packed_sequence, gen_data_clean, teacher_forcing_geometry=None):
         if teacher_forcing_geometry is None:

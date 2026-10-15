@@ -46,6 +46,73 @@ def build(raw, template, planner, **kwargs):
     return build_block_sample(raw, template=template, planner=planner, history_blocks=2, **kwargs)
 
 
+@pytest.mark.parametrize(
+    "real_actions,expected",
+    [(1, [True, False, False]), (6, [True, True, False]), (20, [True, True, True]), (32, [True, True, True])],
+)
+@pytest.mark.parametrize("early", [False, True])
+@pytest.mark.parametrize("full_range", [False, True])
+def test_valid_lengths_follow_sampled_video_groups_independently_of_window_mode(
+    real_actions, expected, early, full_range
+):
+    raw, template, planner = sample(n=32)
+    raw["real_action_steps"] = real_actions
+    if full_range:
+        raw["full_range"] = (0, real_actions + 1)
+    if early:
+        raw["video_observation_indexes"] = torch.arange(0, 33, 4)
+        raw["video"] = raw["video"][:, ::4]
+    result, metadata = build(raw, template, planner)
+    assert metadata.real_action_steps == real_actions
+    assert metadata.num_valid_video_latents == sum(expected)
+    assert type(metadata.real_action_steps) is type(metadata.num_valid_video_latents) is int
+    assert metadata.action_mask[:, 0].all()
+    assert metadata.action_mask[:, 1].sum() == 0
+    # Loss validity never sanitizes padded action/video inputs or changes channel statistics.
+    reference, reference_metadata = build(sample(n=32)[0], template, planner)
+    torch.testing.assert_close(result["action"], reference["action"])
+    torch.testing.assert_close(result["video"], reference["video"])
+    torch.testing.assert_close(metadata.action_mask, reference_metadata.action_mask)
+    assert not hasattr(metadata, "action_loss_mask")
+    assert not hasattr(metadata, "video_loss_mask")
+    moved = metadata.to("cpu")
+    assert moved.real_action_steps == real_actions
+    assert moved.num_valid_video_latents == sum(expected)
+
+
+@pytest.mark.parametrize("real_actions", [0, -1, 33, True, 1.5])
+def test_valid_lengths_reject_invalid_real_length(real_actions):
+    raw, template, planner = sample(n=32)
+    raw["real_action_steps"] = real_actions
+    with pytest.raises(ValueError, match="real_action_steps"):
+        build(raw, template, planner)
+
+
+def test_valid_lengths_follow_nonstandard_stride_and_vae_compression():
+    raw, template, _ = sample()
+    geometry = CausalBlockGeometry(actions_per_block=24, video_stride=3, temporal_compression_factor=2)
+    planner = SegmentPlanner(max_action_steps=96, overlap_action_steps=16, geometry=geometry)
+    raw["real_action_steps"] = 4
+    _, metadata = build(raw, template, planner)
+    assert metadata.real_action_steps == 4
+    assert metadata.num_valid_video_latents == 2
+
+
+@pytest.mark.parametrize("steps,stride,compression", [(32, 4, 4), (24, 3, 2), (16, 2, 4)])
+def test_valid_latent_count_matches_explicit_vae_groups_at_every_tail_position(steps, stride, compression):
+    raw, template, _ = sample()
+    geometry = CausalBlockGeometry(
+        actions_per_block=steps, video_stride=stride, temporal_compression_factor=compression
+    )
+    planner = SegmentPlanner(max_action_steps=96, overlap_action_steps=16, geometry=geometry)
+    for real_actions in range(1, 97):
+        raw["real_action_steps"] = real_actions
+        result, metadata = build(raw, template, planner)
+        sampled_real = result["video"][0, :, 0, 0] <= real_actions
+        expected = torch.cat((sampled_real[:1], sampled_real[1:].reshape(-1, compression).any(dim=1)))
+        assert metadata.num_valid_video_latents == int(expected.sum())
+
+
 def statistics(raw, planner, bound=100.0):
     d = raw["state_mask"].numel()
     return BlockStatistics(

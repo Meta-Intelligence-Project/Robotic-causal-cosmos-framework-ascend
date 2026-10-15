@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class ActionTrainingRange:
-    """episode 内的 observation 半开范围；caption=None 沿用原任务文本。"""
+    """episode 内的原始 observation 半开范围，不含切片扩展；caption=None 沿用任务文本。"""
 
     start: int
     stop: int
@@ -50,8 +50,9 @@ class SegmentLeRobotDataset(BaseActionLeRobotDataset):
         root: str | Path,
         template: ActionStateTemplate,
         planner: SegmentPlanner,
+        window_mode: str = "segmented",
         read_options: ActionReadOptions = ActionReadOptions(),
-        use_subtask: bool = False,  # 仅训练按 action_config 切分；统计保持默认 episode 模式。
+        use_subtask: bool = False,  # frame_window 只取起点文本，segmented 按 action_config 切分。
         split: str = "full",
         split_seed: int = 0,
         split_val_ratio: float = 0.0,
@@ -64,6 +65,13 @@ class SegmentLeRobotDataset(BaseActionLeRobotDataset):
     ):
         if table_backend not in ("parquet", "hf"):
             raise ValueError("table_backend must be parquet or hf")
+        if window_mode not in ("segmented", "frame_window"):
+            raise ValueError("window_mode must be segmented or frame_window")
+        if window_mode == "frame_window":
+            if planner.max_action_steps <= 0:
+                raise ValueError("frame_window requires positive max_action_steps")
+            planner.geometry.validate_observation_frames(planner.max_action_steps + 1)
+        self.window_mode = window_mode
         self.root = Path(root)
         self.table_backend = table_backend
         self.early_video_sampling = early_video_sampling
@@ -99,10 +107,13 @@ class SegmentLeRobotDataset(BaseActionLeRobotDataset):
         # 索引计数属于当前 Reader，不修改调用方或其他 Reader 的 planner。
         self.planner = SegmentPlanner(
             max_action_steps=planner.max_action_steps,
-            overlap_action_steps=planner.overlap_action_steps,
+            overlap_action_steps=0 if window_mode == "frame_window" else planner.overlap_action_steps,
             geometry=planner.geometry,
         )
         self._segments: list[tuple[int, int, int, int]] = []  # ds、episode、源表起点、action 数
+        # frame_window 每个可采 episode 仅一条：ds、episode、源表 episode 起点、合法 observation [first, stop)。
+        self._frame_ranges: list[tuple[int, int, int, int, int]] = []
+        self.skipped_window_episodes = 0
         # 每个保留范围只存一次文本；累计终点同时用于 shuffle 和片段到范围的查找。
         self._range_captions: list[str | None] = []
         # 每个保留 subtask 的 (标注起点, 标注终点, 读取起点, 读取终点)，不按窗口重复存储。
@@ -116,8 +127,22 @@ class SegmentLeRobotDataset(BaseActionLeRobotDataset):
             prefetched_meta=meta,
         )
 
-        # 建完索引只需范围 caption，释放临时标注边界，不缓存完整 JSONL。
-        self._subtask_ranges.clear()
+        if window_mode == "segmented":
+            # 旧路径建完索引只需范围 caption，释放临时标注边界。
+            self._subtask_ranges.clear()
+        else:
+            # 新路径保留可采 episode 的原始标注供起点查找，不缓存完整 JSONL 或逐帧文本。
+            kept = {episode_id for _, episode_id, _, _, _ in self._frame_ranges}
+            self._subtask_ranges = {k: v for k, v in self._subtask_ranges.items() if k in kept}
+            logger.info(
+                "Frame windows source=%s: episodes=%s, candidates=%s, skipped_empty_episodes=%s; "
+                "max_action_steps=%s, overlap_action_steps ignored",
+                self.root,
+                len(self._frame_ranges),
+                len(self),
+                self.skipped_window_episodes,
+                planner.max_action_steps,
+            )
 
     def _load_episode_metadata(self, root, meta):
         """流式读取 FPS 和可选 subtask；episode ID 从 0 连续编号。"""
@@ -155,34 +180,47 @@ class SegmentLeRobotDataset(BaseActionLeRobotDataset):
                         length = int(ep["dataset_to_index"]) - int(ep["dataset_from_index"])
                         annotations = episode.get("action_config")
                         try:
-                            if not isinstance(annotations, list) or not annotations:
-                                raise ValueError("action_config must be a non-empty list")
-                            parsed, previous_stop = [], 0
-                            for i, annotation in enumerate(annotations):
-                                if not isinstance(annotation, dict):
-                                    raise ValueError(f"subtask {i} must be an object")
-                                start, stop = annotation.get("start_frame"), annotation.get("end_frame")
-                                caption = annotation.get("action_text")
-                                if type(start) is not int or type(stop) is not int:
-                                    raise ValueError(f"subtask {i} frame bounds must be integers")
-                                if not previous_stop <= start < stop <= length:
-                                    raise ValueError(
-                                        f"subtask {i} bounds must be ordered, non-overlapping and within the episode"
-                                    )
-                                if not isinstance(caption, str) or not caption.strip():
-                                    raise ValueError(f"subtask {i} action_text must be non-empty text")
-                                parsed.append(ActionTrainingRange(start, stop, caption, str(i)))
-                                previous_stop = stop
-                            ranges[episode_id] = parsed
+                            ranges[episode_id] = self._parse_subtask_annotations(annotations, length)
                         except ValueError as error:
+                            fallback = "task text" if self.window_mode == "frame_window" else "episode mode"
                             warnings.warn(
-                                f"Episode {episode_id} in {self.root}: falling back to episode mode: {error}",
+                                f"Episode {episode_id} in {self.root}: falling back to {fallback}: {error}",
                                 UserWarning,
                                 stacklevel=2,
                             )
-                            ranges[episode_id] = [ActionTrainingRange(0, length)]
+                            # 无有效标注；由窗口路径决定范围或文本回退，不冒充原始标注。
+                            ranges[episode_id] = []
         values.setflags(write=False)
         return values, ranges
+
+    @staticmethod
+    def _parse_subtask_annotations(annotations, episode_length):
+        """校验并只保留原始范围及文本，不决定窗口边界；任一标注非法则整组失败。"""
+        if not isinstance(annotations, list) or not annotations:
+            raise ValueError("action_config must be a non-empty list")
+        parsed, previous_stop = [], 0
+        for i, annotation in enumerate(annotations):
+            if not isinstance(annotation, dict):
+                raise ValueError(f"subtask {i} must be an object")
+            start, stop = annotation.get("start_frame"), annotation.get("end_frame")
+            caption = annotation.get("action_text")
+            if type(start) is not int or type(stop) is not int:
+                raise ValueError(f"subtask {i} frame bounds must be integers")
+            if not previous_stop <= start < stop <= episode_length:
+                raise ValueError(f"subtask {i} bounds must be ordered, non-overlapping and within the episode")
+            if not isinstance(caption, str) or not caption.strip():
+                raise ValueError(f"subtask {i} action_text must be non-empty text")
+            parsed.append(ActionTrainingRange(start, stop, caption, str(i)))
+            previous_stop = stop
+        return parsed
+
+    @staticmethod
+    def _find_subtask_annotation(ranges: list[ActionTrainingRange], frame: int) -> ActionTrainingRange | None:
+        """在已校验的原始标注 [start, stop) 中查找；间隙返回 None，不使用扩展读取范围。"""
+        index = bisect_right(ranges, frame, key=lambda training_range: training_range.start) - 1
+        if index >= 0 and frame < ranges[index].stop:
+            return ranges[index]
+        return None
 
     def _read_source_fps(self, episode_id):
         """按 episode ID 直接索引；NaN 表示未声明，回退到 meta.fps。"""
@@ -201,7 +239,7 @@ class SegmentLeRobotDataset(BaseActionLeRobotDataset):
                 UserWarning,
                 stacklevel=2,
             )
-            ranges = [ActionTrainingRange(0, episode_length)]
+        ranges = ranges or [ActionTrainingRange(0, episode_length)]
         covered = 0
         for training_range in ranges:
             covered += training_range.stop - training_range.start
@@ -210,6 +248,13 @@ class SegmentLeRobotDataset(BaseActionLeRobotDataset):
 
     def _caption_for_index(self, idx):
         """按范围查找文本，避免为重叠片段重复保存 caption。"""
+        if self.window_mode == "frame_window":
+            _, episode_id, start, _ = self._resolve_index(idx)
+            if idx < 0:
+                idx += len(self)
+            _, _, begin, _, _ = self._frame_ranges[bisect_right(self._episode_cum_ends, idx)]
+            annotation = self._find_subtask_annotation(self._subtask_ranges.get(episode_id, []), start - begin)
+            return annotation.caption if annotation is not None else None
         if idx < 0:
             idx += len(self._segments)
         return self._range_captions[bisect_right(self._episode_cum_ends, idx)]
@@ -255,6 +300,41 @@ class SegmentLeRobotDataset(BaseActionLeRobotDataset):
             ep = meta.episodes[episode_id]
             begin, end = int(ep["dataset_from_index"]), int(ep["dataset_to_index"])
             count = end - begin
+            if self.window_mode == "frame_window":
+                # first/stop 是 episode 内合法 observation 区间 [first, stop)，begin 是源表中的 episode 起点。
+                # action 的目标行 = action 起点 + offset；负 offset 时跳过开头，避免目标落到 episode 前。
+                first = max(0, -offset)
+                # 最后一个 action 从 stop-2 开始，其目标 stop-2+offset 必须 < count，
+                # 因此 stop <= count+1-offset；observation 本身还要求 stop <= count。
+                # max(first, ...) 将无可读数据的情况表示为空区间。
+                stop = max(first, min(count, count + 1 - offset))
+                # 可用 action 数 = observation 数 - 1；连一步真实 action 都没有时跳过。
+                available_actions = max(0, stop - first - 1)
+                if not available_actions:
+                    self.skipped_window_episodes += 1
+                    continue
+                # 长 episode 只保留能读满 L 的起点：first .. stop-L-1。
+                # 整个合法范围不足 L 时，只保留 first 一条，读取全部真实数据后补齐到最近的 block。
+                candidates = max(1, available_actions - self.planner.max_action_steps + 1)
+                # 每个 episode 只存一条区间；抽样时再计算具体起点，避免按帧展开索引。
+                self._frame_ranges.append((ds_idx, episode_id, begin, first, stop))
+                self._num_valid_indices += candidates
+                # 保存累计候选数，供 _resolve_index 二分定位 episode。
+                # 例如 L=96、两个 episode 各有 100/50 个可用 action，候选数为 5/1，累计终点为 [5, 6]。
+                self._episode_cum_ends.append(self._num_valid_indices)
+                if self.use_subtask:
+                    # 新模式的 subtask 只用于起点文本；缺失标注不会减少上面已计入的候选。
+                    ranges = self._subtask_ranges.get(episode_id)
+                    if ranges is None:
+                        warnings.warn(
+                            f"Episode {episode_id} in {self.root}: falling back to task text: missing metadata",
+                            UserWarning,
+                            stacklevel=2,
+                        )
+                    # 仅统计未标注的 observation 数，不据此过滤窗口或改变 episode 边界。
+                    self.unannotated_observation_frames += count - sum(r.stop - r.start for r in ranges or [])
+                # 新模式的 episode 索引已建好，跳过下面旧路径的 subtask/episode 切片规划。
+                continue
             for training_range in self._iter_training_ranges(episode_id, count):
                 lo, hi = training_range.start, training_range.stop
                 if not 0 <= lo <= hi <= count:
@@ -282,10 +362,21 @@ class SegmentLeRobotDataset(BaseActionLeRobotDataset):
                     self._range_captions.append(training_range.caption)
                     if is_subtask:
                         self._range_bounds.append((lo, hi, first, stop))
-        self._num_valid_indices = len(self._segments)
+        if self.window_mode == "segmented":
+            self._num_valid_indices = len(self._segments)
 
     def _resolve_index(self, idx):
-        """新索引空间的一项就是一段；不再把 idx 解释成滑窗起点。"""
+        """按窗口方式将候选编号映射到 ds、episode、源表起点和真实 action 数。"""
+        if self.window_mode == "frame_window":
+            if idx < 0:
+                idx += len(self)
+            if not 0 <= idx < len(self):
+                raise IndexError(f"Frame window index {idx} out of range for size {len(self)}")
+            span = bisect_right(self._episode_cum_ends, idx)
+            ds_idx, episode_id, begin, first, stop = self._frame_ranges[span]
+            previous = self._episode_cum_ends[span - 1] if span else 0
+            start = first + idx - previous
+            return ds_idx, episode_id, begin + start, min(self.planner.max_action_steps, stop - start - 1)
         return self._segments[idx]
 
     def _read_masks(self, row, *, ds=None, values=None):
@@ -332,26 +423,39 @@ class SegmentLeRobotDataset(BaseActionLeRobotDataset):
             raise TypeError("pyav_resize expected uint8 video")
         return video_tchw.permute(1, 0, 2, 3)
 
+    def _pad_to_action_steps(self, state, target, times, *, real_actions, output_actions):
+        """保留真实行，重复末尾补到指定 action 数；时间轴按存储 FPS 延长。"""
+        if not 1 <= real_actions <= output_actions:
+            raise ValueError("Padding requires 1 <= real_actions <= output_actions")
+        padding = output_actions - real_actions
+        if padding:
+            state = torch.cat((state, state[-1:].expand(padding, -1)))
+            target = torch.cat((target, target[-1:].expand(padding, -1)))
+            times = torch.cat((times, times[-1] + torch.arange(1, padding + 1, dtype=times.dtype) / self.fps))
+        return state, target, times
+
     def __getitem__(self, idx):
         """按实际长度批量读取，目标偏移只在这里执行一次。"""
-        ds_idx, episode_id, start, actions = self._resolve_index(idx)
+        ds_idx, episode_id, start, real_actions = self._resolve_index(idx)
         # 按当前 episode 获取原始 FPS；只有字段缺失时才回退到 meta.fps。
         source_fps = self._read_source_fps(episode_id)
         options = self.read_options
         if self.table_backend == "parquet":
             meta = self._direct_meta
-            state, target, state_mask, action_mask, times, task = self._read_parquet_segment(episode_id, start, actions)
+            state, target, state_mask, action_mask, times, task = self._read_parquet_segment(
+                episode_id, start, real_actions
+            )
         else:
             ds = self._get_dataset(ds_idx)
             meta = ds.meta
             ds._ensure_hf_dataset_loaded()
-            rows = list(range(start, start + actions + 1))
+            rows = list(range(start, start + real_actions + 1))
             target_rows = [row + options.action_time_offset_steps for row in rows[:-1]]
             # 不经过 LeRobot 的边界 clamp，也不改共享 delta_timestamps。
             observations = ds._query_hf_dataset({options.state_key: rows})
             if options.action_from_state and options.action_time_offset_steps in (0, 1):
                 offset = options.action_time_offset_steps
-                target = observations[options.state_key][offset : offset + actions]
+                target = observations[options.state_key][offset : offset + real_actions]
             else:
                 target = ds._query_hf_dataset({options.target_key: target_rows})[options.target_key]
             state_mask, action_mask = self._read_masks(rows[0], ds=ds)
@@ -363,15 +467,13 @@ class SegmentLeRobotDataset(BaseActionLeRobotDataset):
         # 先用存储 FPS 检查连续采样，再将输出 FPS 切换到真实训练时间尺度。
         if not torch.allclose(times[1:] - times[:-1], torch.full_like(times[1:], 1 / self.fps), atol=1e-5, rtol=1e-4):
             raise ValueError(f"Episode {episode_id}: timestamp intervals must match meta.fps={self.fps}")
-        real_actions = actions
-        if self.planner.max_action_steps == -1:
+        actions = real_actions  # 输出长度与真实读取长度分开，正数切片保持原长度。
+        if self.window_mode == "frame_window" or self.planner.max_action_steps == -1:
             # Preserve every real row, then repeat the tail to complete a block.
-            padding = (-actions) % self.planner.geometry.actions_per_block
-            if padding:
-                state = torch.cat((state, state[-1:].expand(padding, -1)))
-                target = torch.cat((target, target[-1:].expand(padding, -1)))
-                times = torch.cat((times, times[-1] + torch.arange(1, padding + 1, dtype=times.dtype) / self.fps))
-                actions += padding
+            actions += (-real_actions) % self.planner.geometry.actions_per_block
+        state, target, times = self._pad_to_action_steps(
+            state, target, times, real_actions=real_actions, output_actions=actions
+        )
         # action 时间标记区间起点；目标实际读取时刻由 read_options 声明。
         # 当前使用默认布局；后续布局增强在此选择本次样本的 viewpoint。
         viewpoint = self._viewpoint
@@ -379,7 +481,7 @@ class SegmentLeRobotDataset(BaseActionLeRobotDataset):
             torch.arange(0, actions + 1, self.planner.geometry.video_stride) if self.early_video_sampling else None
         )
         video_times = times if video_indexes is None else times[video_indexes]
-        if self.planner.max_action_steps == -1:
+        if actions > real_actions:
             # Padded timeline positions reuse the last real video frame.
             video_times = video_times.clamp(max=times[real_actions])
         video = self._read_video(meta, episode_id, video_times.tolist(), viewpoint=viewpoint)
@@ -398,6 +500,7 @@ class SegmentLeRobotDataset(BaseActionLeRobotDataset):
             state_timestamps=times,
             action_timestamps=times[:-1].clone(),
             action_state_indexes=torch.arange(actions),
+            real_action_steps=real_actions,
             source=str(self.root),
             split=self.split,
             # 存储时间戳仍搭配 storage_fps；训练 FPS 在读取完成后统一切换。

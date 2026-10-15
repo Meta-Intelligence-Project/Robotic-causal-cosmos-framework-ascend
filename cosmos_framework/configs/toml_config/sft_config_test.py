@@ -31,6 +31,26 @@ _CUSTOM_PAYLOAD = {
 # 1. pydantic schema validation                                               #
 # --------------------------------------------------------------------------- #
 class TestSchemaValidation:
+    @pytest.mark.parametrize("mode", ["segmented", "frame_window"])
+    def test_action_window_mode_schema_and_override(self, mode):
+        raw = {
+            "job": {"task": "vfm", "experiment": "action_causal_midtrain_edge"},
+            "action": {"window_mode": mode, "max_action_steps": 32, "overlap_action_steps": 161},
+        }
+        assert SFTExperimentConfig.model_validate(raw).action.window_mode == mode
+        assert f"data_setting.action.window_mode={mode}" in build_hydra_overrides(raw)
+
+    def test_action_window_mode_default_and_invalid_combinations(self):
+        raw = {"job": {"task": "vfm", "experiment": "action_causal_midtrain_edge"}}
+        assert SFTExperimentConfig.model_validate(raw).action.window_mode == "segmented"
+        for action in (
+            {"window_mode": "unknown"},
+            {"window_mode": "frame_window", "max_action_steps": -1},
+            {"window_mode": "frame_window", "max_action_steps": 0},
+        ):
+            with pytest.raises(ValidationError, match="window_mode|max_action_steps"):
+                SFTExperimentConfig.model_validate(dict(raw, action=action))
+
     @pytest.mark.parametrize("maximum", [-1, 32, 96])
     def test_full_action_length_schema_and_override(self, maximum):
         raw = {
@@ -332,6 +352,18 @@ def _dummy_recipe_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class TestEndToEndLoader:
+    def test_template_action_frame_window_recipe(self, tmp_path, _dummy_recipe_env, monkeypatch):
+        monkeypatch.setenv("ACTION_SOURCES_FILE", "/tmp/sources.json")
+        recipe = Path(__file__).parents[3] / "examples/action_pretrain/action_midtrain_edge_causal_tnd.toml"
+        path = tmp_path / "frame_window.toml"
+        path.write_text(recipe.read_text().replace("[action]", '[action]\nwindow_mode = "frame_window"'))
+        config = _load_or_skip(path, extra_overrides=["data_setting.action.max_action_steps=96"])
+        source = config.dataloader_train.dataloader.datasets.robots.dataset
+        assert config.data_setting.action.window_mode == source.window_mode == "frame_window"
+        assert source.max_action_steps == 96
+        assert source.overlap_action_steps == 161
+        assert list(config.model.config.tokenizer.encode_exact_durations) == [9, 17, 25]
+
     def test_template_action_full_range_recipe(self, _dummy_recipe_env, monkeypatch):
         monkeypatch.setenv("ACTION_SOURCES_FILE", "/tmp/sources.json")
         path = Path(__file__).parents[3] / "examples/action_pretrain/action_midtrain_edge_causal_tnd.toml"

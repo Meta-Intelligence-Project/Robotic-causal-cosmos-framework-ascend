@@ -33,6 +33,10 @@ def make_reader(
     maximum=64,
     overlap=16,
     table_backend="hf",
+    timestamp_start=0.0,
+    window_mode="segmented",
+    task_indexes=None,
+    split_val_ratio=0.0,
 ):
     template = ActionStateTemplate55()
     size = sum(lengths)
@@ -44,8 +48,8 @@ def make_reader(
         "action": state + 1000,
         "mask_state": mask.expand(size, -1),
         "mask_action": mask.expand(size, -1),
-        "timestamp": torch.cat([torch.arange(n, dtype=torch.float64) / 30 for n in lengths]),
-        "task_index": torch.zeros(size, dtype=torch.long),
+        "timestamp": timestamp_start + torch.cat([torch.arange(n, dtype=torch.float64) / 30 for n in lengths]),
+        "task_index": torch.zeros(size, dtype=torch.long) if task_indexes is None else torch.tensor(task_indexes),
     }
     episodes = []
     start = 0
@@ -58,7 +62,7 @@ def make_reader(
         episodes=episodes,
         total_episodes=len(lengths),
         root=root,
-        tasks=pd.DataFrame({"task_index": [0]}, index=["test task"]),
+        tasks=pd.DataFrame({"task_index": [0, 1]}, index=["test task", "second task"]),
     )
     if table_backend == "parquet":
         root = Path(root)
@@ -93,14 +97,157 @@ def make_reader(
         template=template,
         planner=SegmentPlanner(
             max_action_steps=maximum,
-            overlap_action_steps=overlap,
+            overlap_action_steps=0 if window_mode == "frame_window" else overlap,
             geometry=CausalBlockGeometry(temporal_compression_factor=4),
         ),
         read_options=ActionReadOptions(action_from_state=from_state, action_time_offset_steps=offset),
         use_subtask=use_subtask,
+        window_mode=window_mode,
         split=split,
+        split_val_ratio=split_val_ratio,
     )
     return reader, queries
+
+
+def test_annotation_lookup_uses_original_half_open_ranges():
+    reader = object.__new__(module.SegmentLeRobotDataset)
+    annotations = [
+        {"start_frame": lo, "end_frame": hi, "action_text": caption, "unused": {"large": "metadata"}}
+        for lo, hi, caption in [(2, 10, "  first caption  "), (10, 15, "second"), (20, 25, "third")]
+    ]
+    ranges = reader._parse_subtask_annotations(annotations, 30)
+    assert ranges == [
+        module.ActionTrainingRange(2, 10, "  first caption  ", "0"),
+        module.ActionTrainingRange(10, 15, "second", "1"),
+        module.ActionTrainingRange(20, 25, "third", "2"),
+    ]
+    reader.read_options = ActionReadOptions(action_time_offset_steps=1)
+    reader.planner = SegmentPlanner(
+        max_action_steps=64, overlap_action_steps=16, geometry=CausalBlockGeometry(temporal_compression_factor=4)
+    )
+    # 切片可以向前、向后借帧，但不能扩大 caption 所属范围。
+    assert reader._subtask_read_bounds(ranges[2], 100) == (20, 53)
+    assert reader._subtask_read_bounds(ranges[2], 30) == (0, 30)
+    expected_matches = {
+        -1: None,
+        0: None,
+        1: None,
+        2: ranges[0],
+        9: ranges[0],
+        10: ranges[1],
+        14: ranges[1],
+        15: None,
+        19: None,
+        20: ranges[2],
+        24: ranges[2],
+        25: None,
+        29: None,
+        30: None,
+    }
+    for frame, expected in expected_matches.items():
+        assert reader._find_subtask_annotation(ranges, frame) is expected
+        assert reader._find_subtask_annotation([], frame) is None
+    # 读取范围计算不修改原始标注。
+    assert [(r.start, r.stop) for r in ranges] == [(2, 10), (10, 15), (20, 25)]
+
+
+def test_metadata_does_not_turn_invalid_annotations_into_an_episode_annotation(tmp_path):
+    reader = object.__new__(module.SegmentLeRobotDataset)
+    reader.root, reader.use_subtask = tmp_path, True
+    reader.window_mode = "segmented"
+    (tmp_path / "meta").mkdir()
+    valid = {"start_frame": 2, "end_frame": 10, "action_text": "valid"}
+    invalid = {"start_frame": 9, "end_frame": 15, "action_text": "overlap"}
+    (tmp_path / "meta/episodes.jsonl").write_text(
+        "\n".join(
+            json.dumps(record)
+            for record in [
+                {"episode_index": 0, "action_config": [valid]},
+                {"episode_index": 1, "action_config": [valid, invalid]},
+            ]
+        )
+    )
+    meta = SimpleNamespace(total_episodes=3, episodes=[{"dataset_from_index": 0, "dataset_to_index": 30}] * 3)
+    with pytest.warns(UserWarning, match="Episode 1.*falling back to episode mode"):
+        _, reader._subtask_ranges = reader._load_episode_metadata(tmp_path, meta)
+    assert reader._subtask_ranges == {0: [module.ActionTrainingRange(2, 10, "valid", "0")], 1: []}
+    reader.unannotated_observation_frames = 0
+    assert list(reader._iter_training_ranges(1, 30)) == [module.ActionTrainingRange(0, 30)]
+    with pytest.warns(UserWarning, match="Episode 2.*missing metadata"):
+        assert list(reader._iter_training_ranges(2, 30)) == [module.ActionTrainingRange(0, 30)]
+    assert reader.unannotated_observation_frames == 0  # 沿用旧 episode 回退计数。
+
+
+@pytest.mark.parametrize("table_backend", ["hf", "parquet"])
+@pytest.mark.parametrize("maximum", [64, -1])
+@pytest.mark.parametrize("use_subtask", [False, True])
+def test_annotation_refactor_preserves_sample_indexes_rows_and_captions(
+    monkeypatch, tmp_path, table_backend, maximum, use_subtask
+):
+    captions = ["  lift cup  ", "place", "release"]
+    (tmp_path / "meta").mkdir()
+    (tmp_path / "meta/episodes.jsonl").write_text(
+        json.dumps(
+            {
+                "episode_index": 0,
+                "action_config": [
+                    {"start_frame": lo, "end_frame": hi, "action_text": caption}
+                    for (lo, hi), caption in zip([(1, 34), (45, 49), (70, 130)], captions)
+                ],
+            }
+        )
+    )
+    if use_subtask:
+        with pytest.warns(UserWarning, match="Episode 1.*missing metadata"):
+            reader, _ = make_reader(
+                monkeypatch,
+                lengths=(131, 100),
+                root=tmp_path,
+                offset=1,
+                use_subtask=True,
+                maximum=maximum,
+                table_backend=table_backend,
+            )
+        if maximum == -1:
+            expected = [(0, 0, 1, 33), (0, 0, 45, 4), (0, 0, 70, 60), (0, 1, 131, 99)]
+            bounds = [(1, 34, 1, 35), (45, 49, 45, 50), (70, 130, 70, 131)]
+            blocks = [(0, 1), (1, 1), (2, 1), (3, 1)]
+        else:
+            expected = [(0, 0, 1, 64), (0, 0, 45, 32), (0, 0, 66, 64), (0, 1, 131, 64), (0, 1, 166, 64)]
+            bounds = [(1, 34, 1, 66), (45, 49, 45, 78), (70, 130, 66, 131)]
+            blocks = [(0, 1), (1, 1), (2, 1), (3, 2)]
+        expected_captions = captions + ["test task"] * (len(expected) - 3)
+        assert reader._range_bounds == bounds
+        assert reader.unannotated_observation_frames == 34
+    else:
+        reader, _ = make_reader(
+            monkeypatch, lengths=(131, 100), root=tmp_path, offset=1, maximum=maximum, table_backend=table_backend
+        )
+        if maximum == -1:
+            expected = [(0, 0, 0, 130), (0, 1, 131, 99)]
+            blocks = [(0, 1), (1, 1)]
+        else:
+            expected = [(0, 0, 0, 64), (0, 0, 48, 64), (0, 0, 66, 64), (0, 1, 131, 64), (0, 1, 166, 64)]
+            blocks = [(0, 3), (3, 2)]
+        expected_captions = ["test task"] * len(expected)
+        assert reader._range_bounds == []
+        assert reader.unannotated_observation_frames == 0
+    assert reader._segments == expected
+    assert len(reader) == len(expected)
+    assert reader.get_shuffle_blocks() == blocks
+    assert reader._subtask_ranges == {}  # 原始标注只在建索引时使用，随后释放。
+    for index, (_, _, start, actions) in enumerate(expected):
+        sample = reader[index]
+        torch.testing.assert_close(
+            sample["state_trajectory"][: actions + 1, 0], torch.arange(start, start + actions + 1).float()
+        )
+        torch.testing.assert_close(
+            sample["action_target"][:actions, 0], torch.arange(start + 1, start + actions + 1).float() + 1000
+        )
+        assert sample["ai_caption"] == expected_captions[index]
+        expected_caption = expected_captions[index] if use_subtask and index < 3 else None
+        assert reader._caption_for_index(index) == expected_caption
+    assert reader[-1]["ai_caption"] == expected_captions[-1]
 
 
 @pytest.mark.parametrize("offset", [-2, 0, 1, 3])
@@ -405,6 +552,7 @@ def test_full_episode_retains_real_rows_and_repeats_tail(
         maximum=-1,
         overlap=10000,
         table_backend=table_backend,
+        timestamp_start=1000.0,
     )
     first, stop = max(0, -offset), min(frames, frames + 1 - offset)
     real_actions = stop - first - 1
@@ -423,17 +571,79 @@ def test_full_episode_retains_real_rows_and_repeats_tail(
     torch.testing.assert_close(raw["action_target"][:real_actions, 0], expected_targets)
     assert (raw["state_trajectory"][real_actions:, 0] == expected_states[-1]).all()
     assert (raw["action_target"][real_actions - 1 :, 0] == expected_targets[-1]).all()
+    assert raw["state_timestamps"].dtype == raw["action_timestamps"].dtype == torch.float64
     torch.testing.assert_close(
-        raw["state_timestamps"], torch.arange(first, first + padded_actions + 1, dtype=torch.float64) / 30
+        raw["state_timestamps"],
+        1000 + torch.arange(first, first + padded_actions + 1, dtype=torch.float64) / 30,
+        rtol=0,
+        atol=1e-12,
     )
+    torch.testing.assert_close(raw["action_timestamps"], raw["state_timestamps"][:-1], rtol=0, atol=0)
     encoded, metadata = build_block_sample(raw, template=reader.template, planner=reader.planner, history_blocks=2)
     assert metadata.full_range == raw["full_range"]
     assert metadata.action_mask.shape == (padded_actions, reader.template.width)
-    assert metadata.action_mask[:, 0].all()  # Padding is supervised as requested.
+    assert metadata.action_mask[:, 0].all()  # 通道有效性不承担 padding loss 屏蔽。
+    assert metadata.real_action_steps == real_actions
+    assert type(metadata.num_valid_video_latents) is int
     decoded = reader.template.decode_action_delta(
         encoded["action"], metadata.anchors.repeat_interleave(32, dim=0), raw["action_mask"]
     )
     torch.testing.assert_close(decoded[:, 0], raw["action_target"][:, 0])
+
+
+@pytest.mark.parametrize("output_actions", [3, 8])
+def test_tail_padding_accepts_target_length_independently_of_block_geometry(output_actions):
+    reader = object.__new__(module.SegmentLeRobotDataset)
+    reader._fps = 30
+    state = torch.arange(8).reshape(4, 2).float()
+    target = torch.arange(6).reshape(3, 2).float() + 100
+    times = 1000 + torch.arange(4, dtype=torch.float64) / 30
+    originals = [tensor.clone() for tensor in (state, target, times)]
+    padded = reader._pad_to_action_steps(state, target, times, real_actions=3, output_actions=output_actions)
+    expected_rows = torch.arange(output_actions + 1).clamp(max=3)
+    expected_actions = torch.arange(output_actions).clamp(max=2)
+    torch.testing.assert_close(padded[0], state[expected_rows], rtol=0, atol=0)
+    torch.testing.assert_close(padded[1], target[expected_actions], rtol=0, atol=0)
+    torch.testing.assert_close(
+        padded[2], 1000 + torch.arange(output_actions + 1, dtype=torch.float64) / 30, rtol=0, atol=1e-12
+    )
+    for original, tensor, result in zip(originals, (state, target, times), padded):
+        torch.testing.assert_close(tensor, original, rtol=0, atol=0)
+        if output_actions == 3:
+            assert result is tensor  # 不补齐时不分配副本。
+
+
+@pytest.mark.parametrize("real_actions,output_actions", [(0, 32), (3, 2)])
+def test_tail_padding_rejects_empty_data_or_truncation(real_actions, output_actions):
+    reader = object.__new__(module.SegmentLeRobotDataset)
+    with pytest.raises(ValueError, match="1 <= real_actions <= output_actions"):
+        reader._pad_to_action_steps(None, None, None, real_actions=real_actions, output_actions=output_actions)
+
+
+@pytest.mark.parametrize("table_backend", ["hf", "parquet"])
+@pytest.mark.parametrize("offset", [-2, 3])
+@pytest.mark.parametrize("early", [False, True])
+def test_positive_segments_keep_actual_length_and_video_timeline(monkeypatch, tmp_path, table_backend, offset, early):
+    reader, _ = make_reader(
+        monkeypatch, lengths=(50,), root=tmp_path, table_backend=table_backend, offset=offset, timestamp_start=1000.0
+    )
+    reader.early_video_sampling = early
+    received = []
+    monkeypatch.setattr(reader, "_read_video", lambda meta, episode, times, *, viewpoint: received.append(times))
+    first = max(0, -offset)
+    assert reader._segments == [(0, 0, first, 32)]
+    raw = reader[0]
+    assert "full_range" not in raw
+    assert raw["state_trajectory"].shape[0] == 33
+    assert raw["action_target"].shape[0] == 32  # 仍截至完整 block，不补至 maximum=64。
+    torch.testing.assert_close(raw["state_trajectory"][:, 0], torch.arange(first, first + 33).float())
+    torch.testing.assert_close(
+        raw["action_target"][:, 0], torch.arange(first + offset, first + offset + 32).float() + 1000
+    )
+    expected_times = 1000 + torch.arange(first, first + 33, dtype=torch.float64) / 30
+    torch.testing.assert_close(raw["state_timestamps"], expected_times, rtol=0, atol=0)
+    torch.testing.assert_close(raw["action_timestamps"], expected_times[:-1], rtol=0, atol=0)
+    assert received == [expected_times[:: 4 if early else 1].tolist()]
 
 
 @pytest.mark.parametrize("table_backend", ["hf", "parquet"])
@@ -488,7 +698,12 @@ def test_full_episode_without_an_action_fails_instead_of_skipping(monkeypatch, t
 
 
 @pytest.mark.parametrize("early", [False, True])
-def test_full_video_repeats_actual_last_frame_without_reading_past_episode(monkeypatch, tmp_path, early):
+@pytest.mark.parametrize("table_backend", ["hf", "parquet"])
+@pytest.mark.parametrize("frames,offset", [(33, 1), (34, 0), (34, -2), (34, 3), (107, 1)])
+@pytest.mark.parametrize("window_mode", ["segmented", "frame_window"])
+def test_tail_video_repeats_actual_last_frame_without_reading_past_episode(
+    monkeypatch, tmp_path, early, table_backend, frames, offset, window_mode
+):
     import av
 
     from cosmos_framework.data.generator.action.video_view import VideoViewConfig
@@ -496,8 +711,16 @@ def test_full_video_repeats_actual_last_frame_without_reading_past_episode(monke
     monkeypatch.setattr(
         "cosmos_framework.data.generator.action.video_view.ACTION_RES_SIZE_INFO", {"256": {"square": (16, 16)}}
     )
-    reader, _ = make_reader(monkeypatch, lengths=(34,), root=tmp_path, maximum=-1, table_backend="parquet")
-    meta = reader._direct_meta
+    reader, _ = make_reader(
+        monkeypatch,
+        lengths=(frames,),
+        root=tmp_path,
+        maximum=-1 if window_mode == "segmented" else 96,
+        table_backend=table_backend,
+        offset=offset,
+        window_mode=window_mode,
+    )
+    meta = reader._direct_meta if table_backend == "parquet" else reader._get_dataset(0).meta
     meta.features["camera"] = {"dtype": "video", "shape": [16, 16, 3], "names": ["height", "width", "rgb"]}
     episode = dict(meta.episodes[0], **{"videos/camera/from_timestamp": 0.0})
     meta.episodes = Dataset.from_list([episode])
@@ -505,8 +728,8 @@ def test_full_video_repeats_actual_last_frame_without_reading_past_episode(monke
     with av.open(str(tmp_path / "camera.mp4"), "w") as container:
         stream = container.add_stream("mpeg4", rate=30)
         stream.width, stream.height, stream.pix_fmt = 16, 16, "yuv420p"
-        for i in range(34):
-            frame = av.VideoFrame.from_ndarray(np.full((16, 16, 3), 3 * i, dtype=np.uint8), format="rgb24")
+        for i in range(frames):
+            frame = av.VideoFrame.from_ndarray(np.full((16, 16, 3), (3 * i) % 256, dtype=np.uint8), format="rgb24")
             for packet in stream.encode(frame):
                 container.mux(packet)
         for packet in stream.encode():
@@ -516,12 +739,34 @@ def test_full_video_repeats_actual_last_frame_without_reading_past_episode(monke
     reader.video_backend, reader._pyav_resize = "pyav_resize", True
     reader.early_video_sampling = early
     original = reader.video_view.read(
-        meta, 0, [i / 30 for i in range(34)], viewpoint="ego_view", tolerance_s=1e-4, video_backend="pyav_resize"
+        meta, 0, [i / 30 for i in range(frames)], viewpoint="ego_view", tolerance_s=1e-4, video_backend="pyav_resize"
     )
-    raw = reader[0]
-    indexes = torch.arange(0, 65, 4 if early else 1)
-    torch.testing.assert_close(raw["video"], original[:, indexes.clamp(max=33)], rtol=0, atol=0)
-    assert raw["full_range"] == (0, 34)
+    received = []
+    read_video = reader._read_video
+
+    def capture_video(meta, episode_id, times, *, viewpoint):
+        received.extend(times)
+        return read_video(meta, episode_id, times, viewpoint=viewpoint)
+
+    monkeypatch.setattr(reader, "_read_video", capture_video)
+    index = 5 if window_mode == "frame_window" and len(reader) > 1 else 0
+    raw = reader[index]
+    first, stop = max(0, -offset) + index, min(frames, frames + 1 - offset)
+    real_actions = min(96, stop - first - 1) if window_mode == "frame_window" else stop - first - 1
+    stop = first + real_actions + 1
+    padded_actions = ((real_actions + 31) // 32) * 32
+    indexes = torch.arange(0, padded_actions + 1, 4 if early else 1)
+    expected_rows = (first + indexes).clamp(max=stop - 1)
+    torch.testing.assert_close(raw["video"], original[:, expected_rows], rtol=0, atol=0)
+    torch.testing.assert_close(
+        torch.tensor(received, dtype=torch.float64), expected_rows.double() / 30, rtol=0, atol=1e-12
+    )
+    if window_mode == "segmented":
+        assert raw["full_range"] == (first, stop)
+    else:
+        assert "full_range" not in raw
+    assert raw["real_action_steps"] == real_actions
+    assert "video_frame_validity" not in raw
     if early:
         assert torch.equal(raw["video_observation_indexes"], indexes)
 
@@ -555,7 +800,7 @@ def full_sft_sample(monkeypatch, tmp_path, mode="policy"):
 
 
 @pytest.mark.parametrize("mode", ["policy", "forward_dynamics", "inverse_dynamics"])
-def test_full_sft_adapter_keeps_padding_supervised_and_carries_original_range(monkeypatch, tmp_path, mode):
+def test_full_sft_adapter_carries_valid_lengths_and_original_range(monkeypatch, tmp_path, mode):
     from cosmos_framework.data.generator.joint_dataloader import custom_collate_fn
 
     result = full_sft_sample(monkeypatch, tmp_path, mode)
@@ -565,7 +810,10 @@ def test_full_sft_adapter_keeps_padding_supervised_and_carries_original_range(mo
     assert metadata.full_range == (0, 34)
     assert metadata.action_frame_ids.shape == (64,)
     assert metadata.action_mask[:, 0].all()
+    assert metadata.real_action_steps == 33
+    assert metadata.num_valid_video_latents == 3
     assert "full_range" not in result
+    assert "real_action_steps" not in result and "video_frame_validity" not in result
     batch = custom_collate_fn([result])
     assert batch["sequence_plan"][0].causal_action_metadata.full_range == (0, 34)
 
