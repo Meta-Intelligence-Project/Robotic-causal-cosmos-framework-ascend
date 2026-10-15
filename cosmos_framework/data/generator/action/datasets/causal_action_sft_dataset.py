@@ -37,6 +37,7 @@ class CausalActionSFTDataset(ActionSFTDataset):
         allow_mock_statistics=False,
         history_blocks_min=1,
         history_blocks_max=8,
+        full_history=False,
         joint_mode_weights=None,
         use_state=True,
     ):
@@ -53,6 +54,7 @@ class CausalActionSFTDataset(ActionSFTDataset):
         self.planner = self._dataset.planner
         self.mode = mode
         self.history_range = (history_blocks_min, history_blocks_max)
+        self.full_history = full_history
         self.statistics_path = statistics_path
         self.statistics = statistics
         self._statistics_validated = False
@@ -92,7 +94,12 @@ class CausalActionSFTDataset(ActionSFTDataset):
             raw,
             template=self.template,
             planner=self.planner,
-            history_blocks=random.randint(*self.history_range),
+            # 全历史按实际输出 block 数确定；修改窗口长度后无需同步配置 history。
+            history_blocks=(
+                self.planner.geometry.num_blocks(len(raw["state_trajectory"]))
+                if self.full_history
+                else random.randint(*self.history_range)
+            ),
             statistics=self.statistics,
         )
         for key in (

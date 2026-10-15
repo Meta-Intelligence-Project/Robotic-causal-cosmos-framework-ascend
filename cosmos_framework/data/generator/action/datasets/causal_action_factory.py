@@ -69,6 +69,7 @@ def get_causal_action_dataset(
     mode="joint",
     history_blocks_min=1,
     history_blocks_max=8,
+    full_history=False,
     seed=42,
     sampling_strategy="shuffle_cycle",
     resolution="480",
@@ -162,6 +163,7 @@ def get_causal_action_dataset(
                     allow_mock_statistics=allow_mock_statistics,
                     history_blocks_min=history_blocks_min,
                     history_blocks_max=history_blocks_max,
+                    full_history=full_history,
                     joint_mode_weights=source.get("joint_mode_weights"),
                 )
                 children.append(dataset)

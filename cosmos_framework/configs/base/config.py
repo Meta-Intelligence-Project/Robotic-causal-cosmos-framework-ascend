@@ -19,6 +19,7 @@ class ActionDataSetting:
     table_backend: str = "parquet"
     early_video_sampling: bool = True
     window_mode: str = "segmented"
+    full_history: bool = False
     actions_per_block: int = 32
     max_action_steps: int = 96
     overlap_action_steps: int = 16

@@ -112,6 +112,7 @@ class ActionConfig(BaseModel):
     table_backend: Literal["parquet", "hf"] = "parquet"
     early_video_sampling: bool = True
     window_mode: Literal["segmented", "frame_window"] = "segmented"
+    full_history: bool = Field(default=False, description="Expose all past visual blocks in each actual action sample.")
     actions_per_block: int = Field(default=32, ge=1)
     max_action_steps: int = Field(default=96, ge=-1)
     overlap_action_steps: int = Field(default=16, ge=0)
@@ -711,6 +712,10 @@ class CheckpointConfig(BaseModel):
 
     model_config = _PYDANTIC_MODEL_CONFIG
 
+    load_training_state: bool = Field(
+        default=False,
+        description="Load optimizer and training state on external warm start; false loads model weights only.",
+    )
     keys_to_skip_loading: list[str] = Field(
         default_factory=list,
         description=(

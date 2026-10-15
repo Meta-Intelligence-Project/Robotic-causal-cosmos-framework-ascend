@@ -352,6 +352,34 @@ def _dummy_recipe_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class TestEndToEndLoader:
+    @pytest.mark.parametrize("stage", [1, 2])
+    def test_two_stage_action_recipes(self, stage, _dummy_recipe_env, monkeypatch):
+        monkeypatch.setenv("ACTION_SOURCES_FILE", "/tmp/sources.json")
+        monkeypatch.setenv("STAGE1_CHECKPOINT_PATH", "/tmp/stage1/checkpoints/iter_000005000")
+        root = Path(__file__).parents[3] / "examples/action_pretrain"
+        config = _load_or_skip(root / f"action_midtrain_stage{stage}_edge_causal_tnd.toml")
+        source = config.dataloader_train.dataloader.datasets.robots.dataset
+        model = config.model.config
+        assert source.window_mode == ("frame_window" if stage == 1 else "segmented")
+        assert source.max_action_steps == (160 if stage == 1 else 1792)
+        assert source.overlap_action_steps == (0 if stage == 1 else 321)
+        assert config.dataloader_train.max_sequence_length == 96000
+        assert config.dataloader_train.dataloader.num_workers == 8
+        assert source.full_history is (stage == 1)
+        assert source.sampling_strategy == "sample_uniform"
+        assert source.actions_per_block == 32 and source.video_stride == 4
+        assert str(source.resolution) == "480" and source.mode == "joint"
+        assert config.checkpoint.load_training_state is False
+        if stage == 1:
+            assert list(model.tokenizer.encode_exact_durations) == [9, 17, 25, 33, 41]
+            assert "state2llm" in config.checkpoint.keys_to_skip_loading
+        else:
+            assert source.history_blocks_min == model.teacher_forcing_history_blocks_min == 1
+            assert source.history_blocks_max == model.teacher_forcing_history_blocks_max == 32
+            assert list(model.tokenizer.encode_exact_durations) == list(range(9, 450, 8))
+            assert config.checkpoint.load_path == "/tmp/stage1/checkpoints/iter_000005000"
+            assert list(config.checkpoint.keys_to_skip_loading) == ["net_ema."]
+
     def test_template_action_frame_window_recipe(self, tmp_path, _dummy_recipe_env, monkeypatch):
         monkeypatch.setenv("ACTION_SOURCES_FILE", "/tmp/sources.json")
         recipe = Path(__file__).parents[3] / "examples/action_pretrain/action_midtrain_edge_causal_tnd.toml"
