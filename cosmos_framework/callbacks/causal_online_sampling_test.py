@@ -1,12 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: OpenMDW-1.1
 
+import json
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from cosmos_framework.callbacks.every_n_draw_sample import EveryNDrawSample
+from cosmos_framework.callbacks.every_n_draw_sample import EveryNDrawSample, causal_preview_action_mse
 from cosmos_framework.data.generator.sequence_packing import SequencePlan
 from cosmos_framework.model.generator.omni_mot_causal_model import OmniMoTCausalModel
 from cosmos_framework.model.generator.omni_mot_model import OmniMoTModel
@@ -75,6 +76,109 @@ def test_causal_callback_uses_ti2v_without_mutating_training_batch(monkeypatch, 
     if scenario == "multiple":
         assert len(calls) == 2
         assert calls[1][1]["seed"] == [2]
+
+
+@pytest.mark.parametrize("mode", ["policy", "forward_dynamics", "inverse_dynamics"])
+def test_causal_action_preview_skips_cfg(monkeypatch, mode):
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    video = torch.zeros(1, 1, 5, 2, 2)
+    metadata = SimpleNamespace(block_size=2, history_blocks=4)
+    batch = {
+        "video": [video],
+        "ai_caption": ["pick up the cup"],
+        "sequence_plan": [SequencePlan(has_text=True, has_vision=True, causal_action_metadata=metadata)],
+        "causal_action_mode": [mode],
+    }
+    calls = []
+    model = SimpleNamespace(
+        net=torch.nn.Linear(1, 1),
+        config=SimpleNamespace(causal_training_strategy="teacher_forcing"),
+        input_video_key="video",
+        input_caption_key="ai_caption",
+        get_data_and_condition=lambda data: SimpleNamespace(
+            raw_state_vision=data["video"], x0_tokens_vision=data["video"]
+        ),
+        decode=lambda latent: latent,
+    )
+
+    def generate(data, **kwargs):
+        calls.append(kwargs)
+        return {"vision": data["video"]}
+
+    model.generate_samples_from_batch = generate
+    callback = EveryNDrawSample(1, guidance=[3.0])
+    monkeypatch.setattr(callback, "run_save", lambda rows, count, name: None)
+    callback.sample(None, model, batch, None, None, 1)
+    assert [call["guidance"] for call in calls] == [1.0]
+
+
+def test_causal_preview_action_mse_uses_generated_valid_channels():
+    predicted = torch.tensor([[0.0, 1.0], [2.0, 9.0]])
+    target = torch.zeros(2, 2)
+    action_mask = torch.tensor([[True, True], [True, False]])
+    # The second step was not denoised, and its invalid channel is excluded either way.
+    generated_steps = torch.tensor([True, False])
+    assert causal_preview_action_mse(predicted, target, action_mask, generated_steps) == 0.5
+
+
+def test_causal_preview_action_mse_skips_empty_mask():
+    value = torch.zeros(1, 2)
+    assert causal_preview_action_mse(value, value, torch.zeros(1, 2, dtype=torch.bool), None) is None
+
+
+def test_action_preview_logs_mse_only_when_action_is_predicted(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    messages = []
+    monkeypatch.setattr(
+        "cosmos_framework.callbacks.every_n_draw_sample.log.info",
+        lambda message, rank0_only=True: messages.append(message),
+    )
+    video = torch.zeros(1, 1, 4, 2, 2)
+    action = torch.tensor([[1.0, 0.0], [0.0, 4.0]])
+    target = torch.zeros(2, 2)
+    metadata = SimpleNamespace(
+        block_size=2,
+        history_blocks=4,
+        action_mask=torch.tensor([[True, False], [True, True]]),
+    )
+    batch = {
+        "video": [video],
+        "ai_caption": ["pick up the cup"],
+        "sequence_plan": [SequencePlan(has_text=True, has_vision=True, causal_action_metadata=metadata)],
+        "causal_action_mode": ["policy"],
+    }
+    model = SimpleNamespace(
+        net=torch.nn.Linear(1, 1),
+        config=SimpleNamespace(causal_training_strategy="teacher_forcing"),
+        input_video_key="video",
+        input_caption_key="ai_caption",
+        get_data_and_condition=lambda data: SimpleNamespace(
+            raw_state_vision=data["video"], x0_tokens_vision=data["video"], x0_tokens_action=[target]
+        ),
+        decode=lambda latent: latent,
+        generate_samples_from_batch=lambda data, **kwargs: {
+            "vision": data["video"],
+            "action": [action],
+            "generated_action_mask": [torch.tensor([True, True])],
+        },
+    )
+    callback = EveryNDrawSample(1, guidance=[1.0])
+    monkeypatch.setattr(callback, "run_save", lambda rows, count, name: None)
+    callback.sample(None, model, batch, None, None, 7)
+    preview = [message for message in messages if message.startswith("CAUSAL_ACTION_PREVIEW")]
+    assert len(preview) == 1
+    record = json.loads(preview[0].removeprefix("CAUSAL_ACTION_PREVIEW "))
+    # Valid elements are 1, 0 and 4. Mean square is (1 + 0 + 16) / 3.
+    assert record["iteration"] == 7
+    assert record["mode"] == "policy"
+    assert record["sample"] == 0
+    assert record["guidance"] == 1.0
+    assert record["action_mse"] == pytest.approx(17 / 3)
+
+    messages.clear()
+    batch["causal_action_mode"] = ["forward_dynamics"]
+    callback.sample(None, model, batch, None, None, 7)
+    assert not any(message.startswith("CAUSAL_ACTION_PREVIEW") for message in messages)
 
 
 @pytest.mark.parametrize("kwargs", [{"causal_num_blocks": 0}, {"causal_block_size": 0}, {"causal_history_blocks": 17}])

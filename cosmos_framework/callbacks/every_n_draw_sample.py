@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: OpenMDW-1.1
 
+import json
 import math
 import os
 from contextlib import nullcontext
@@ -348,6 +349,66 @@ def _build_reference_grid(references: list[torch.Tensor], target_width: int) -> 
     return _resize_5d_to_width(grid, target_width)  # (1,C,1,H_grid,target_width)
 
 
+def causal_preview_action_mse(
+    predicted: torch.Tensor | None,
+    target: torch.Tensor | None,
+    action_mask: torch.Tensor | None,
+    generated_steps: torch.Tensor | None,
+) -> float | None:
+    """Masked MSE between a sampled action and its normalized ground-truth tokens.
+
+    ``generated_steps`` selects action rows the sampler actually denoised. Invalid
+    channels in ``action_mask`` stay out of the mean.
+    """
+    if predicted is None or target is None or action_mask is None:
+        return None
+    pred = predicted.detach().float()
+    gt = target.detach().float().to(device=pred.device)
+    valid = action_mask.to(device=pred.device, dtype=torch.bool)
+    if generated_steps is not None:
+        steps = generated_steps.to(device=pred.device, dtype=torch.bool)
+        if steps.shape != valid.shape[:1]:
+            raise ValueError(f"generated action steps {tuple(steps.shape)} do not match action length {valid.shape[0]}")
+        valid = valid & steps.unsqueeze(-1)
+    if pred.shape != gt.shape or pred.shape != valid.shape:
+        raise ValueError(
+            f"action preview shapes pred={tuple(pred.shape)} gt={tuple(gt.shape)} mask={tuple(valid.shape)}"
+        )
+    if not bool(valid.any()):
+        return None
+    return float((pred - gt).square()[valid].mean())
+
+
+def _log_causal_action_preview_loss(batch, clean, generated, metadata, iteration, sample_id, guidance) -> None:
+    """Log sampled-vs-GT action MSE for modes that denoise action. Forward dynamics does not."""
+    mode = batch.get("causal_action_mode")
+    if isinstance(mode, (list, tuple)):
+        mode = mode[0] if mode else None
+    if mode not in ("policy", "inverse_dynamics"):
+        return
+    targets = getattr(clean, "x0_tokens_action", None)
+    actions = generated.get("action")
+    step_masks = generated.get("generated_action_mask")
+    action_mse = causal_preview_action_mse(
+        None if not actions else actions[0],
+        None if not targets else targets[0],
+        getattr(metadata, "action_mask", None),
+        None if not step_masks else step_masks[0],
+    )
+    log.info(
+        "CAUSAL_ACTION_PREVIEW "
+        + json.dumps(
+            {
+                "iteration": iteration,
+                "mode": mode,
+                "sample": sample_id,
+                "guidance": guidance,
+                "action_mse": action_mse,
+            }
+        )
+    )
+
+
 class EveryNDrawSample(EveryN):
     """
     This callback sample condition inputs from training data, run inference and save the results to wandb and s3.
@@ -466,6 +527,11 @@ class EveryNDrawSample(EveryN):
                 rows = []
                 clean = model.get_data_and_condition(batch)
                 batch["causal_action_truth_vision"] = clean.x0_tokens_vision
+                # Policy, forward dynamics, and inverse dynamics all preview without CFG.
+                # guidance=1 is conditional only: sample_prepared skips the unconditional branch.
+                if self.guidance != [1.0]:
+                    self.guidance = [1.0]
+                    log.info("causal action 预览关闭 CFG：guidance=1.0")
                 for guidance in self.guidance:
                     generated = model.generate_samples_from_batch(
                         batch,
@@ -479,6 +545,9 @@ class EveryNDrawSample(EveryN):
                         causal_use_kv_cache=self.causal_use_kv_cache,
                     )
                     rows.append(model.decode(generated["vision"][0]).float().cpu())
+                    _log_causal_action_preview_loss(
+                        batch, clean, generated, action_metadata, iteration, sample_id, guidance
+                    )
                 rows.extend(
                     [model.decode(clean.x0_tokens_vision[0]).float().cpu(), clean.raw_state_vision[0].float().cpu()]
                 )
