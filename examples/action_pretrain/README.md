@@ -8,6 +8,8 @@
 - **路线 B：AgiBot + EgoSuite 混合训练。** 分别计算两份组统计，按训练片段数设置组权重，再启动 mix。
 - **路线 C：只训练 RoboTwin。** 完成公共环境准备后，直接执行路线 C，计算独立组统计并启动单组训练。
 
+训练后的在线 policy 服务、32 步预测 / 16 步执行反馈协议，以及无需仿真器的 RoboTwin 数据回放，见 [causal action 推理服务](../../docs/causal_action_server.md)。
+
 ## 1. 公共准备：环境与路径
 
 ```bash
@@ -303,6 +305,7 @@ Action 来源未指定 `video_backend` 时，默认使用 `pyav_resize`，启用
 - `action_midtrain_edge_causal_tnd.toml`：公共训练参数。
 - `launch_midtrain_template.sh`：跨机器环境模板，路径为 `/path/to/xxx`；调用通用训练启动脚本。
 - `launch_midtrain_local.sh`：原开发机器的独立副本，已经填入本机路径；其他机器使用 template。
+- `set_env_template.sh`：通过 `source` 加载环境与 Robotwin 数据路径，使用前替换占位路径或设置环境变量。
 - `launch_midtrain_action_causal.sh`：构造并执行 torchrun 命令，末尾传入的命令行参数优先。
 
 统计文件在 `$RUN_DIR/stats`；生成的 mix 清单在 `$RUN_DIR/config/mixed.json`；启动日志在 `$OUTPUT_ROOT/launcher_rank0.log`，训练 checkpoint 位于该输出目录的任务子目录中。恢复训练复用输出目录，新实验使用新目录。

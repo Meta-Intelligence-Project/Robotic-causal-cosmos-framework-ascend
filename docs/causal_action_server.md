@@ -1,0 +1,328 @@
+# Causal action policy 推理服务
+
+服务入口：`python -m cosmos_framework.inference.causal_action.server`。使用与
+`examples/action_pretrain/inference_robotwin_template.sh` 相同的 causal action checkpoint、
+Wan2.2 VAE、unified55 模板和训练 state/delta 统计。网络协议兼容 LingBot/OpenPI 的
+WebSocket + msgpack/NumPy 编码，单模型 rank、单仿真器连接。
+当前请求协议是 `cosmos-causal-action-v2`：client 发送 Robotwin 原生 state，
+server 组装 unified55 并返回拆分后的原生动作。旧版直接收发 55D 的 client 需要同步更新。
+首次连接先接收 metadata 字典，其中包含支持的执行模式、左右臂 DOF 和四元数顺序。
+
+## 模板启动与数据回放
+
+`examples/action_pretrain/*_template.sh` 是跨机器模板。使用前将 `/path/to/...`
+替换为实际路径，或通过环境变量设置 `ASCEND_ENV`、`CONDA_ROOT`、`CONDA_ENV`；
+模型服务还需配置 `CHECKPOINT_ROOT`、`ROBOTWIN_GROUP_STATS_PATH`、
+`COSMOS3_EDGE_PROCESSOR_PATH` 和 `WAN_VAE_PATH`，数据回放还需配置 `ROBOTWIN_ROOT`。
+checkpoint、统计文件、processor 和 VAE 应与训练配方对应。
+
+终端一启动服务，等待日志出现 `Causal policy listening`：
+
+```bash
+bash examples/action_pretrain/robotwin_server_template.sh
+```
+
+默认使用 NPU 0，10 次 UniPC denoise，CFG guidance=1，
+预测 32 个 action、执行前 16 个。可通过环境变量 `CHECKPOINT_ROOT`、
+`ROBOTWIN_GROUP_STATS_PATH`、`COSMOS3_EDGE_PROCESSOR_PATH`、`WAN_VAE_PATH`、
+`ASCEND_RT_VISIBLE_DEVICES`、`NUM_STEPS`、`GUIDANCE`、`HISTORY_BLOCKS`、`FPS`、
+`HOST`、`PORT`、`SEED` 覆盖；其他 Python 参数可以直接追加到 shell 后面。
+`FPS` 是训练对齐后的原始 action/control FPS（默认 30），视频抽帧后 FPS=FPS/4。
+
+终端二使用训练 Robotwin 数据假装仿真器观测，无需运行 Robotwin 仿真：
+
+```bash
+bash examples/action_pretrain/robotwin_replay_template.sh
+
+# 两次 episode 之间 reset，检查缓存清空与首次单帧恢复。
+EPISODES=2 ROUNDS=3 bash examples/action_pretrain/robotwin_replay_template.sh
+```
+
+回放从 `ROBOTWIN_ROOT` 下第一个数据集的第一个训练片段读取三视角原始图像、
+state、mask、任务描述和实际 FPS；`--dataset-index`、`--index` 可选择其他数据。
+回放会将训练 state 转成原生 joint/endpose 字典，只发送数据里实际有效的字段，
+不会从关节目标伪造 EEF。mask 只用于本地回放转换，不发送给 server。
+默认请求观测时刻为 0、16、32，每次返回动作保存至
+`outputs/causal_action/server_replay/episodeXXX_stepXXXXXX_action_joint.npy`，
+如果模型支持 EEF，则同时保存 `_action_eef.npy`。
+`metrics.json` 保存数据来源及服务耗时。回放数据的下一帧不受预测动作影响，
+这只能验证接口和推理链路，不衡量真实闭环成功率。
+
+## 联合 RoboTwin 运行真实闭环仿真
+
+已保存可直接启动的脚本
+[`examples/action_pretrain/robotwin_client.py`](../examples/action_pretrain/robotwin_client.py)，
+具体实现位于
+[`robotwin_client.py`](../cosmos_framework/inference/causal_action/robotwin_client.py)。
+它创建 RoboTwin 环境并调用 `CausalPolicyClient`，完成 reset、执行动作、收集反馈和结束清理。
+不需要修改 RoboTwin 的 `get_obs()` 或 `take_action()`。
+本环境没有运行 RoboTwin 仿真；脚本通过模拟环境测试验证交互流程，真实仿真效果待实际部署验证。
+
+### 两端环境与启动顺序
+
+server 使用当前模型推理环境，client 使用能够独立运行 RoboTwin 的 Python/CUDA/SAPIEN 环境。
+两端可以在不同机器，不要求共享 Python 环境或 GPU。client 不加载 checkpoint、Torch 或 VAE，
+只需能够读取本仓库和 RoboTwin 仓库，且其 Python 环境安装 NumPy、msgpack 和
+支持 `websockets.sync.client.connect` 的 websockets（本仓库使用的接口需要 15.x 或更新版本）。
+无需在 RoboTwin 环境安装整套 Cosmos 训练依赖，示例入口会自动添加本仓库至 Python 搜索路径。
+
+1. 在 server 机器的仓库根目录启动模型服务，选择空闲设备，等待 `Causal policy listening`：
+
+   ```bash
+   cd /path/to/cosmos-framework
+   ASCEND_RT_VISIBLE_DEVICES=0 PORT=8000 NUM_STEPS=10 GUIDANCE=1 SEED=42 \
+     bash examples/action_pretrain/robotwin_server_template.sh
+   ```
+
+2. 在具备 RoboTwin 仿真能力的机器激活其原有环境，再运行下面的 client。
+   将 `/path/to/...` 和 `SERVER_IP` 换成该机器可访问的实际位置；同机连接可以使用 `127.0.0.1`。
+   运行时必须显式传入 `--robotwin-root`，不使用默认路径或 `ROBOTWIN_ROOT` 环境变量。
+
+   ```bash
+   python /path/to/cosmos-framework/examples/action_pretrain/robotwin_client.py \
+     --robotwin-root /path/to/RoboTwin \
+     --server-uri ws://SERVER_IP:8000 \
+     --task-name adjust_bottle \
+     --task-config demo_clean \
+     --control-mode joint \
+     --state-source command \
+     --seed 100000 \
+     --episodes 1 \
+     --max-steps 32 \
+     --output /path/to/outputs/causal_action/robotwin_sim
+   ```
+
+   `--max-steps 32` 适合先检查两轮动作执行；删除这个参数后使用 RoboTwin 任务本身的步数上限。
+   默认由 RoboTwin 根据任务和当前 seed 的场景生成 instruction，无需手写文本。
+   如需固定文本调试，可以额外传入 `--instruction "..."` 覆盖。
+
+3. 查看输出目录的 `metrics.json`，确认请求、执行步数和 episode 是否成功。
+   如需连续测试多个 episode，设置 `--episodes 2`；每次新 episode 都会先清空 server 缓存。
+
+脚本会读取所指定 RoboTwin checkout 的 `scripts/eval_policy_xpolicylab.py`，复用其中的
+`load_task_args()`、`class_decorator()`、`safe_close_env()`、`resolve_eval_instruction()` 和
+`build_instruction()`，不进入其原有 RPC 推理循环。
+因此该文件必须存在；换用其他 RoboTwin 版本时，需要对应适配这些配置/环境/文本辅助接口。
+载入时切换工作目录到 RoboTwin 根目录，以解析机器人资产等相对路径；输出路径会提前转换成绝对路径。
+
+### 参数
+
+| 参数                            | 默认值                               | 含义                                                                     |
+| ------------------------------- | ------------------------------------ | ------------------------------------------------------------------------ |
+| `--robotwin-root`               | 无，必须显式指定                     | 具有仿真依赖和资产的 RoboTwin 仓库                                       |
+| `--server-uri`                  | `ws://127.0.0.1:8000`                | 模型服务地址                                                             |
+| `--task-name` / `--task-config` | `adjust_bottle` / `demo_clean`       | 环境类名及 `env_cfg/task_config/<配置>.yml`                              |
+| `--instruction`                 | 不指定，由 RoboTwin 生成             | 可选文本覆盖；指定后所有 episode 共用该文本，跳过专家预运行              |
+| `--instruction-type`            | task config 的 `eval_instruction`    | 自动生成文本使用 `seen` 或 `unseen` 模板；`demo_clean` 默认为 `seen`     |
+| `--control-mode`                | `joint`                              | 选择 server 返回的 `joint` 或 `eef` 动作；当前 checkpoint 只支持 `joint` |
+| `--state-source`                | `command`                            | `command` 使用 get_obs 的 drive target；`measured` 改用实测关节 qpos     |
+| `--seed` / `--episodes`         | `100000` / `1`                       | 第一个 episode 的仿真 seed 及 episode 数量；后续 seed 逐次加 1           |
+| `--max-steps`                   | 不额外限制                           | 实际上限取该值与 RoboTwin 任务上限的较小者，单位为 take_action 调用次数  |
+| `--render-freq`                 | `0`                                  | 透传 RoboTwin 的界面渲染频率；0 不开启 viewer，仍采集相机图像            |
+| `--output`                      | `outputs/causal_action/robotwin_sim` | 相对启动目录解析的日志与预测动作保存目录                                 |
+
+server 的 `SEED` 控制模型采样，client 的 `--seed` 控制仿真场景，两者分别配置。
+`--help` 只解析参数，不导入 RoboTwin/SAPIEN，也不会连接 server。
+
+### 单个 episode 的具体执行顺序
+
+1. client 建立 WebSocket 连接，读取 server metadata，校验所选 `control_mode`。
+   选择不支持的 EEF 模式会在创建仿真环境之前失败。
+2. 根据 task config 加载双臂 embodiment、相机尺寸和机器人资产配置，创建任务环境，
+   调用 `setup_demo(now_ep_num=episode, seed=seed, is_test=True, ...)`。
+   强制启用 `eval_mode`、头部/双腕相机和 `rgb/qpos/endpose`；关闭原有评测视频记录。
+   校验仿真左右臂关节数量与 server 的 DOF 相符。
+   默认先在关闭 viewer 的情况下执行一次 `play_once()` 获取 `episode_info["info"]`，
+   按任务名选择 `description/task_instruction/<task_name>.json`，结合本轮物体/手臂等占位字段、
+   `seen/unseen` 类型和 seed 调用 RoboTwin 的 `build_instruction()`，生成本轮任务文本。
+   随后关闭专家预运行环境，使用**相同 seed** 重新 `setup_demo()` 恢复初始场景，
+   再设置 policy 的步数上限和 instruction。专家观测不发送给 server，不计入 policy 的执行步数。
+   指定 `--instruction` 时直接设置该文本，跳过专家预运行和文本生成。
+3. 调用 `client.reset(prompt=env.get_instruction())`，server 清空上一 episode 的缓存。
+   初次 `get_obs()` 读取当前三视角图像和 joint/endpose，发送 `observation_step=0`。
+   server 根据自身 mask 组装 unified55、归一化、更新首帧 KV，再进行 10 次 denoise。
+4. 接收完整 32 步预测，检查 native action 的维度、有限值及 `execute_steps`，
+   将动作块保存为 `.npy`。仅取前 16 行按顺序执行，后 16 行丢弃。
+   `joint` 映射到 `env.take_action(action, action_type="qpos")`；
+   `eef` 映射到 `action_type="ee"`，每行含原生 wxyz 四元数。
+5. **每次 take_action 返回后立即 get_obs**，记录执行后的三视角图像。
+   对 RGB 数组做独立拷贝，防止下一次渲染复用缓冲区覆盖旧帧。
+   不重复发送上一轮末帧；正常一轮获得恰好 16 组新图像。
+6. 将这 16 组图像和最后一组对应的 joint/endpose 发给 server，同时发送
+   `executed_steps=16` 和累计 `observation_step=16/32/48/...`。
+   server 更新真实观测 KV，以最新 state 重新预测 32 步，继续执行前 16 步。
+   client 不生成 unified55、不发送 mask，也不做归一化、相对位姿相加或四元数换序。
+7. 每次动作后检查 `env.eval_success` 和 `env.take_action_cnt >= env.step_lim`。
+   成功或达到上限立即停止，即使当前 16 步尚未执行完；不足 16 帧不补齐、不提交下一次 infer。
+   保存 episode 结果，通过 `finally` 关闭环境；下一 episode 使用新 seed、重新 reset。
+   退出时关闭 WebSocket，server 清理该连接的缓存。遇到初始化或推理错误，记录错误并结束程序。
+
+默认 `--state-source command` 保留现有训练数据的 get_obs state 语义。
+若选择 `measured`，脚本用 `robot.get_left_arm_real_jointState()` 和
+`get_right_arm_real_jointState()` 替换左右关节、夹爪及 `joint_action.vector`，
+EEF 仍取本次 get_obs 的 `endpose`；这不自动解决实测 state 与训练 state 的分布差异。
+Robotwin 的一次 take_action 内部含路径规划和多次物理推进，因此这里的“一帧”是一个动作目标
+执行完成后的观测，并不保证相邻两帧对应固定 1/30 秒；真实闭环时序需要与训练采样方式对齐。
+
+### 输出与测试范围
+
+输出结构示例：
+
+```text
+robotwin_sim/
+  metrics.json
+  episode000/
+    step000000_action_joint.npy
+    step000016_action_joint.npy
+  episode001/
+    ...
+```
+
+每个 `.npy` 保存 server 返回的完整 32 步原生动作，只有前 16 步会进入正常执行循环，
+终止发生在块内时实际执行更少。`metrics.json` 保存任务、文本、server 地址、控制模式、
+state 来源和各 episode 的 seed、实际 instruction、文本来源/类型、状态、success、执行步数、
+policy 闭环耗时及各次请求的 server 耗时（闭环耗时不包含专家预运行及场景初始化）。
+脚本不保存观测视频，若需视频可以在每次 get_obs 后自行增加 recorder。
+
+自动生成文本通常需要专家预运行，因为多数任务在 `play_once()` 中填充文本占位参数，
+仅有 task-name 或初始 `get_instruction()` 不足以获得完整描述；例如 `adjust_bottle` 包括瓶子和手臂。
+这会增加每个 episode 的启动时间。脚本沿用 RoboTwin 的模板生成与 seed 选择逻辑，
+但不按专家成功率筛选/跳过 seed，也不替代官方 benchmark 的评估流程。
+若 RoboTwin 生成失败并退回原始 task-name，脚本报错退出，避免把任务类名当作模型指令；
+可以检查任务描述/物体描述文件，或通过 `--instruction` 显式覆盖。
+某个 seed 初始化或专家预运行失败也会记录并退出，不会隐式跳过该 seed 或将其计为模型失败。
+当前检查覆盖模拟环境中的动作分块、图像时间顺序、提前成功、实测状态替换、自动文本生成与重建场景、
+手动覆盖和异常清理；未在本机运行真实 RoboTwin 仿真。
+
+## Server 的机器人配置
+
+server 负责 `state_mask` 和 `action_mask`。默认从统计文件的
+`provenance.sources` 加载两套 mask，要求所有来源完全一致；不会直接把组统计的
+`valid` 并集当成当前机器人的 mask。当前 Robotwin 统计满足这一条件。
+
+若统计中没有来源 mask，或者包含不同机器人，可传 `--robot-config /path/to/robot.json`。
+JSON 字段为 `state_mask`、`action_mask`（各 55 个 bool 或精确的 0/1），以及
+可选 `left_arm_dof`、`right_arm_dof`（默认均为 6，取值 1..7）。
+server 会校验模板、统计覆盖、关节槽位以及相对动作所需的 state anchor。
+reset 和连接断开只清空 episode 数据，保留启动时加载的配置。
+
+当前 Robotwin 训练来源只启用左右六关节和夹爪，`available_control_modes=["joint"]`。
+EEF 返回 `None`，不能作为动作执行；只有 action mask 同时覆盖双臂 EEF 和夹爪时，
+才会开放 `eef`。输入同时提供 joint 和 EEF 不会改变模型训练过的有效维度。
+
+## 仿真器客户端协议
+
+轻量客户端 `cosmos_framework/inference/causal_action/client.py` 只依赖 NumPy、
+msgpack 和 websockets，不加载 Torch、VAE 或模型。也可以直接沿用 LingBot
+客户端的 msgpack/NumPy 编解码。
+
+```python
+from cosmos_framework.inference.causal_action.client import CausalPolicyClient
+
+
+def camera_images(observation):
+    cameras = observation["observation"]
+    return {
+        "cam_high": cameras["head_camera"]["rgb"].copy(),  # [H,W,3] RGB uint8
+        "cam_left_wrist": cameras["left_camera"]["rgb"].copy(),
+        "cam_right_wrist": cameras["right_camera"]["rgb"].copy(),
+    }
+
+
+def native_state(observation):
+    return {
+        "joint_action": observation["joint_action"],
+        "endpose": observation["endpose"],
+    }
+
+
+control_mode = "joint"  # 或 "eef"，连接时会校验模型是否支持
+action_type = "qpos" if control_mode == "joint" else "ee"
+with CausalPolicyClient("ws://127.0.0.1:8000", control_mode=control_mode) as client:
+    client.reset(prompt=TASK_ENV.get_instruction())
+    observation = TASK_ENV.get_obs()
+    response = client.infer(dict(
+        obs=camera_images(observation), state=native_state(observation), observation_step=0,
+    ))
+    step = 0
+    done = False
+    while not done:
+        observations = []
+        for action in client.actions(response)[:response["execute_steps"]]:
+            TASK_ENV.take_action(action, action_type=action_type)
+            observation = TASK_ENV.get_obs()
+            observations.append(camera_images(observation))
+            step += 1
+            done = TASK_ENV.eval_success or TASK_ENV.take_action_cnt >= TASK_ENV.step_lim
+            if done:
+                break
+        if not done:
+            # 16 张执行后新图，不重复上一轮末帧；state 与最后一张图对应。
+            response = client.infer(dict(
+                obs=observations, state=native_state(observation),
+                executed_steps=16, observation_step=step,
+            ))
+```
+
+`state.joint_action` 使用 `left_arm`、`right_arm`、`left_gripper`、`right_gripper`；
+关节向量长度等于 server 配置的左右臂 DOF，夹爪可为标量或长度 1 的数组。
+`state.endpose` 使用 `left_endpose`、`right_endpose`，各为
+`[x,y,z,qw,qx,qy,qz]`；夹爪也可放在 endpose 下作为 joint_action 缺失时的补充。
+若两处都提供夹爪，则以 joint_action 中的值为准。直接发送 get_obs() 的这两个字典即可。
+server 只读取 state_mask 启用的字段；有效字段缺失、形状错误或非法值会报错。
+无效字段忽略并清零，内部四元数转换成 unified55 的 xyzw 后再进行校验和归一化。
+
+RoboTwin 的 `get_obs().joint_action` 关节值来自 drive target，并非实际 qpos。
+如需实测关节状态，client 应明确调用 `get_*_arm_real_jointState()` 后替换对应字段，
+并确认与训练 state 语义一致。EEF 的参考坐标系和 EE/TCP 定义也应与训练一致。
+现有 take_action() 包含路径规划和多次物理步推进，不保证一次调用对应固定 1/30 秒。
+
+`reset=True` 可以单独发送，也可以与首次 `obs`、`state` 合并发送。
+prompt 可在 reset 或首次观测请求中提供，随后沿用。client 不发送 mask 或 55D state。
+可选 `control_mode` 在 reset 时传 `joint` 或 `eef`，只用于支持性校验，不改变模型 mask；
+episode 内修改任务或执行模式需要 reset。`obs` 同时支持三个相机的 `[T,H,W,3]`
+数组字典，以及长度为 T 的相机字典列表。第一轮 T=1，之后严格 T=16。
+可选 `observation_step` 用于拒绝重复或乱序反馈，建议真实 client 始终发送。
+
+响应包含 `action`、`available_control_modes`、`execute_steps=16`、`observation_step`、
+`revision` 和 `server_timing.infer_ms`。`action` 是含以下两个键的字典：
+
+- `joint`：`float32 [32,left_dof+right_dof+2]`，每行顺序为左关节、左夹爪、右关节、右夹爪。
+- `eef`：`float32 [32,16]`，每行顺序为左 xyz+wxyz、左夹爪、右 xyz+wxyz、右夹爪。
+
+未训练的执行模式值为 `None`；两种模式都有效时同时返回，由 client 选择。
+动作已经反归一化并恢复成绝对目标，client 不再加初始位姿，也不需要知道 unified55 槽位。
+启动时加 `--return-unified-action` 可额外返回内部 `action_unified [32,55]` 用于调试。
+启动时加 `--return-video-latents` 可返回本轮预测的 `video_latents`
+（`[1,C,2,H_latent,W_latent]`，不包含观测前缀）；默认仍联合预测 video/action，
+只省略 video 网络传输。服务器不会默认将预测 latent 解码为视频。
+
+请求错误返回 `error` 和 `reset_required`。输入校验失败可以修正后重发；
+VAE/prefill/denoise 失败后必须 reset，避免继续使用部分更新的缓存。
+连接断开会自动清空 episode；第二个同时连接的客户端会被拒绝。
+
+## 缓存与时间对齐
+
+1. reset 清空流式 VAE 特征、所有层与 CFG 分支的 text/video KV、时间坐标及 state。
+2. 首次三视角按训练 `concat_view` 布局拼接：head 在上，左右 wrist 在下。
+   使用同一 resize/reflection-padding 和归一化，单帧 VAE 编码后，以零 timestep
+   prefill 各层 observed video KV。
+3. 以当前收到的 state 和 observed KV 为条件，10 次 UniPC 联合预测未来
+   32 个 action 和 2 个 video latent。相对 action 使用当前 state 为 anchor 解码；
+   gripper/hand 字段保持模板定义的绝对目标语义。
+4. 执行前 16 个 action 后，取新观测的第 4、8、12、16 张（1-based），
+   保留 Wan2.2 因果卷积特征，增量编码为 1 个真实观测 latent，再 prefill KV。
+   这等价于全轨迹抽取 0、4、8、12、16、20……帧，边界不重复。
+5. 保留最近 `history * latent_frames_per_training_block` 个 observed latent KV，
+   默认 64 帧。淘汰旧 KV 时保留绝对 mRoPE 时间坐标。state 只作用于当前预测，
+   不进入 visual history。预测的 action/video 都不写入 observed KV。
+
+训练块是 32 action / 2 latent；在线反馈按 16 action / 1 latent 更新，并在每次预测时
+重新锚定当前 state。真实历史按单 latent 因果 prefill，因此更新时不会等待未来另一帧，
+也不会把预测帧当观测。这与离线脚本的整块真值 state 预览在历史可见性上有区别；
+真实闭环效果需要后续仿真评估。
+
+实现使用 compact action teacher-forcing pack，每次只处理当前观测和未来两个 latent
+的槽位，历史各层 KV 跨请求保留。text 及 compact pack 仍会执行投影/FFN，
+尚未做固定 state 的跨 denoise 步投影缓存或 CUDA graph 优化。
+当前服务仅支持 Wan2.2 VAE、UniPC、单 rank；训练基础代码和离线完整块 session 保持原有接口。

@@ -1,0 +1,150 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+"""Replay processed RoboTwin observations against a live server, without simulation.
+
+Dataset frames/state advance by 16 independently of predicted actions. This checks
+serving integration, not closed-loop policy success or dynamics accuracy.
+"""
+
+import argparse
+import json
+import os
+from pathlib import Path
+
+import numpy as np
+
+from cosmos_framework.inference.causal_action.client import CausalPolicyClient
+
+
+def load_observations(args):
+    from cosmos_framework.data.generator.action.action_state_template import ActionStateTemplate55
+    from cosmos_framework.data.generator.action.causal_block_geometry import CausalBlockGeometry
+    from cosmos_framework.data.generator.action.datasets.robotwin_segment_lerobot_dataset import (
+        RoboTwinSegmentLeRobotDataset,
+    )
+    from cosmos_framework.data.generator.action.lerobot_discovery import discover_dataset_roots
+    from cosmos_framework.data.generator.action.segment_planner import SegmentPlanner
+    from cosmos_framework.inference.causal_action.robotwin import RobotwinAdapter
+    from lerobot.datasets.video_utils import decode_video_frames
+
+    roots = discover_dataset_roots([args.dataset_root])
+    geometry = CausalBlockGeometry(temporal_compression_factor=4)
+    # At least two complete training blocks, even when only replaying the first observation.
+    maximum = max(64, ((args.rounds - 1) * 16 + 31) // 32 * 32)
+    reader = RoboTwinSegmentLeRobotDataset(
+        root=roots[args.dataset_index],
+        template=ActionStateTemplate55(),
+        planner=SegmentPlanner(max_action_steps=maximum, overlap_action_steps=0, geometry=geometry),
+        video_backend="pyav_resize",
+        table_backend="parquet",
+        split="full",
+    )
+    _, episode_id, start, actions = reader._resolve_index(args.index)
+    state, _, sm, am, times, task = reader._read_parquet_segment(episode_id, start, actions)
+    required = 1 + (args.rounds - 1) * 16
+    if len(state) < required:
+        raise ValueError(f"Selected segment has {len(state)} observations; {required} required")
+    meta = reader._direct_meta
+    cameras = {}
+    for role, key in reader.video_view.cameras.items():
+        feature = meta.features[key]
+        names, shape = feature["names"], feature["shape"]
+        height, width = shape[names.index("height")], shape[names.index("width")]
+        offset = meta.episodes[episode_id][f"videos/{key}/from_timestamp"]
+        video = decode_video_frames(
+            meta.root / meta.get_video_file_path(episode_id, key),
+            [offset + timestamp for timestamp in times[:required].tolist()],
+            reader._tolerance_s,
+            backend="pyav_resize",
+            resize_h=height,
+            resize_w=width,
+        )
+        short_key = {"head": "cam_high", "left": "cam_left_wrist", "right": "cam_right_wrist"}[role]
+        cameras[short_key] = video.permute(0, 2, 3, 1).numpy()
+    adapter = RobotwinAdapter(reader.template, state_mask=sm, action_mask=am)
+    return dict(
+        cameras=cameras,
+        state=[adapter.state_for_replay(row) for row in state[:required].numpy()],
+        prompt=reader._caption_for_index(args.index) or str(meta.tasks.iloc[int(task)].name),
+        fps=reader._read_source_fps(episode_id),
+        root=str(reader.root),
+        episode=episode_id,
+        start=start,
+    )
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--uri", default="ws://localhost:8000")
+    p.add_argument(
+        "--dataset-root", default=os.environ.get("ROBOTWIN_ROOT"), required="ROBOTWIN_ROOT" not in os.environ
+    )
+    p.add_argument("--dataset-index", type=int, default=0)
+    p.add_argument("--index", type=int, default=0)
+    p.add_argument("--rounds", type=int, default=3)
+    p.add_argument("--episodes", type=int, default=1, help="Replay the same sequence with reset between episodes")
+    p.add_argument("--control-mode", choices=["joint", "eef"], default="joint")
+    p.add_argument("--output", default="outputs/causal_action/server_replay")
+    args = p.parse_args()
+    if args.rounds < 1 or args.episodes < 1:
+        p.error("rounds and episodes must be positive")
+    data = load_observations(args)
+    output = Path(args.output)
+    output.mkdir(parents=True, exist_ok=True)
+    metrics = []
+    with CausalPolicyClient(args.uri, control_mode=args.control_mode) as client:
+        if client.metadata["execute_steps"] != 16 or client.metadata["actions_per_block"] != 32:
+            raise ValueError("Replay expects 32 predicted actions / 16 executed steps")
+        if not np.isclose(client.metadata["fps"], data["fps"]):
+            raise ValueError(f"Server FPS {client.metadata['fps']} differs from dataset aligned FPS {data['fps']}")
+        for episode in range(args.episodes):
+            client.reset(prompt=data["prompt"])
+            for revision in range(args.rounds):
+                step = revision * 16
+                begin = 0 if revision == 0 else step - 15
+                request = dict(
+                    obs={key: frames[begin : step + 1] for key, frames in data["cameras"].items()},
+                    state=data["state"][step],
+                    observation_step=step,
+                )
+                if revision:
+                    request["executed_steps"] = 16
+                result = client.infer(request)
+                action = client.actions(result)
+                width = (
+                    client.metadata["left_arm_dof"] + client.metadata["right_arm_dof"] + 2
+                    if args.control_mode == "joint"
+                    else 16
+                )
+                if action.shape != (32, width) or not np.isfinite(action).all():
+                    raise RuntimeError("Invalid server action output")
+                for mode, values in result["action"].items():
+                    if values is not None:
+                        np.save(output / f"episode{episode:03d}_step{step:06d}_action_{mode}.npy", values)
+                if "action_unified" in result:
+                    np.save(
+                        output / f"episode{episode:03d}_step{step:06d}_action_unified.npy", result["action_unified"]
+                    )
+                if "video_latents" in result:
+                    np.save(output / f"episode{episode:03d}_step{step:06d}_video_latents.npy", result["video_latents"])
+                row = dict(episode=episode, step=step, revision=result["revision"], **result["server_timing"])
+                metrics.append(row)
+                print(json.dumps(row), flush=True)
+    (output / "metrics.json").write_text(
+        json.dumps(
+            dict(
+                source=data["root"],
+                episode=data["episode"],
+                start=data["start"],
+                fps=data["fps"],
+                semantics="dataset observation replay; predicted actions do not drive subsequent observations",
+                requests=metrics,
+            ),
+            indent=2,
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()
