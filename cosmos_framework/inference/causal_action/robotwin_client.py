@@ -17,7 +17,12 @@ from pathlib import Path
 
 import numpy as np
 
-from cosmos_framework.inference.causal_action.client import CausalPolicyClient
+from cosmos_framework.inference.causal_action.client import (
+    CausalPolicyClient,
+    H264VideoWriter,
+    append_prediction_video,
+    save_prediction_video,
+)
 
 
 def camera_images(observation):
@@ -54,18 +59,11 @@ def episode_finished(env):
     return env.eval_success or env.take_action_cnt >= env.step_lim
 
 
-class VideoRecorder:
+class VideoRecorder(H264VideoWriter):
     """Stream copied RGB observations to an MP4 without retaining an episode in RAM."""
 
     def __init__(self, output, *, fps=30):
-        self.path = Path(output) / "video.mp4" if output is not None else None
-        self.fps = fps
-        self.frames = 0
-        self.writer = None
-        self.shape = None
-
-    def __enter__(self):
-        return self
+        super().__init__(Path(output) / "video.mp4" if output is not None else None, fps=fps)
 
     def append(self, images):
         if self.path is None:
@@ -74,31 +72,14 @@ class VideoRecorder:
 
         head, left, right = (images[name] for name in ("cam_high", "cam_left_wrist", "cam_right_wrist"))
         for image in (head, left, right):
-            if image.ndim != 3 or image.shape[2] != 3 or image.dtype != np.uint8:
+            if image.ndim != 3 or image.shape[2] != 3 or image.dtype != np.uint8 or min(image.shape[:2]) < 2:
                 raise ValueError("Video recording requires uint8 RGB camera images")
-        height = head.shape[0] + max(left.shape[0], right.shape[0])
-        width = max(head.shape[1], left.shape[1] + right.shape[1])
-        # Preserve camera pixels and pad to even dimensions for the video codec.
-        frame = np.zeros((height + height % 2, width + width % 2, 3), dtype=np.uint8)
-        head_x = (width - head.shape[1]) // 2
-        frame[: head.shape[0], head_x : head_x + head.shape[1]] = head
-        frame[head.shape[0] : head.shape[0] + left.shape[0], : left.shape[1]] = left
-        frame[head.shape[0] : head.shape[0] + right.shape[0], left.shape[1] : left.shape[1] + right.shape[1]] = right
-        if self.writer is None:
-            self.shape = frame.shape
-            self.writer = cv2.VideoWriter(
-                str(self.path), cv2.VideoWriter_fourcc(*"mp4v"), self.fps, (frame.shape[1], frame.shape[0])
-            )
-            if not self.writer.isOpened():
-                raise RuntimeError(f"Cannot open MP4 writer: {self.path}; check OpenCV video codec support")
-        if frame.shape != self.shape:
-            raise ValueError("Camera image dimensions changed during video recording")
-        self.writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-        self.frames += 1
-
-    def __exit__(self, *args):
-        if self.writer is not None:
-            self.writer.release()
+        # Match VideoViewConfig's concat_view geometry without importing Torch.
+        height, width = head.shape[:2]
+        left = cv2.resize(left, (width // 2, height // 2), interpolation=cv2.INTER_LINEAR)
+        right = cv2.resize(right, (width - width // 2, height // 2), interpolation=cv2.INTER_LINEAR)
+        frame = np.concatenate([head, np.concatenate([left, right], axis=1)], axis=0)
+        super().append(frame)
 
 
 def rollout(env, client, *, state_source="command", output=None, video_fps=30):
@@ -117,7 +98,12 @@ def rollout(env, client, *, state_source="command", output=None, video_fps=30):
     requests = []
     client.reset(prompt=env.get_instruction())
 
-    with VideoRecorder(output, fps=video_fps) as video:
+    video_stride = client.metadata.get("video_stride", 4)
+    prediction_fps = client.metadata.get("video_fps", client.metadata.get("fps", 30) / video_stride)
+    with (
+        VideoRecorder(output, fps=video_fps) as video,
+        H264VideoWriter(output / "prediction.mp4" if output is not None else None, fps=prediction_fps) as prediction,
+    ):
         if not episode_finished(env):
             observation = env.get_obs()
             images = camera_images(observation)
@@ -147,17 +133,24 @@ def rollout(env, client, *, state_source="command", output=None, video_fps=30):
                 requests.append(dict(observation_step=executed, **response.get("server_timing", {})))
                 if output is not None:
                     np.save(output / f"step{executed:06d}_action_{client.control_mode}.npy", actions)
+                    requests[-1].update(save_prediction_video(response, output / f"step{executed:06d}_prediction.mp4"))
 
                 observations = []
-                for action in actions[:count]:
-                    env.take_action(action, action_type=action_type)
-                    observation = env.get_obs()
-                    images = camera_images(observation)
-                    video.append(images)
-                    observations.append(images)
-                    executed += 1
-                    if episode_finished(env):
-                        break
+                block_start = executed
+                try:
+                    for action in actions[:count]:
+                        env.take_action(action, action_type=action_type)
+                        observation = env.get_obs()
+                        images = camera_images(observation)
+                        video.append(images)
+                        observations.append(images)
+                        executed += 1
+                        if episode_finished(env):
+                            break
+                finally:
+                    append_prediction_video(
+                        prediction, response, action_steps=executed - block_start, video_stride=video_stride
+                    )
                 if episode_finished(env):
                     break
                 request = dict(
@@ -175,6 +168,9 @@ def rollout(env, client, *, state_source="command", output=None, video_fps=30):
         video_path=str(video.path) if video.path is not None else None,
         video_frames=video.frames,
         video_fps=video_fps,
+        prediction_video_path=str(prediction.path) if prediction.frames else None,
+        prediction_video_frames=prediction.frames,
+        prediction_video_fps=prediction.fps,
     )
 
 

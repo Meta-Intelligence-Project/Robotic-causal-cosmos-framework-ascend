@@ -253,8 +253,21 @@ class CausalPolicyEngine:
         )[0]
         delta = self.statistics.action.denormalize(sampled[nv:].reshape(anoise.shape), mask)
         actions = self.template.decode_action_delta(delta, state.to(delta), mask)
+        video_latents = sampled[:nv].reshape(shape)
+        # Wan decodes N latents into 1 + (N - 1) * 4 frames. Supply the
+        # observed prefix so every predicted latent yields four future frames.
+        # Each preview owns its decoder cache; predictions never become history.
+        decoded = self.encoder.vae.decode(torch.cat([self.latest, video_latents], dim=2), clear_decoder_cache=True)
+        decoded = decoded[0, :, 1:]
+        if decoded.shape[1] != g.actions_per_block // g.video_stride:
+            raise RuntimeError("Decoded prediction length does not match the action/video stride")
+        if not torch.isfinite(decoded).all():
+            raise RuntimeError("VAE returned nonfinite predicted video")
+        video = ((decoded.float().clamp(-1, 1) + 1) * 127.5).round().to(torch.uint8)
         # Predicted latents never enter the observed cache or the streaming VAE.
         return dict(
             action=actions.float().cpu().numpy(),
-            video_latents=sampled[:nv].reshape(shape).float().cpu().numpy(),
+            action_normalized=sampled[nv:].reshape(anoise.shape).float().cpu().numpy(),
+            video=video.permute(1, 2, 3, 0).contiguous().cpu().numpy(),
+            video_latents=video_latents.float().cpu().numpy(),
         )

@@ -47,7 +47,7 @@ class FakeEngine:
     def predict(self, **kwargs):
         out = np.zeros((32, 55), dtype=np.float32)
         out[:, 0] = kwargs["state"][0].item()
-        return dict(action=out, video_latents=np.zeros((1, 2, 2, 1, 1)))
+        return dict(action=out, video=np.zeros((8, 4, 6, 3), dtype=np.uint8), video_latents=np.zeros((1, 2, 2, 1, 1)))
 
 
 def request(engine, count=1, value=0):
@@ -176,6 +176,9 @@ def test_native_websocket_roundtrip_and_reset(monkeypatch):
                             assert client.actions(result).shape == (32, 14)
                             assert result["action"]["eef"] is None
                             assert result["action_unified"].shape == (32, 55)
+                            assert result["video"].shape == (8, 4, 6, 3)
+                            assert result["video"].dtype == np.uint8
+                            assert result["video_fps"] == 7.5
                             assert result["revision"] == revision + 1
                             assert client.actions(result)[0, 0] == revision + episode
                 with pytest.raises(ValueError, match="does not support"):

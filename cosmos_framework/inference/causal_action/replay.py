@@ -14,7 +14,12 @@ from pathlib import Path
 
 import numpy as np
 
-from cosmos_framework.inference.causal_action.client import CausalPolicyClient
+from cosmos_framework.inference.causal_action.client import (
+    CausalPolicyClient,
+    H264VideoWriter,
+    append_prediction_video,
+    save_prediction_video,
+)
 
 
 def load_observations(args):
@@ -25,8 +30,6 @@ def load_observations(args):
     )
     from cosmos_framework.data.generator.action.lerobot_discovery import discover_dataset_roots
     from cosmos_framework.data.generator.action.segment_planner import SegmentPlanner
-    from cosmos_framework.inference.causal_action.robotwin import RobotwinAdapter
-    from lerobot.datasets.video_utils import decode_video_frames
 
     roots = discover_dataset_roots([args.dataset_root])
     geometry = CausalBlockGeometry(temporal_compression_factor=4)
@@ -40,9 +43,17 @@ def load_observations(args):
         table_backend="parquet",
         split="full",
     )
-    _, episode_id, start, actions = reader._resolve_index(args.index)
-    state, _, sm, am, times, task = reader._read_parquet_segment(episode_id, start, actions)
-    required = 1 + (args.rounds - 1) * 16
+    return read_observations(reader, args.index, required=1 + (args.rounds - 1) * 16)
+
+
+def read_observations(reader, index, *, required=None):
+    """Read native cameras/state once for both WebSocket and offline policy replay."""
+    from cosmos_framework.inference.causal_action.robotwin import RobotwinAdapter
+    from lerobot.datasets.video_utils import decode_video_frames
+
+    _, episode_id, start, actions = reader._resolve_index(index)
+    state, target, sm, am, times, task = reader._read_parquet_segment(episode_id, start, actions)
+    required = len(state) if required is None else required
     if len(state) < required:
         raise ValueError(f"Selected segment has {len(state)} observations; {required} required")
     meta = reader._direct_meta
@@ -66,11 +77,15 @@ def load_observations(args):
     return dict(
         cameras=cameras,
         state=[adapter.state_for_replay(row) for row in state[:required].numpy()],
-        prompt=reader._caption_for_index(args.index) or str(meta.tasks.iloc[int(task)].name),
+        prompt=reader._caption_for_index(index) or str(meta.tasks.iloc[int(task)].name),
         fps=reader._read_source_fps(episode_id),
         root=str(reader.root),
         episode=episode_id,
         start=start,
+        state_unified=state[:required],
+        action_target=target[: required - 1],
+        state_mask=sm,
+        action_mask=am,
     )
 
 
@@ -93,44 +108,67 @@ def main():
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     metrics = []
+    prediction_videos = []
     with CausalPolicyClient(args.uri, control_mode=args.control_mode) as client:
         if client.metadata["execute_steps"] != 16 or client.metadata["actions_per_block"] != 32:
             raise ValueError("Replay expects 32 predicted actions / 16 executed steps")
         if not np.isclose(client.metadata["fps"], data["fps"]):
             raise ValueError(f"Server FPS {client.metadata['fps']} differs from dataset aligned FPS {data['fps']}")
+        video_stride = client.metadata.get("video_stride", 4)
+        video_fps = client.metadata.get("video_fps", client.metadata["fps"] / video_stride)
         for episode in range(args.episodes):
             client.reset(prompt=data["prompt"])
-            for revision in range(args.rounds):
-                step = revision * 16
-                begin = 0 if revision == 0 else step - 15
-                request = dict(
-                    obs={key: frames[begin : step + 1] for key, frames in data["cameras"].items()},
-                    state=data["state"][step],
-                    observation_step=step,
-                )
-                if revision:
-                    request["executed_steps"] = 16
-                result = client.infer(request)
-                action = client.actions(result)
-                width = (
-                    client.metadata["left_arm_dof"] + client.metadata["right_arm_dof"] + 2
-                    if args.control_mode == "joint"
-                    else 16
-                )
-                if action.shape != (32, width) or not np.isfinite(action).all():
-                    raise RuntimeError("Invalid server action output")
-                for mode, values in result["action"].items():
-                    if values is not None:
-                        np.save(output / f"episode{episode:03d}_step{step:06d}_action_{mode}.npy", values)
-                if "action_unified" in result:
-                    np.save(
-                        output / f"episode{episode:03d}_step{step:06d}_action_unified.npy", result["action_unified"]
+            with H264VideoWriter(output / f"episode{episode:03d}_prediction.mp4", fps=video_fps) as prediction:
+                for revision in range(args.rounds):
+                    step = revision * 16
+                    begin = 0 if revision == 0 else step - 15
+                    request = dict(
+                        obs={key: frames[begin : step + 1] for key, frames in data["cameras"].items()},
+                        state=data["state"][step],
+                        observation_step=step,
                     )
-                if "video_latents" in result:
-                    np.save(output / f"episode{episode:03d}_step{step:06d}_video_latents.npy", result["video_latents"])
-                row = dict(episode=episode, step=step, revision=result["revision"], **result["server_timing"])
-                metrics.append(row)
-                print(json.dumps(row), flush=True)
+                    if revision:
+                        request["executed_steps"] = 16
+                    result = client.infer(request)
+                    action = client.actions(result)
+                    width = (
+                        client.metadata["left_arm_dof"] + client.metadata["right_arm_dof"] + 2
+                        if args.control_mode == "joint"
+                        else 16
+                    )
+                    if action.shape != (32, width) or not np.isfinite(action).all():
+                        raise RuntimeError("Invalid server action output")
+                    for mode, values in result["action"].items():
+                        if values is not None:
+                            np.save(output / f"episode{episode:03d}_step{step:06d}_action_{mode}.npy", values)
+                    if "action_unified" in result:
+                        np.save(
+                            output / f"episode{episode:03d}_step{step:06d}_action_unified.npy", result["action_unified"]
+                        )
+                    if "video_latents" in result:
+                        np.save(
+                            output / f"episode{episode:03d}_step{step:06d}_video_latents.npy", result["video_latents"]
+                        )
+                    row = dict(episode=episode, step=step, revision=result["revision"], **result["server_timing"])
+                    row.update(
+                        save_prediction_video(result, output / f"episode{episode:03d}_step{step:06d}_prediction.mp4")
+                    )
+                    append_prediction_video(
+                        prediction,
+                        result,
+                        action_steps=result["execute_steps"],
+                        video_stride=video_stride,
+                    )
+                    metrics.append(row)
+                    print(json.dumps(row), flush=True)
+            prediction_videos.append(
+                dict(
+                    episode=episode,
+                    prediction_video_path=str(prediction.path) if prediction.frames else None,
+                    prediction_video_frames=prediction.frames,
+                    prediction_video_fps=prediction.fps,
+                )
+            )
     (output / "metrics.json").write_text(
         json.dumps(
             dict(
@@ -140,6 +178,7 @@ def main():
                 fps=data["fps"],
                 semantics="dataset observation replay; predicted actions do not drive subsequent observations",
                 requests=metrics,
+                prediction_videos=prediction_videos,
             ),
             indent=2,
         )

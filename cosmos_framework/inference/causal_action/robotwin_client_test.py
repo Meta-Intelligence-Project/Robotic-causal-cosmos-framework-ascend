@@ -196,8 +196,8 @@ def test_saved_video_contains_every_observation_and_is_closed_on_exit(tmp_path, 
     finally:
         capture.release()
     assert len(frames) == count
-    assert frames[0].shape == (64, 96, 3)
-    np.testing.assert_allclose([frame[16, 48].mean() for frame in frames], np.arange(count) * 5, atol=4)
+    assert frames[0].shape == (48, 48, 3)
+    np.testing.assert_allclose([frame[16, 24].mean() for frame in frames], np.arange(count) * 5, atol=4)
 
 
 def test_video_preserves_rgb_colors_and_different_camera_sizes(tmp_path):
@@ -214,11 +214,11 @@ def test_video_preserves_rgb_colors_and_different_camera_sizes(tmp_path):
     try:
         ok, frame = capture.read()
         assert ok
-        assert frame.shape == (64, 68, 3)
+        assert frame.shape == (50, 66, 3)
         # Decoded pixels are BGR; inspect well inside each camera to avoid codec edges.
         np.testing.assert_allclose(frame[16, 32], [0, 0, 255], atol=10)
-        np.testing.assert_allclose(frame[48, 16], [0, 255, 0], atol=10)
-        np.testing.assert_allclose(frame[48, 50], [255, 0, 0], atol=10)
+        np.testing.assert_allclose(frame[40, 16], [0, 255, 0], atol=10)
+        np.testing.assert_allclose(frame[40, 50], [255, 0, 0], atol=10)
     finally:
         capture.release()
 

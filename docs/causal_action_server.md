@@ -45,8 +45,40 @@ state、mask、任务描述和实际 FPS；`--dataset-index`、`--index` 可选�
 默认请求观测时刻为 0、16、32，每次返回动作保存至
 `outputs/causal_action/server_replay/episodeXXX_stepXXXXXX_action_joint.npy`，
 如果模型支持 EEF，则同时保存 `_action_eef.npy`。
+每次响应的解码预测视频同时保存为 `episodeXXX_stepXXXXXX_prediction.mp4`；
+完整 32 步预测对应 8 帧视频，播放 FPS 使用 server 返回的 action FPS/4。
+每个 episode 另保存 `episodeXXX_prediction.mp4`：每轮取前 16 步 action 对应的
+前 4 帧按请求顺序拼接，避免预测时间重叠，不跨 episode 拼接。
+各段及完整视频均使用 H.264/AVC 编码；`metrics.json` 的 `prediction_videos` 记录完整视频信息。
 `metrics.json` 保存数据来源及服务耗时。回放数据的下一帧不受预测动作影响，
 这只能验证接口和推理链路，不衡量真实闭环成功率。
+
+## 离线使用相同的 32 步预测 / 16 步保存流程
+
+`inference_robotwin_template.sh` 和 `inference_robotwin_local.sh` 默认使用 10 步采样、
+guidance=1、预测 32 步，并通过 `--execute-steps 16` 每轮仅保存前 16 步动作及前 4 帧视频。
+随后从数据集读取新的 16 组真实观测和对应 state，复用 server 的 `CausalPolicyEngine`
+更新流式 VAE / observed KV，再预测下一轮；预测视频不写入历史。
+`NUM_STEPS`、`GUIDANCE`、`EXECUTE_STEPS` 可覆盖这些默认值。
+执行步数与 server 保持相同约束，必须等于 `video_stride × VAE temporal compression`，当前为 `4 × 4 = 16`。
+
+```bash
+NUM_STEPS=10 GUIDANCE=1 EXECUTE_STEPS=16 \
+  bash examples/action_pretrain/inference_robotwin_template.sh
+```
+
+`action.npy` 和 `sample.pt` 的 action 只累积每轮保留的 16 步，`video.mp4` 只按时间顺序
+累积每轮保留的 4 帧，不包含首帧重建，使用 H.264/AVC 编码。
+`metrics.json` 保存实际数据来源、episode、起点、采样参数和各轮保留步数；
+`action_loss.json` 评估每 16 步重新锚定当前 state 后的归一化 action 误差。
+`sample.pt` 的 `vision_latents` 只保留执行部分；`observed_prefix_latents` 保存各轮解码前缀，
+这些 latent 对应逐轮独立解码，不能将其直接当作单个连续 VAE 序列解码。
+
+对比离线与 WebSocket replay 时，必须匹配 checkpoint、统计文件、processor、VAE、prompt、
+seed、数据 episode 和起点。两端的数据集切片长度和 split seed 可能不同，
+同一个 `index` 不保证同一片段，应核对各自 `metrics.json` 的 `source/episode/start`。
+离线入口未传 `--execute-steps` 时保留原有 FD/ID/Policy 采样接口；
+`--preview-ground-truth-states` 是原有整块离线预览，与新的执行前缀模式不能同时使用。
 
 ## 联合 RoboTwin 运行真实闭环仿真
 
@@ -63,7 +95,7 @@ state、mask、任务描述和实际 FPS；`--dataset-index`、`--index` 可选�
 server 使用当前模型推理环境，client 使用能够独立运行 RoboTwin 的 Python/CUDA/SAPIEN 环境。
 两端可以在不同机器，不要求共享 Python 环境或 GPU。client 不加载 checkpoint、Torch 或 VAE，
 只需能够读取本仓库和 RoboTwin 仓库，且其 Python 环境安装 NumPy、msgpack、
-支持 MP4 编码的 OpenCV（RoboTwin 环境已有此依赖），以及
+OpenCV（用于双腕视角 resize）、支持 `libx264` 编码器的 FFmpeg 命令行程序，以及
 支持 `websockets.sync.client.connect` 的 websockets（本仓库使用的接口需要 15.x 或更新版本）。
 无需在 RoboTwin 环境安装整套 Cosmos 训练依赖，示例入口会自动添加本仓库至 Python 搜索路径。
 
@@ -144,7 +176,9 @@ server 的 `SEED` 控制模型采样，client 的 `--seed` 控制仿真场景，
    初次 `get_obs()` 读取当前三视角图像和 joint/endpose，发送 `observation_step=0`。
    server 根据自身 mask 组装 unified55、归一化、更新首帧 KV，再进行 10 次 denoise。
 4. 接收完整 32 步预测，检查 native action 的维度、有限值及 `execute_steps`，
-   将动作块保存为 `.npy`。仅取前 16 行按顺序执行，后 16 行丢弃。
+   将动作块保存为 `.npy`，将 server 解码返回的 8 帧预测视频保存为本次请求的
+   `stepXXXXXX_prediction.mp4`。仅取前 16 行按顺序执行，对应预测视频的前 4 帧；
+   后 16 行不执行，但完整预测视频仍保留以便检查。
    `joint` 映射到 `env.take_action(action, action_type="qpos")`；
    `eef` 映射到 `action_type="ee"`，每行含原生 wxyz 四元数。
 5. **每次 take_action 返回后立即 get_obs**，记录执行后的三视角图像。
@@ -180,8 +214,11 @@ robotwin_sim/
   episode000/
     seed100000/
       video.mp4
+      prediction.mp4
       step000000_action_joint.npy
+      step000000_prediction.mp4
       step000016_action_joint.npy
+      step000016_prediction.mp4
   episode001/
     ...
 ```
@@ -190,11 +227,23 @@ robotwin_sim/
 终止发生在块内时实际执行更少。`metrics.json` 保存任务、文本、server 地址、控制模式、
 state 来源和各 episode 的 seed、实际 instruction、文本来源/类型、状态、success、执行步数、
 policy 闭环耗时及各次请求的 server 耗时（闭环耗时不包含专家预运行及场景初始化）。
+各次请求还记录 `prediction_video_path`、`prediction_video_frames` 和 `prediction_video_fps`。
+预测 MP4 使用 server 返回的 FPS（默认 7.5）。每轮完整预测仍独立保存，另将本轮
+实际执行步数对应的预测帧追加到同一 `prediction.mp4`；正常执行 16 步追加前 4 帧，
+保留时间顺序并去掉相邻轮次的重叠预测。提前终止时只取 `实际执行步数 // 4` 帧，
+不足一个抽帧间隔的尾部不追加。每个 episode/seed 分别拼接，异常退出也会关闭编码器。
+episode 的 metrics 同样记录完整预测视频的路径、帧数及 FPS。
+`--video-fps` 只影响真实观测的 `video.mp4`。
+视频按返回的完整 action 长度对齐：每 4 步 action 对应 1 帧预测视频，
+默认 32 步/8 帧；若 server 配置预测 16 步，则返回 4 帧。
 `episodes` 保存正常结束或因其他错误退出的 episode；`skipped_seeds` 单独保存
 `UnStableError` 尝试的 episode 编号、seed、`skipped_unstable` 状态和错误原因。
 动作文件按 episode/seed 分目录，保留重试前已保存的动作，避免不同 seed 的结果相互覆盖。
 默认在每个 `episodeXXX/seedXXXX/` 下保存完整 policy 观测视频 `video.mp4`，
-头部相机在上、左右腕部相机在下；保持各相机原始像素，空白区域补黑。
+布局与训练 `concat_view` 对齐：头部相机保持原尺寸 `H × W` 放在上方，
+左右腕部相机先分别双线性 resize 为 `(H//2) × (W//2)` 和
+`(H//2) × (W-W//2)`，再左右拼接到底部。拼接尺寸为 `(H+H//2) × W`；
+仅在编码要求偶数尺寸时，在最右侧或最下侧补一列或一行黑像素。
 视频包含初始帧及每次 `take_action()` 返回后的观测，正常结束时帧数为实际执行步数加 1，
 包括最后不足 16 步的动作块；不包含专家预运行。
 默认播放 FPS 为 30，可用 `--video-fps` 调整；这不是逐物理步录像，也不表示仿真实际耗时。
@@ -202,6 +251,10 @@ policy 闭环耗时及各次请求的 server 耗时（闭环耗时不包含专�
 若执行途中发生 `UnStableError`，保留该 seed 已获取的画面，重试写入新 seed 的目录。
 初始化阶段尚未获取 policy 观测就失败的 seed 不生成视频。
 正常结束的 episode 在 `metrics.json` 中记录 `video_path`、`video_frames` 和 `video_fps`。
+观测视频、每轮预测和完整预测视频统一使用 FFmpeg `libx264` 编码，MP4 容器标记为
+`avc1`，像素格式为 `yuv420p`，启用 `faststart` 以便浏览器播放。
+client 环境的 `PATH` 必须能找到支持 `libx264` 的 `ffmpeg`；编码器不可用会报错。
+视频逐帧写入，不在内存中累积整个 episode。
 
 自动生成文本通常需要专家预运行，因为多数任务在 `play_once()` 中填充文本占位参数，
 仅有 task-name 或初始 `get_instruction()` 不足以获得完整描述；例如 `adjust_bottle` 包括瓶子和手臂。
@@ -238,7 +291,9 @@ msgpack 和 websockets，不加载 Torch、VAE 或模型。也可以直接沿用
 客户端的 msgpack/NumPy 编解码。
 
 ```python
-from cosmos_framework.inference.causal_action.client import CausalPolicyClient
+from pathlib import Path
+
+from cosmos_framework.inference.causal_action.client import CausalPolicyClient, save_prediction_video
 
 
 def camera_images(observation):
@@ -259,6 +314,7 @@ def native_state(observation):
 
 control_mode = "joint"  # 或 "eef"，连接时会校验模型是否支持
 action_type = "qpos" if control_mode == "joint" else "ee"
+output = Path("outputs/causal_action/custom_client")
 with CausalPolicyClient("ws://127.0.0.1:8000", control_mode=control_mode) as client:
     client.reset(prompt=TASK_ENV.get_instruction())
     observation = TASK_ENV.get_obs()
@@ -268,6 +324,7 @@ with CausalPolicyClient("ws://127.0.0.1:8000", control_mode=control_mode) as cli
     step = 0
     done = False
     while not done:
+        save_prediction_video(response, output / f"step{step:06d}_prediction.mp4")
         observations = []
         for action in client.actions(response)[:response["execute_steps"]]:
             TASK_ENV.take_action(action, action_type=action_type)
@@ -306,7 +363,14 @@ episode 内修改任务或执行模式需要 reset。`obs` 同时支持三个相
 可选 `observation_step` 用于拒绝重复或乱序反馈，建议真实 client 始终发送。
 
 响应包含 `action`、`available_control_modes`、`execute_steps=16`、`observation_step`、
-`revision` 和 `server_timing.infer_ms`。`action` 是含以下两个键的字典：
+`revision`、`video`、`video_fps` 和 `server_timing.infer_ms`。
+metadata 另含 `video_stride`（默认 4）和 `video_fps`（默认 7.5）。
+`video` 是三视角拼接的 RGB `uint8 [T,H,W,3]` 数组，分辨率为模型解码分辨率，
+`T = actions_per_block / video_stride`，不包含起始观测帧。
+`video_fps = fps / video_stride`，因此预测视频与 action 覆盖相同的未来时长。
+server 每轮默认解码并返回预测视频；client 不需安装 Torch 或 VAE。
+`save_prediction_video(response, path)` 可用于自定义 client 保存该响应的 H.264 MP4，需要 FFmpeg/libx264。
+`action` 是含以下两个键的字典：
 
 - `joint`：`float32 [32,left_dof+right_dof+2]`，每行顺序为左关节、左夹爪、右关节、右夹爪。
 - `eef`：`float32 [32,16]`，每行顺序为左 xyz+wxyz、左夹爪、右 xyz+wxyz、右夹爪。
@@ -316,10 +380,13 @@ episode 内修改任务或执行模式需要 reset。`obs` 同时支持三个相
 启动时加 `--return-unified-action` 可额外返回内部 `action_unified [32,55]` 用于调试。
 启动时加 `--return-video-latents` 可返回本轮预测的 `video_latents`
 （`[1,C,2,H_latent,W_latent]`，不包含观测前缀）；默认仍联合预测 video/action，
-只省略 video 网络传输。服务器不会默认将预测 latent 解码为视频。
+该选项只控制是否额外传输 latent，不影响默认返回的解码视频。
+解码时拼接最新真实观测 latent 与本轮预测 latent，使用独立的 decoder cache，
+去掉解码结果的观测前缀帧，再按训练视频归一化的逆变换转成 RGB uint8。
+预测视频不进入真实观测的 encoder cache 或 Transformer KV cache。
 
 请求错误返回 `error` 和 `reset_required`。输入校验失败可以修正后重发；
-VAE/prefill/denoise 失败后必须 reset，避免继续使用部分更新的缓存。
+VAE/prefill/denoise/视频解码失败后必须 reset，避免继续使用部分更新的缓存。
 连接断开会自动清空 episode；第二个同时连接的客户端会被拒绝。
 
 ## 缓存与时间对齐

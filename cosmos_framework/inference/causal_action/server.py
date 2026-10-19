@@ -40,6 +40,8 @@ async def serve(policy, *, host="0.0.0.0", port=8000):
                         execute_steps=policy.engine.execute_steps,
                         steps=policy.engine.steps,
                         fps=policy.engine.fps,
+                        video_stride=policy.engine.geometry.video_stride,
+                        video_fps=policy.engine.geometry.video_fps(policy.engine.fps),
                         camera_keys=["cam_high", "cam_left_wrist", "cam_right_wrist"],
                         **policy.adapter.metadata,
                     )

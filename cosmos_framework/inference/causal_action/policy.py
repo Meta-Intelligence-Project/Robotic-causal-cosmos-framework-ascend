@@ -91,6 +91,15 @@ class CausalPolicy:
                 or not np.isfinite(action).all()
             ):
                 raise RuntimeError("Model returned invalid actions")
+            video = result["video"]
+            if (
+                video.dtype != np.uint8
+                or video.ndim != 4
+                or video.shape[0] != len(action) // self.engine.geometry.video_stride
+                or video.shape[-1] != 3
+                or min(video.shape[1:3]) < 2
+            ):
+                raise RuntimeError("Model returned invalid predicted video")
         except Exception:
             # A VAE or CFG branch may have advanced before failure. Never reuse it.
             self.reset()
@@ -105,6 +114,8 @@ class CausalPolicy:
             execute_steps=self.engine.execute_steps,
             observation_step=step,
             revision=self.revision,
+            video=video,
+            video_fps=self.engine.geometry.video_fps(self.engine.fps),
         )
         if self.return_video_latents:
             response["video_latents"] = result["video_latents"]

@@ -5,9 +5,9 @@
 # 环境模板：将 /path/to 占位路径替换为实际路径，或通过环境变量覆盖。
 
 # RoboTwin policy 全段视频预测模板。
-# 按训练片段长度滚完每一个 block，
+# 每轮预测 32 步，保存前 16 步并用下一组真实观测重新预测，
 # 解码 video.mp4，并把反归一化后的预测动作写成 action.npy。
-# 这是样本真值 state 条件下的整段预览，不是把预测画面喂回去的自由闭环。
+# 使用与 server 相同的推理引擎，每 16 步接收数据集真实观测；预测画面不进入历史。
 
 set -euo pipefail
 
@@ -48,13 +48,13 @@ export OVERLAP_ACTION_STEPS="${OVERLAP_ACTION_STEPS:-161}"
 export HISTORY_BLOCKS="${HISTORY_BLOCKS:-32}"
 export ACTIONS_PER_BLOCK="${ACTIONS_PER_BLOCK:-32}"
 export VIDEO_STRIDE="${VIDEO_STRIDE:-4}"
-export NUM_STEPS="${NUM_STEPS:-20}"
-export GUIDANCE="${GUIDANCE:-3}"
+export NUM_STEPS="${NUM_STEPS:-10}"
+export GUIDANCE="${GUIDANCE:-1}"
 
 mkdir -p "$OUTPUT_ROOT"
 
 bash "$SCRIPT_DIR/inference_causal_action.sh" \
-    --preview-ground-truth-states \
+    --execute-steps "${EXECUTE_STEPS:-16}" \
     --decode-video \
     "$@"
 

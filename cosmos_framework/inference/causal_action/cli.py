@@ -23,9 +23,12 @@ def main():
     p.add_argument("--index", type=int, default=0)
     p.add_argument("--resolution", default="480")
     p.add_argument("--output", required=True)
-    p.add_argument("--steps", type=int, default=20)
-    p.add_argument("--guidance", type=float, default=3.0)
+    p.add_argument("--steps", type=int, default=10)
+    p.add_argument("--guidance", type=float, default=1.0)
     p.add_argument("--actions-per-block", type=int, default=32)
+    p.add_argument(
+        "--execute-steps", type=int, help="RoboTwin policy replay: predict a block, save this prefix, replan"
+    )
     p.add_argument("--max-action-steps", type=int, default=96)
     p.add_argument("--overlap-action-steps", type=int, default=16)
     p.add_argument("--history", type=int, default=8)
@@ -39,8 +42,18 @@ def main():
         "--preview-ground-truth-states", action="store_true", help="Explicit offline truth-state conditioned preview"
     )
     p.add_argument("--decode-video", action="store_true")
+    p.add_argument("--evaluate-actions", action="store_true", help="Report open-loop normalized action MSE against GT")
     p.add_argument("--override", action="append", default=[])
     args = p.parse_args()
+    if args.evaluate_actions and args.mode == "forward_dynamics":
+        p.error("--evaluate-actions requires policy or inverse_dynamics; forward_dynamics conditions on GT actions")
+    if args.execute_steps is not None:
+        if args.mode != "policy" or args.preview_ground_truth_states or args.current_block is not None:
+            p.error("--execute-steps requires policy mode without --preview-ground-truth-states or --current-block")
+        if not args.kv_cache:
+            p.error("--execute-steps uses the server's observed KV cache; do not pass --no-kv-cache")
+        if args.execute_steps != args.video_stride * 4:
+            p.error("--execute-steps must equal --video-stride * Wan2.2 temporal compression (4)")
     os.environ.setdefault("COSMOS_DEVICE", "npu")
     os.environ["WAN_VAE_PATH"] = args.vae
     import torch
@@ -51,7 +64,7 @@ def main():
         latent_block_size,
     )
     from cosmos_framework.data.generator.joint_dataloader import custom_collate_fn
-    from cosmos_framework.inference.causal_action.outputs import real_actions
+    from cosmos_framework.inference.causal_action.outputs import normalized_action_metrics, real_actions
     from cosmos_framework.utils import distributed
     from cosmos_framework.utils.generator.model_loader import load_model_from_checkpoint
 
@@ -103,6 +116,15 @@ def main():
         tokenizer_config=model.config.vlm_config.tokenizer,
     )
     dataset = mixture.datasets[args.source_index]
+    if args.execute_steps is not None:
+        from cosmos_framework.inference.causal_action.receding import run_receding_policy
+
+        try:
+            run_receding_policy(model, dataset, args)
+        finally:
+            if torch.distributed.is_initialized():
+                torch.distributed.destroy_process_group()
+        return
     # 离线任务由命令行显式选择，不沿用训练来源清单中的 joint 模式覆盖。
     dataset.set_mode(args.mode)
     batch = custom_collate_fn([dataset[args.index]])
@@ -118,6 +140,12 @@ def main():
     outdir.mkdir(parents=True, exist_ok=True)
     (outdir / "prompt.json").write_text(json.dumps(batch[model.input_caption_key], ensure_ascii=False, indent=2))
     print("MODEL PROMPT:", batch[model.input_caption_key], flush=True)
+    evaluation_batch = (
+        dict(batch, action=[action.detach().float().cpu().clone() for action in batch["action"]])
+        if args.evaluate_actions
+        else None
+    )
+    action_metrics = None
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     started = time.perf_counter()
@@ -132,10 +160,18 @@ def main():
             causal_use_kv_cache=args.kv_cache,
         )
         actions = real_actions(result, batch)
-        torch.save(
-            dict(vision_latents=[v.cpu() for v in result["vision"]], action=[a.cpu() for a in actions]),
-            outdir / "sample.pt",
-        )
+        payload = dict(vision_latents=[v.cpu() for v in result["vision"]], action=[a.cpu() for a in actions])
+        if evaluation_batch is not None:
+            action_metrics = normalized_action_metrics(result, evaluation_batch)
+            payload.update(
+                action_normalized=[a.float().cpu() for a in result["action"]],
+                gt_action_normalized=evaluation_batch["action"],
+                action_valid_mask=[plan.causal_action_metadata.action_mask.cpu() for plan in batch["sequence_plan"]],
+                generated_action_mask=[mask.cpu() for mask in result["generated_action_mask"]],
+            )
+            (outdir / "action_loss.json").write_text(json.dumps(action_metrics, ensure_ascii=False, indent=2))
+            print("NORMALIZED ACTION MSE:", action_metrics["mse"], flush=True)
+        torch.save(payload, outdir / "sample.pt")
         if args.decode_video:
             import imageio.v3 as iio
 
@@ -151,6 +187,8 @@ def main():
         kv_cache=args.kv_cache,
         action_shape=list(actions[0].shape),
     )
+    if action_metrics is not None:
+        metrics.update(normalized_action_mse=action_metrics["mse"], action_loss_file="action_loss.json")
     (outdir / "metrics.json").write_text(json.dumps(metrics, indent=2))
     print(metrics)
     if torch.distributed.is_initialized():
