@@ -19,11 +19,11 @@ from cosmos_framework.data.generator.action.datasets.robotwin_segment_lerobot_da
 )
 from cosmos_framework.data.generator.action.segment_planner import SegmentPlanner
 from cosmos_framework.data.generator.action.transforms import build_sequence_plan_from_mode
-from cosmos_framework.inference.causal_action.client import H264VideoWriter
 from cosmos_framework.inference.causal_action.online import CausalPolicyEngine
 from cosmos_framework.inference.causal_action.outputs import normalized_action_metrics
 from cosmos_framework.inference.causal_action.replay import read_observations
 from cosmos_framework.inference.causal_action.robotwin import RobotwinAdapter
+from cosmos_framework.inference.causal_action.video import save_latent_video
 
 
 @torch.no_grad()
@@ -66,61 +66,63 @@ def run_receding_policy(model, dataset, args):
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     started = time.perf_counter()
-    with H264VideoWriter(
-        output / "video.mp4" if args.decode_video else None, fps=engine.geometry.video_fps(data["fps"])
-    ) as video:
-        for revision, step in enumerate(range(0, total, count)):
-            begin = 0 if step == 0 else step - count + 1
-            cameras = {key: frames[begin : step + 1] for key, frames in data["cameras"].items()}
-            state = source.template.sanitize(
-                torch.from_numpy(adapter.assemble_state(data["state"][step])), adapter.state_mask
-            )
-            call_started = time.perf_counter()
-            engine.observe(
-                cameras,
-                state=state,
-                state_mask=adapter.state_mask,
-                action_mask=adapter.action_mask,
-                prompt=data["prompt"],
-            )
-            result = engine.predict(
-                state=state, state_mask=adapter.state_mask, action_mask=adapter.action_mask, revision=revision
-            )
-            if (
-                result["action"].shape != (args.actions_per_block, source.template.width)
-                or not np.isfinite(result["action"]).all()
-            ):
-                raise RuntimeError("Model returned invalid actions")
-            actions.append(torch.from_numpy(result["action"][:count].copy()))
-            normalized.append(torch.from_numpy(result["action_normalized"][:count].copy()))
-            keep_latents = count // engine.geometry.actions_per_latent_frame
-            latents.append(torch.from_numpy(result["video_latents"][:, :, :keep_latents].copy()))
-            prefixes.append(engine.latest.detach().cpu())
-            for frame in result["video"][: count // args.video_stride]:
-                video.append(frame)
-            row = dict(
-                observation_step=step,
-                predicted_steps=args.actions_per_block,
-                saved_steps=count,
-                infer_ms=(time.perf_counter() - call_started) * 1000,
-            )
-            requests.append(row)
-            print(json.dumps(row), flush=True)
+    for revision, step in enumerate(range(0, total, count)):
+        begin = 0 if step == 0 else step - count + 1
+        cameras = {key: frames[begin : step + 1] for key, frames in data["cameras"].items()}
+        state = source.template.sanitize(
+            torch.from_numpy(adapter.assemble_state(data["state"][step])), adapter.state_mask
+        )
+        call_started = time.perf_counter()
+        engine.observe(
+            cameras,
+            state=state,
+            state_mask=adapter.state_mask,
+            action_mask=adapter.action_mask,
+            prompt=data["prompt"],
+        )
+        result = engine.predict(
+            state=state, state_mask=adapter.state_mask, action_mask=adapter.action_mask, revision=revision
+        )
+        if (
+            result["action"].shape != (args.actions_per_block, source.template.width)
+            or not np.isfinite(result["action"]).all()
+        ):
+            raise RuntimeError("Model returned invalid actions")
+        actions.append(torch.from_numpy(result["action"][:count].copy()))
+        normalized.append(torch.from_numpy(result["action_normalized"][:count].copy()))
+        keep_latents = count // engine.geometry.actions_per_latent_frame
+        latents.append(torch.from_numpy(result["video_latents"][:, :, :keep_latents].copy()))
+        prefixes.append(engine.latest.detach().cpu())
+        row = dict(
+            observation_step=step,
+            predicted_steps=args.actions_per_block,
+            saved_steps=count,
+            infer_ms=(time.perf_counter() - call_started) * 1000,
+        )
+        requests.append(row)
+        print(json.dumps(row), flush=True)
     action = torch.cat(actions)
     prediction = torch.cat(normalized)
+    video_latents = torch.cat([prefixes[0], *latents], dim=2)
+    video_metrics = dict(video_path=None, video_frames=0, video_fps=16)
+    if args.decode_video:
+        video_metrics = save_latent_video(model, video_latents, output / "video.mp4")
     payload = dict(
         action=[action],
         action_normalized=[prediction],
-        vision_latents=[torch.cat(latents, dim=2)],
+        vision_latents=[video_latents],
         observed_prefix_latents=prefixes,
         prediction_starts=torch.arange(0, total, count),
         execute_steps=count,
-        video_decode_mode="Each prefix is decoded with its own observed latent; concatenate decoded frames",
+        video_decode_mode="Decode initial observed latent plus all selected prediction latents once",
     )
     metrics = dict(
         source=data["root"],
         episode=data["episode"],
         start=data["start"],
+        split_seed=data["split_seed"],
+        max_action_steps=data["max_action_steps"],
+        overlap_action_steps=data["overlap_action_steps"],
         checkpoint=args.checkpoint,
         seed=args.seed,
         steps=args.steps,
@@ -134,9 +136,7 @@ def run_receding_policy(model, dataset, args):
         kv_cache=True,
         action_shape=list(action.shape),
         requests=requests,
-        video_path=str(video.path) if video.frames else None,
-        video_frames=video.frames,
-        video_fps=video.fps,
+        **video_metrics,
     )
     if args.evaluate_actions:
         geometry = CausalBlockGeometry(

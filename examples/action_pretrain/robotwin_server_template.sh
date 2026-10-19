@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: OpenMDW-1.1
 
 # 环境模板：将 /path/to 占位路径替换为实际路径，或通过环境变量覆盖。
+# 回放期间只生成 latent；片段结束后整段解码，MP4 保存方式与 EveryNDrawSample 一致。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

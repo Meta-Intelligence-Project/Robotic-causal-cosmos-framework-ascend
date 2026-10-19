@@ -21,6 +21,7 @@ def main():
     p.add_argument("--mode", choices=["policy", "forward_dynamics", "inverse_dynamics"], default="policy")
     p.add_argument("--video-stride", type=int, default=4)
     p.add_argument("--index", type=int, default=0)
+    p.add_argument("--split-seed", type=int, default=42, help="Dataset ordering seed; separate from --seed")
     p.add_argument("--resolution", default="480")
     p.add_argument("--output", required=True)
     p.add_argument("--steps", type=int, default=10)
@@ -106,6 +107,7 @@ def main():
         max_action_steps=args.max_action_steps,
         overlap_action_steps=args.overlap_action_steps,
         mode=args.mode,
+        seed=args.split_seed,
         resolution=args.resolution,
         cfg_dropout_rate=0,
         allow_mock_statistics=args.allow_mock_statistics,
@@ -173,16 +175,17 @@ def main():
             print("NORMALIZED ACTION MSE:", action_metrics["mse"], flush=True)
         torch.save(payload, outdir / "sample.pt")
         if args.decode_video:
-            import imageio.v3 as iio
+            from cosmos_framework.inference.causal_action.video import save_latent_video
 
-            frames = model.decode(result["vision"][0]).float().cpu().squeeze(0)
-            frames = ((frames.clamp(-1, 1) + 1) * 127.5).byte().permute(1, 2, 3, 0).numpy()
-            iio.imwrite(outdir / "video.mp4", frames, fps=float(batch["conditioning_fps"][0]))
+            save_latent_video(model, result["vision"][0], outdir / "video.mp4")
     torch.cuda.synchronize()
     metrics = dict(
         seconds=time.perf_counter() - started,
         peak_gib=torch.cuda.max_memory_allocated() / 2**30,
         mode=args.mode,
+        split_seed=args.split_seed,
+        max_action_steps=args.max_action_steps,
+        overlap_action_steps=args.overlap_action_steps,
         semantics=result["preview_semantics"],
         kv_cache=args.kv_cache,
         action_shape=list(actions[0].shape),

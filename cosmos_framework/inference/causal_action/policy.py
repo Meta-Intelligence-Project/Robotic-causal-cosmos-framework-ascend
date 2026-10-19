@@ -28,6 +28,28 @@ class CausalPolicy:
         self.revision = self.observation_step = 0
         self.started = False
         self.needs_reset = False
+        self.record_video = False
+        self.video_latents = []
+
+    def finish_video(self):
+        """Decode and encode the selected prediction sequence once on the model host."""
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        from cosmos_framework.inference.causal_action.video import save_latent_video
+
+        if self.needs_reset or not self.record_video or len(self.video_latents) < 2:
+            raise ValueError("No recorded prediction sequence; reset with record_video=True before inference")
+        latent = torch.cat(self.video_latents, dim=2)
+        with TemporaryDirectory(prefix="cosmos-prediction-") as directory:
+            path = Path(directory) / "prediction.mp4"
+            metrics = save_latent_video(self.engine.model, latent, path)
+            result = dict(
+                video_mp4=path.read_bytes(), video_frames=metrics["video_frames"], video_fps=metrics["video_fps"]
+            )
+        self.video_latents.clear()
+        self.record_video = False
+        return result
 
     def infer(self, request):
         if not isinstance(request, dict):
@@ -43,10 +65,18 @@ class CausalPolicy:
             self.reset()
             self.prompt = request.get("prompt")
             self.control_mode = mode
+            self.record_video = bool(request.get("record_video", False))
             if "obs" not in request:
                 return {"reset": True, "observation_step": 0}
         if self.needs_reset:
             raise ValueError("Previous inference failed; send reset before continuing")
+        if request.get("finish_video", False):
+            try:
+                return self.finish_video()
+            except Exception:
+                self.reset()
+                self.needs_reset = True
+                raise
         if "obs" not in request:
             raise ValueError("Each inference needs fresh observations and measured state")
         prompt = request.get("prompt", self.prompt)
@@ -91,15 +121,19 @@ class CausalPolicy:
                 or not np.isfinite(action).all()
             ):
                 raise RuntimeError("Model returned invalid actions")
-            video = result["video"]
+            video_latents = result["video_latents"]
             if (
-                video.dtype != np.uint8
-                or video.ndim != 4
-                or video.shape[0] != len(action) // self.engine.geometry.video_stride
-                or video.shape[-1] != 3
-                or min(video.shape[1:3]) < 2
+                video_latents.ndim != 5
+                or video_latents.shape[0] != 1
+                or video_latents.shape[2] != self.engine.geometry.latent_frames_per_block
+                or not np.isfinite(video_latents).all()
             ):
-                raise RuntimeError("Model returned invalid predicted video")
+                raise RuntimeError("Model returned invalid predicted video latents")
+            if self.record_video:
+                if not self.video_latents:
+                    self.video_latents.append(self.engine.latest.detach().float().cpu().clone())
+                keep = self.engine.execute_steps // self.engine.geometry.actions_per_latent_frame
+                self.video_latents.append(torch.from_numpy(video_latents[:, :, :keep].copy()))
         except Exception:
             # A VAE or CFG branch may have advanced before failure. Never reuse it.
             self.reset()
@@ -114,8 +148,6 @@ class CausalPolicy:
             execute_steps=self.engine.execute_steps,
             observation_step=step,
             revision=self.revision,
-            video=video,
-            video_fps=self.engine.geometry.video_fps(self.engine.fps),
         )
         if self.return_video_latents:
             response["video_latents"] = result["video_latents"]

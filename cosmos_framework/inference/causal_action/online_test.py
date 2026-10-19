@@ -24,6 +24,7 @@ class FakeEngine:
         self.geometry = CausalBlockGeometry(temporal_compression_factor=4)
         self.execute_steps = 16
         self.steps = 10
+        self.seed = 42
         self.fps = 30.0
         mask = torch.zeros(55, dtype=torch.bool)
         mask[:6] = True
@@ -165,6 +166,7 @@ def test_native_websocket_roundtrip_and_reset(monkeypatch):
             def client_session():
                 with CausalPolicyClient(uri, control_mode="joint") as client:
                     assert client.metadata["protocol"] == "cosmos-causal-action-v2"
+                    assert client.metadata["seed"] == policy.engine.seed
                     assert client.metadata["available_control_modes"] == ["joint"]
                     for episode in range(2):
                         assert client.reset(prompt="Pick up the cube.")["reset"]
@@ -176,9 +178,9 @@ def test_native_websocket_roundtrip_and_reset(monkeypatch):
                             assert client.actions(result).shape == (32, 14)
                             assert result["action"]["eef"] is None
                             assert result["action_unified"].shape == (32, 55)
-                            assert result["video"].shape == (8, 4, 6, 3)
-                            assert result["video"].dtype == np.uint8
-                            assert result["video_fps"] == 7.5
+                            assert "video" not in result
+                            assert client.metadata["video_decode_mode"] == "whole_sequence"
+                            assert client.metadata["prediction_video_fps"] == 16
                             assert result["revision"] == revision + 1
                             assert client.actions(result)[0, 0] == revision + episode
                 with pytest.raises(ValueError, match="does not support"):

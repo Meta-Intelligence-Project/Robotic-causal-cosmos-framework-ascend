@@ -29,6 +29,7 @@ CMD=(
     --mode "${MODE:-policy}"
     --video-stride "${VIDEO_STRIDE:-4}"
     --index "${SAMPLE_INDEX:-0}"
+    --split-seed "${DATA_SPLIT_SEED:-42}"
     --steps "${NUM_STEPS:-10}"
     --guidance "${GUIDANCE:-1}"
     --actions-per-block "${ACTIONS_PER_BLOCK:-32}"

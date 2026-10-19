@@ -6,7 +6,8 @@
 
 # RoboTwin policy 全段视频预测模板。
 # 每轮预测 32 步，保存前 16 步并用下一组真实观测重新预测，
-# 解码 video.mp4，并把反归一化后的预测动作写成 action.npy。
+# 首个真实 latent 与所有保留的预测 latent 拼接后一次解码为 video.mp4。
+# MP4 沿用 EveryNDrawSample 的保存函数、默认质量和 16 FPS；动作写成 action.npy。
 # 使用与 server 相同的推理引擎，每 16 步接收数据集真实观测；预测画面不进入历史。
 
 set -euo pipefail
@@ -43,6 +44,7 @@ export OUTPUT_ROOT="${OUTPUT_ROOT:-$REPO_ROOT/outputs/causal_action/inference_ro
 export MODE=policy
 export SOURCE_INDEX="${SOURCE_INDEX:-0}"
 export SAMPLE_INDEX="${SAMPLE_INDEX:-0}"
+export DATA_SPLIT_SEED="${DATA_SPLIT_SEED:-42}"
 export MAX_ACTION_STEPS="${MAX_ACTION_STEPS:-896}"
 export OVERLAP_ACTION_STEPS="${OVERLAP_ACTION_STEPS:-161}"
 export HISTORY_BLOCKS="${HISTORY_BLOCKS:-32}"

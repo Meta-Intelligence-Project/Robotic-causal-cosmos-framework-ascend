@@ -164,8 +164,22 @@ class CausalPolicyClient:
             raise RuntimeError(response["error"])
         return response
 
-    def reset(self, *, prompt):
-        return self.infer(dict(reset=True, prompt=prompt, control_mode=self.control_mode))
+    def reset(self, *, prompt, record_video=False):
+        return self.infer(dict(reset=True, prompt=prompt, control_mode=self.control_mode, record_video=record_video))
+
+    def save_prediction_video(self, path):
+        """Request one whole-sequence VAE decode and save the server-encoded MP4."""
+        from pathlib import Path
+
+        result = self.infer(dict(finish_video=True))
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(result["video_mp4"])
+        return dict(
+            prediction_video_path=str(path),
+            prediction_video_frames=result["video_frames"],
+            prediction_video_fps=result["video_fps"],
+        )
 
     def actions(self, response):
         """Select server-packed native joint/EEF actions without unified55 slot logic."""

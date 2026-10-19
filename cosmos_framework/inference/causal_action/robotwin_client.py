@@ -96,13 +96,19 @@ def rollout(env, client, *, state_source="command", output=None, video_fps=30):
     started = time.perf_counter()
     executed = 0
     requests = []
-    client.reset(prompt=env.get_instruction())
+    whole_video = client.metadata.get("video_decode_mode") == "whole_sequence"
+    if whole_video:
+        client.reset(prompt=env.get_instruction(), record_video=output is not None)
+    else:
+        client.reset(prompt=env.get_instruction())
 
     video_stride = client.metadata.get("video_stride", 4)
     prediction_fps = client.metadata.get("video_fps", client.metadata.get("fps", 30) / video_stride)
     with (
         VideoRecorder(output, fps=video_fps) as video,
-        H264VideoWriter(output / "prediction.mp4" if output is not None else None, fps=prediction_fps) as prediction,
+        H264VideoWriter(
+            output / "prediction.mp4" if output is not None and not whole_video else None, fps=prediction_fps
+        ) as prediction,
     ):
         if not episode_finished(env):
             observation = env.get_obs()
@@ -160,6 +166,13 @@ def rollout(env, client, *, state_source="command", output=None, video_fps=30):
                     observation_step=executed,
                 )
 
+    prediction_metrics = dict(
+        prediction_video_path=str(prediction.path) if prediction.frames else None,
+        prediction_video_frames=prediction.frames,
+        prediction_video_fps=prediction.fps,
+    )
+    if whole_video and output is not None and requests:
+        prediction_metrics = client.save_prediction_video(output / "prediction.mp4")
     return dict(
         success=bool(env.eval_success),
         executed_steps=executed,
@@ -168,9 +181,7 @@ def rollout(env, client, *, state_source="command", output=None, video_fps=30):
         video_path=str(video.path) if video.path is not None else None,
         video_frames=video.frames,
         video_fps=video_fps,
-        prediction_video_path=str(prediction.path) if prediction.frames else None,
-        prediction_video_frames=prediction.frames,
-        prediction_video_fps=prediction.fps,
+        **prediction_metrics,
     )
 
 

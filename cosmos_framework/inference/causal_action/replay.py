@@ -14,12 +14,7 @@ from pathlib import Path
 
 import numpy as np
 
-from cosmos_framework.inference.causal_action.client import (
-    CausalPolicyClient,
-    H264VideoWriter,
-    append_prediction_video,
-    save_prediction_video,
-)
+from cosmos_framework.inference.causal_action.client import CausalPolicyClient
 
 
 def load_observations(args):
@@ -33,17 +28,20 @@ def load_observations(args):
 
     roots = discover_dataset_roots([args.dataset_root])
     geometry = CausalBlockGeometry(temporal_compression_factor=4)
-    # At least two complete training blocks, even when only replaying the first observation.
-    maximum = max(64, ((args.rounds - 1) * 16 + 31) // 32 * 32)
     reader = RoboTwinSegmentLeRobotDataset(
         root=roots[args.dataset_index],
         template=ActionStateTemplate55(),
-        planner=SegmentPlanner(max_action_steps=maximum, overlap_action_steps=0, geometry=geometry),
+        planner=SegmentPlanner(
+            max_action_steps=args.max_action_steps,
+            overlap_action_steps=args.overlap_action_steps,
+            geometry=geometry,
+        ),
         video_backend="pyav_resize",
         table_backend="parquet",
         split="full",
+        split_seed=args.split_seed,
     )
-    return read_observations(reader, args.index, required=1 + (args.rounds - 1) * 16)
+    return read_observations(reader, args.index)
 
 
 def read_observations(reader, index, *, required=None):
@@ -82,6 +80,9 @@ def read_observations(reader, index, *, required=None):
         root=str(reader.root),
         episode=episode_id,
         start=start,
+        split_seed=reader._split_seed,
+        max_action_steps=reader.planner.max_action_steps,
+        overlap_action_steps=reader.planner.overlap_action_steps,
         state_unified=state[:required],
         action_target=target[: required - 1],
         state_mask=sm,
@@ -97,88 +98,79 @@ def main():
     )
     p.add_argument("--dataset-index", type=int, default=0)
     p.add_argument("--index", type=int, default=0)
-    p.add_argument("--rounds", type=int, default=3)
-    p.add_argument("--episodes", type=int, default=1, help="Replay the same sequence with reset between episodes")
+    p.add_argument("--split-seed", type=int, default=42, help="Dataset ordering seed; separate from model sampling")
+    p.add_argument("--max-action-steps", type=int, default=96, help="Match the offline segment planner")
+    p.add_argument("--overlap-action-steps", type=int, default=16, help="Match the offline segment planner")
     p.add_argument("--control-mode", choices=["joint", "eef"], default="joint")
-    p.add_argument("--output", default="outputs/causal_action/server_replay")
+    p.add_argument(
+        "--output", default="outputs", help="Output root; results are saved under seed{server sampling seed}"
+    )
     args = p.parse_args()
-    if args.rounds < 1 or args.episodes < 1:
-        p.error("rounds and episodes must be positive")
     data = load_observations(args)
-    output = Path(args.output)
-    output.mkdir(parents=True, exist_ok=True)
+    total = len(data["action_target"])
+    if total % 16:
+        raise ValueError("Selected segment must contain complete 16-step execution prefixes")
+    rounds = total // 16
+    print(f"Replay selected segment: {total} action steps, {rounds} prediction rounds", flush=True)
     metrics = []
-    prediction_videos = []
     with CausalPolicyClient(args.uri, control_mode=args.control_mode) as client:
         if client.metadata["execute_steps"] != 16 or client.metadata["actions_per_block"] != 32:
             raise ValueError("Replay expects 32 predicted actions / 16 executed steps")
         if not np.isclose(client.metadata["fps"], data["fps"]):
             raise ValueError(f"Server FPS {client.metadata['fps']} differs from dataset aligned FPS {data['fps']}")
-        video_stride = client.metadata.get("video_stride", 4)
-        video_fps = client.metadata.get("video_fps", client.metadata["fps"] / video_stride)
-        for episode in range(args.episodes):
-            client.reset(prompt=data["prompt"])
-            with H264VideoWriter(output / f"episode{episode:03d}_prediction.mp4", fps=video_fps) as prediction:
-                for revision in range(args.rounds):
-                    step = revision * 16
-                    begin = 0 if revision == 0 else step - 15
-                    request = dict(
-                        obs={key: frames[begin : step + 1] for key, frames in data["cameras"].items()},
-                        state=data["state"][step],
-                        observation_step=step,
-                    )
-                    if revision:
-                        request["executed_steps"] = 16
-                    result = client.infer(request)
-                    action = client.actions(result)
-                    width = (
-                        client.metadata["left_arm_dof"] + client.metadata["right_arm_dof"] + 2
-                        if args.control_mode == "joint"
-                        else 16
-                    )
-                    if action.shape != (32, width) or not np.isfinite(action).all():
-                        raise RuntimeError("Invalid server action output")
-                    for mode, values in result["action"].items():
-                        if values is not None:
-                            np.save(output / f"episode{episode:03d}_step{step:06d}_action_{mode}.npy", values)
-                    if "action_unified" in result:
-                        np.save(
-                            output / f"episode{episode:03d}_step{step:06d}_action_unified.npy", result["action_unified"]
-                        )
-                    if "video_latents" in result:
-                        np.save(
-                            output / f"episode{episode:03d}_step{step:06d}_video_latents.npy", result["video_latents"]
-                        )
-                    row = dict(episode=episode, step=step, revision=result["revision"], **result["server_timing"])
-                    row.update(
-                        save_prediction_video(result, output / f"episode{episode:03d}_step{step:06d}_prediction.mp4")
-                    )
-                    append_prediction_video(
-                        prediction,
-                        result,
-                        action_steps=result["execute_steps"],
-                        video_stride=video_stride,
-                    )
-                    metrics.append(row)
-                    print(json.dumps(row), flush=True)
-            prediction_videos.append(
-                dict(
-                    episode=episode,
-                    prediction_video_path=str(prediction.path) if prediction.frames else None,
-                    prediction_video_frames=prediction.frames,
-                    prediction_video_fps=prediction.fps,
-                )
+        if client.metadata.get("video_decode_mode") != "whole_sequence":
+            raise ValueError("Replay requires a server supporting whole-sequence prediction video decoding")
+        seed = client.metadata["seed"]
+        output = Path(args.output) / f"seed{seed}"
+        output.mkdir(parents=True, exist_ok=True)
+        print(f"Replay output: {output}", flush=True)
+        client.reset(prompt=data["prompt"], record_video=True)
+        for revision, step in enumerate(range(0, total, 16)):
+            begin = 0 if revision == 0 else step - 15
+            request = dict(
+                obs={key: frames[begin : step + 1] for key, frames in data["cameras"].items()},
+                state=data["state"][step],
+                observation_step=step,
             )
+            if revision:
+                request["executed_steps"] = 16
+            result = client.infer(request)
+            action = client.actions(result)
+            width = (
+                client.metadata["left_arm_dof"] + client.metadata["right_arm_dof"] + 2
+                if args.control_mode == "joint"
+                else 16
+            )
+            if action.shape != (32, width) or not np.isfinite(action).all():
+                raise RuntimeError("Invalid server action output")
+            for mode, values in result["action"].items():
+                if values is not None:
+                    np.save(output / f"step{step:06d}_action_{mode}.npy", values)
+            if "action_unified" in result:
+                np.save(output / f"step{step:06d}_action_unified.npy", result["action_unified"])
+            if "video_latents" in result:
+                np.save(output / f"step{step:06d}_video_latents.npy", result["video_latents"])
+            row = dict(step=step, revision=result["revision"], **result["server_timing"])
+            metrics.append(row)
+            print(json.dumps(row), flush=True)
+        prediction = client.save_prediction_video(output / "prediction.mp4")
     (output / "metrics.json").write_text(
         json.dumps(
             dict(
                 source=data["root"],
                 episode=data["episode"],
                 start=data["start"],
+                split_seed=data["split_seed"],
+                max_action_steps=data["max_action_steps"],
+                overlap_action_steps=data["overlap_action_steps"],
                 fps=data["fps"],
+                seed=seed,
+                action_steps=total,
+                rounds=rounds,
                 semantics="dataset observation replay; predicted actions do not drive subsequent observations",
                 requests=metrics,
-                prediction_videos=prediction_videos,
+                video_decode_mode="whole_sequence",
+                **prediction,
             ),
             indent=2,
         )
