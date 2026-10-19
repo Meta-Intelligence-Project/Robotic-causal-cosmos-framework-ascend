@@ -13,6 +13,10 @@ import pytest
 from cosmos_framework.inference.causal_action import robotwin_client as runner
 
 
+class UnStableError(Exception):
+    pass
+
+
 class FakeEnv:
     def __init__(self, *, limit=35, success_at=None):
         self.step_lim = limit
@@ -142,6 +146,83 @@ def test_invalid_action_chunk_is_rejected_before_simulator_execution():
     assert not env.executed
 
 
+@pytest.mark.parametrize("ending", ["limit", "success", "error"])
+def test_saved_video_contains_every_observation_and_is_closed_on_exit(tmp_path, ending):
+    import cv2
+
+    env = FakeEnv(success_at=3 if ending == "success" else None)
+    env.set_instruction(instruction="Move.")
+    get_obs = env.get_obs
+
+    def observation():
+        obs = get_obs()
+        for camera in obs["observation"].values():
+            camera["rgb"] = np.full((32, 48, 3), env.take_action_cnt * 5, dtype=np.uint8)
+        return obs
+
+    env.get_obs = observation
+    client = FakeClient()
+    infer = client.infer
+
+    def failing_infer(request):
+        if request["observation_step"] == 16:
+            raise RuntimeError("Inference failed")
+        return infer(request)
+
+    if ending == "error":
+        client.infer = failing_infer
+        with pytest.raises(RuntimeError, match="Inference failed"):
+            runner.rollout(env, client, output=tmp_path, video_fps=12)
+        count = 17
+    else:
+        result = runner.rollout(env, client, output=tmp_path, video_fps=12)
+        count = 4 if ending == "success" else 36
+        assert result["video_frames"] == count
+        assert result["video_path"] == str(tmp_path / "video.mp4")
+        assert result["video_fps"] == 12
+
+    # Decode the actual MP4: validates codec output, finalization and frame order,
+    # including the last partial chunk and frames saved before an exception.
+    capture = cv2.VideoCapture(str(tmp_path / "video.mp4"))
+    try:
+        assert capture.isOpened()
+        assert capture.get(cv2.CAP_PROP_FPS) == pytest.approx(12)
+        frames = []
+        while True:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            frames.append(frame)
+    finally:
+        capture.release()
+    assert len(frames) == count
+    assert frames[0].shape == (64, 96, 3)
+    np.testing.assert_allclose([frame[16, 48].mean() for frame in frames], np.arange(count) * 5, atol=4)
+
+
+def test_video_preserves_rgb_colors_and_different_camera_sizes(tmp_path):
+    import cv2
+
+    images = dict(
+        cam_high=np.full((33, 65, 3), [255, 0, 0], dtype=np.uint8),
+        cam_left_wrist=np.full((31, 33, 3), [0, 255, 0], dtype=np.uint8),
+        cam_right_wrist=np.full((29, 35, 3), [0, 0, 255], dtype=np.uint8),
+    )
+    with runner.VideoRecorder(tmp_path) as recorder:
+        recorder.append(images)
+    capture = cv2.VideoCapture(str(tmp_path / "video.mp4"))
+    try:
+        ok, frame = capture.read()
+        assert ok
+        assert frame.shape == (64, 68, 3)
+        # Decoded pixels are BGR; inspect well inside each camera to avoid codec edges.
+        np.testing.assert_allclose(frame[16, 32], [0, 0, 255], atol=10)
+        np.testing.assert_allclose(frame[48, 16], [0, 255, 0], atol=10)
+        np.testing.assert_allclose(frame[48, 50], [255, 0, 0], atol=10)
+    finally:
+        capture.release()
+
+
 def test_robotwin_root_is_required_even_with_environment_variable(monkeypatch, capsys):
     monkeypatch.setenv("ROBOTWIN_ROOT", "/path/to/RoboTwin")
     with pytest.raises(SystemExit) as error:
@@ -168,6 +249,7 @@ def test_main_loads_config_resets_each_episode_and_always_closes_env(monkeypatch
         return env
 
     helpers = SimpleNamespace(
+        UnStableError=UnStableError,
         load_task_args=lambda args: (config, "aloha-agilex"),
         class_decorator=make_env,
         safe_close_env=lambda env: closed.append(env),
@@ -245,6 +327,7 @@ def automatic_main(monkeypatch, tmp_path):
         return f"Lift the bottle with the left arm. Seed {seed}."
 
     helpers = SimpleNamespace(
+        UnStableError=UnStableError,
         load_task_args=lambda args: (config, "aloha-agilex"),
         resolve_eval_instruction=lambda args, task: args["instruction_type"] or task["eval_instruction"],
         build_instruction=build_instruction,
@@ -315,3 +398,71 @@ def test_failed_automatic_instruction_is_recorded_and_never_sent(automatic_main,
     assert client.closed
     metrics = json.loads((tmp_path / "metrics.json").read_text())
     assert metrics["episodes"][0]["status"] == "error"
+
+
+@pytest.mark.parametrize(
+    ("phase", "override"),
+    [("setup", False), ("expert", False), ("restore", False), ("rollout", False), ("setup", True), ("rollout", True)],
+)
+def test_unstable_seeds_are_retried_without_consuming_episodes(automatic_main, tmp_path, phase, override):
+    client, envs, events, helpers = automatic_main
+    if override:
+        sys.argv.extend(["--instruction", "Adjust."])
+    make_env = helpers.class_decorator
+
+    def unstable_env(task):
+        env = make_env(task)
+        setup, expert, take_action = env.setup_demo, env.play_once, env.take_action
+        setups = 0
+
+        def fail_if_unstable(current_phase):
+            if phase == current_phase and env.setup_args["seed"] in (42, 43):
+                raise UnStableError("Objects are unstable")
+
+        def setup_demo(**kwargs):
+            nonlocal setups
+            setup(**kwargs)
+            setups += 1
+            fail_if_unstable("setup" if setups == 1 else "restore")
+
+        def play_once():
+            fail_if_unstable("expert")
+            return expert()
+
+        def execute(action, *, action_type):
+            take_action(action, action_type=action_type)
+            fail_if_unstable("rollout")
+
+        env.setup_demo, env.play_once, env.take_action = setup_demo, play_once, execute
+        return env
+
+    helpers.class_decorator = unstable_env
+    runner.main()
+
+    # Two consecutive bad seeds must not exhaust --episodes=2 or be reused.
+    assert [env.setup_args["seed"] for env in envs] == [42, 43, 44, 45]
+    assert [env.setup_args["now_ep_num"] for env in envs] == [0, 0, 0, 1]
+    assert all(("close", seed) in events for seed in (42, 43, 44, 45))
+    prompts = ["Adjust."] * 2 if override else [f"Lift the bottle with the left arm. Seed {seed}." for seed in (44, 45)]
+    assert client.resets[-2:] == prompts
+    assert len(client.resets) == (4 if phase == "rollout" else 2)
+    assert client.closed
+    metrics = json.loads((tmp_path / "metrics.json").read_text())
+    assert [record["seed"] for record in metrics["episodes"]] == [44, 45]
+    assert all(record["status"] == "finished" and record["executed_steps"] == 2 for record in metrics["episodes"])
+    assert [record["seed"] for record in metrics["skipped_seeds"]] == [42, 43]
+    assert all(record["status"] == "skipped_unstable" for record in metrics["skipped_seeds"])
+    assert all("UnStableError" in record["error"] for record in metrics["skipped_seeds"])
+    assert (tmp_path / "episode000" / "seed44" / "step000000_action_joint.npy").is_file()
+    if phase == "rollout":
+        # Failed attempts' predictions must not be overwritten by the retry.
+        assert (tmp_path / "episode000" / "seed42" / "step000000_action_joint.npy").is_file()
+        import cv2
+
+        for episode, seed, frames in ((0, 42, 1), (0, 43, 1), (0, 44, 3), (1, 45, 3)):
+            capture = cv2.VideoCapture(str(tmp_path / f"episode{episode:03d}" / f"seed{seed}" / "video.mp4"))
+            try:
+                assert capture.isOpened()
+                assert capture.get(cv2.CAP_PROP_FRAME_COUNT) == frames
+            finally:
+                capture.release()

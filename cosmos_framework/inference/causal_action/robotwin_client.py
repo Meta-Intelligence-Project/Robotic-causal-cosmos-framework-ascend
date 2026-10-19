@@ -54,7 +54,54 @@ def episode_finished(env):
     return env.eval_success or env.take_action_cnt >= env.step_lim
 
 
-def rollout(env, client, *, state_source="command", output=None):
+class VideoRecorder:
+    """Stream copied RGB observations to an MP4 without retaining an episode in RAM."""
+
+    def __init__(self, output, *, fps=30):
+        self.path = Path(output) / "video.mp4" if output is not None else None
+        self.fps = fps
+        self.frames = 0
+        self.writer = None
+        self.shape = None
+
+    def __enter__(self):
+        return self
+
+    def append(self, images):
+        if self.path is None:
+            return
+        import cv2
+
+        head, left, right = (images[name] for name in ("cam_high", "cam_left_wrist", "cam_right_wrist"))
+        for image in (head, left, right):
+            if image.ndim != 3 or image.shape[2] != 3 or image.dtype != np.uint8:
+                raise ValueError("Video recording requires uint8 RGB camera images")
+        height = head.shape[0] + max(left.shape[0], right.shape[0])
+        width = max(head.shape[1], left.shape[1] + right.shape[1])
+        # Preserve camera pixels and pad to even dimensions for the video codec.
+        frame = np.zeros((height + height % 2, width + width % 2, 3), dtype=np.uint8)
+        head_x = (width - head.shape[1]) // 2
+        frame[: head.shape[0], head_x : head_x + head.shape[1]] = head
+        frame[head.shape[0] : head.shape[0] + left.shape[0], : left.shape[1]] = left
+        frame[head.shape[0] : head.shape[0] + right.shape[0], left.shape[1] : left.shape[1] + right.shape[1]] = right
+        if self.writer is None:
+            self.shape = frame.shape
+            self.writer = cv2.VideoWriter(
+                str(self.path), cv2.VideoWriter_fourcc(*"mp4v"), self.fps, (frame.shape[1], frame.shape[0])
+            )
+            if not self.writer.isOpened():
+                raise RuntimeError(f"Cannot open MP4 writer: {self.path}; check OpenCV video codec support")
+        if frame.shape != self.shape:
+            raise ValueError("Camera image dimensions changed during video recording")
+        self.writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        self.frames += 1
+
+    def __exit__(self, *args):
+        if self.writer is not None:
+            self.writer.release()
+
+
+def rollout(env, client, *, state_source="command", output=None, video_fps=30):
     """One episode: initial frame, then exactly one frame per executed target.
 
     Predicted rows after execute_steps are discarded. If the episode finishes
@@ -70,56 +117,64 @@ def rollout(env, client, *, state_source="command", output=None):
     requests = []
     client.reset(prompt=env.get_instruction())
 
-    if not episode_finished(env):
-        observation = env.get_obs()
-        request = dict(
-            obs=camera_images(observation),
-            state=native_state(observation, env, state_source=state_source),
-            observation_step=0,
-        )
-        while True:
-            response = client.infer(request)
-            actions = np.asarray(client.actions(response), dtype=np.float32)
-            count = response["execute_steps"]
-            if type(count) is not int or count < 1 or count != client.metadata["execute_steps"]:
-                raise ValueError("Server execute_steps differs from connection metadata")
-            width = (
-                client.metadata["left_arm_dof"] + client.metadata["right_arm_dof"] + 2
-                if client.control_mode == "joint"
-                else 16
+    with VideoRecorder(output, fps=video_fps) as video:
+        if not episode_finished(env):
+            observation = env.get_obs()
+            images = camera_images(observation)
+            video.append(images)
+            request = dict(
+                obs=images,
+                state=native_state(observation, env, state_source=state_source),
+                observation_step=0,
             )
-            if (
-                actions.shape != (client.metadata["actions_per_block"], width)
-                or len(actions) < count
-                or not np.isfinite(actions).all()
-            ):
-                raise ValueError("Server returned an invalid native action chunk")
-            requests.append(dict(observation_step=executed, **response.get("server_timing", {})))
-            if output is not None:
-                np.save(output / f"step{executed:06d}_action_{client.control_mode}.npy", actions)
+            while True:
+                response = client.infer(request)
+                actions = np.asarray(client.actions(response), dtype=np.float32)
+                count = response["execute_steps"]
+                if type(count) is not int or count < 1 or count != client.metadata["execute_steps"]:
+                    raise ValueError("Server execute_steps differs from connection metadata")
+                width = (
+                    client.metadata["left_arm_dof"] + client.metadata["right_arm_dof"] + 2
+                    if client.control_mode == "joint"
+                    else 16
+                )
+                if (
+                    actions.shape != (client.metadata["actions_per_block"], width)
+                    or len(actions) < count
+                    or not np.isfinite(actions).all()
+                ):
+                    raise ValueError("Server returned an invalid native action chunk")
+                requests.append(dict(observation_step=executed, **response.get("server_timing", {})))
+                if output is not None:
+                    np.save(output / f"step{executed:06d}_action_{client.control_mode}.npy", actions)
 
-            observations = []
-            for action in actions[:count]:
-                env.take_action(action, action_type=action_type)
-                observation = env.get_obs()
-                observations.append(camera_images(observation))
-                executed += 1
+                observations = []
+                for action in actions[:count]:
+                    env.take_action(action, action_type=action_type)
+                    observation = env.get_obs()
+                    images = camera_images(observation)
+                    video.append(images)
+                    observations.append(images)
+                    executed += 1
+                    if episode_finished(env):
+                        break
                 if episode_finished(env):
                     break
-            if episode_finished(env):
-                break
-            request = dict(
-                obs=observations,
-                state=native_state(observation, env, state_source=state_source),
-                executed_steps=count,
-                observation_step=executed,
-            )
+                request = dict(
+                    obs=observations,
+                    state=native_state(observation, env, state_source=state_source),
+                    executed_steps=count,
+                    observation_step=executed,
+                )
 
     return dict(
         success=bool(env.eval_success),
         executed_steps=executed,
         seconds=time.perf_counter() - started,
         requests=requests,
+        video_path=str(video.path) if video.path is not None else None,
+        video_frames=video.frames,
+        video_fps=video_fps,
     )
 
 
@@ -155,12 +210,13 @@ def parser():
     p.add_argument("--task-config", default="demo_clean")
     p.add_argument("--instruction", help="Override RoboTwin-generated instruction; reused across episodes")
     p.add_argument("--instruction-type", choices=["seen", "unseen"], help="Default: task config eval_instruction")
-    p.add_argument("--seed", type=int, default=100000, help="First simulator seed; incremented for each episode")
+    p.add_argument("--seed", type=int, default=100000, help="First simulator seed; incremented after every attempt")
     p.add_argument("--episodes", type=positive_int, default=1)
     p.add_argument("--control-mode", choices=["joint", "eef"], default="joint")
     p.add_argument("--state-source", choices=["command", "measured"], default="command")
     p.add_argument("--max-steps", type=positive_int, help="Optional per-episode limit, capped by RoboTwin's task limit")
     p.add_argument("--render-freq", type=int, default=0)
+    p.add_argument("--video-fps", type=positive_int, default=30, help="Saved observation video playback FPS")
     p.add_argument("--output", default="outputs/causal_action/robotwin_sim")
     return p
 
@@ -181,7 +237,9 @@ def main():
         server_uri=args.server_uri,
         control_mode=args.control_mode,
         state_source=args.state_source,
+        video_fps=args.video_fps,
         episodes=[],
+        skipped_seeds=[],
     )
     with CausalPolicyClient(args.server_uri, control_mode=args.control_mode) as client:
         helpers = load_robotwin(args.robotwin_root)
@@ -202,8 +260,8 @@ def main():
             else None
         )
         summary["instruction_type"] = instruction_type
-        for episode in range(args.episodes):
-            seed = args.seed + episode
+        episode, seed = 0, args.seed
+        while episode < args.episodes:
             env = helpers.class_decorator(args.task_name)
             env.suc, env.test_num = 0, episode
             record = dict(episode=episode, seed=seed)
@@ -237,17 +295,31 @@ def main():
                 env.set_instruction(instruction=instruction)
                 print(f"Episode {episode}, seed {seed}, instruction: {instruction}", flush=True)
                 record.update(
-                    rollout(env, client, state_source=args.state_source, output=output / f"episode{episode:03d}")
+                    rollout(
+                        env,
+                        client,
+                        state_source=args.state_source,
+                        output=output / f"episode{episode:03d}" / f"seed{seed}",
+                        video_fps=args.video_fps,
+                    )
                 )
                 record["status"] = "finished"
                 print(json.dumps(record), flush=True)
+            except helpers.UnStableError as error:
+                record.update(status="skipped_unstable", error=f"{type(error).__name__}: {error}")
+                print(
+                    f"Episode {episode}, skipping unstable seed {seed}: {error}; retrying seed {seed + 1}", flush=True
+                )
+                continue
             except Exception as error:
                 record.update(status="error", error=f"{type(error).__name__}: {error}")
                 raise
             finally:
                 helpers.safe_close_env(env)
-                summary["episodes"].append(record)
+                summary["skipped_seeds" if record.get("status") == "skipped_unstable" else "episodes"].append(record)
                 (output / "metrics.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2))
+                seed += 1
+            episode += 1
 
 
 if __name__ == "__main__":

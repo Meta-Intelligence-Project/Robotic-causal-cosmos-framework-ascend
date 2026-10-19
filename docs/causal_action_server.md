@@ -62,7 +62,8 @@ state、mask、任务描述和实际 FPS；`--dataset-index`、`--index` 可选�
 
 server 使用当前模型推理环境，client 使用能够独立运行 RoboTwin 的 Python/CUDA/SAPIEN 环境。
 两端可以在不同机器，不要求共享 Python 环境或 GPU。client 不加载 checkpoint、Torch 或 VAE，
-只需能够读取本仓库和 RoboTwin 仓库，且其 Python 环境安装 NumPy、msgpack 和
+只需能够读取本仓库和 RoboTwin 仓库，且其 Python 环境安装 NumPy、msgpack、
+支持 MP4 编码的 OpenCV（RoboTwin 环境已有此依赖），以及
 支持 `websockets.sync.client.connect` 的 websockets（本仓库使用的接口需要 15.x 或更新版本）。
 无需在 RoboTwin 环境安装整套 Cosmos 训练依赖，示例入口会自动添加本仓库至 Python 搜索路径。
 
@@ -107,19 +108,20 @@ server 使用当前模型推理环境，client 使用能够独立运行 RoboTwin
 
 ### 参数
 
-| 参数                            | 默认值                               | 含义                                                                     |
-| ------------------------------- | ------------------------------------ | ------------------------------------------------------------------------ |
-| `--robotwin-root`               | 无，必须显式指定                     | 具有仿真依赖和资产的 RoboTwin 仓库                                       |
-| `--server-uri`                  | `ws://127.0.0.1:8000`                | 模型服务地址                                                             |
-| `--task-name` / `--task-config` | `adjust_bottle` / `demo_clean`       | 环境类名及 `env_cfg/task_config/<配置>.yml`                              |
-| `--instruction`                 | 不指定，由 RoboTwin 生成             | 可选文本覆盖；指定后所有 episode 共用该文本，跳过专家预运行              |
-| `--instruction-type`            | task config 的 `eval_instruction`    | 自动生成文本使用 `seen` 或 `unseen` 模板；`demo_clean` 默认为 `seen`     |
-| `--control-mode`                | `joint`                              | 选择 server 返回的 `joint` 或 `eef` 动作；当前 checkpoint 只支持 `joint` |
-| `--state-source`                | `command`                            | `command` 使用 get_obs 的 drive target；`measured` 改用实测关节 qpos     |
-| `--seed` / `--episodes`         | `100000` / `1`                       | 第一个 episode 的仿真 seed 及 episode 数量；后续 seed 逐次加 1           |
-| `--max-steps`                   | 不额外限制                           | 实际上限取该值与 RoboTwin 任务上限的较小者，单位为 take_action 调用次数  |
-| `--render-freq`                 | `0`                                  | 透传 RoboTwin 的界面渲染频率；0 不开启 viewer，仍采集相机图像            |
-| `--output`                      | `outputs/causal_action/robotwin_sim` | 相对启动目录解析的日志与预测动作保存目录                                 |
+| 参数                            | 默认值                               | 含义                                                                                     |
+| ------------------------------- | ------------------------------------ | ---------------------------------------------------------------------------------------- |
+| `--robotwin-root`               | 无，必须显式指定                     | 具有仿真依赖和资产的 RoboTwin 仓库                                                       |
+| `--server-uri`                  | `ws://127.0.0.1:8000`                | 模型服务地址                                                                             |
+| `--task-name` / `--task-config` | `adjust_bottle` / `demo_clean`       | 环境类名及 `env_cfg/task_config/<配置>.yml`                                              |
+| `--instruction`                 | 不指定，由 RoboTwin 生成             | 可选文本覆盖；指定后所有 episode 共用该文本，跳过专家预运行                              |
+| `--instruction-type`            | task config 的 `eval_instruction`    | 自动生成文本使用 `seen` 或 `unseen` 模板；`demo_clean` 默认为 `seen`                     |
+| `--control-mode`                | `joint`                              | 选择 server 返回的 `joint` 或 `eef` 动作；当前 checkpoint 只支持 `joint`                 |
+| `--state-source`                | `command`                            | `command` 使用 get_obs 的 drive target；`measured` 改用实测关节 qpos                     |
+| `--seed` / `--episodes`         | `100000` / `1`                       | 起始仿真 seed 及完成的 episode 数量；每次尝试后 seed 加 1，不稳定 seed 不占 episode 数量 |
+| `--max-steps`                   | 不额外限制                           | 实际上限取该值与 RoboTwin 任务上限的较小者，单位为 take_action 调用次数                  |
+| `--render-freq`                 | `0`                                  | 透传 RoboTwin 的界面渲染频率；0 不开启 viewer，仍采集相机图像                            |
+| `--video-fps`                   | `30`                                 | 保存的观测视频播放 FPS；不改变仿真推进或模型请求频率                                     |
+| `--output`                      | `outputs/causal_action/robotwin_sim` | 相对启动目录解析的日志、预测动作和观测视频保存目录                                       |
 
 server 的 `SEED` 控制模型采样，client 的 `--seed` 控制仿真场景，两者分别配置。
 `--help` 只解析参数，不导入 RoboTwin/SAPIEN，也不会连接 server。
@@ -130,7 +132,7 @@ server 的 `SEED` 控制模型采样，client 的 `--seed` 控制仿真场景，
    选择不支持的 EEF 模式会在创建仿真环境之前失败。
 2. 根据 task config 加载双臂 embodiment、相机尺寸和机器人资产配置，创建任务环境，
    调用 `setup_demo(now_ep_num=episode, seed=seed, is_test=True, ...)`。
-   强制启用 `eval_mode`、头部/双腕相机和 `rgb/qpos/endpose`；关闭原有评测视频记录。
+   强制启用 `eval_mode`、头部/双腕相机和 `rgb/qpos/endpose`；由 client 保存视频，关闭原有评测录像。
    校验仿真左右臂关节数量与 server 的 DOF 相符。
    默认先在关闭 viewer 的情况下执行一次 `play_once()` 获取 `episode_info["info"]`，
    按任务名选择 `description/task_instruction/<task_name>.json`，结合本轮物体/手臂等占位字段、
@@ -147,6 +149,7 @@ server 的 `SEED` 控制模型采样，client 的 `--seed` 控制仿真场景，
    `eef` 映射到 `action_type="ee"`，每行含原生 wxyz 四元数。
 5. **每次 take_action 返回后立即 get_obs**，记录执行后的三视角图像。
    对 RGB 数组做独立拷贝，防止下一次渲染复用缓冲区覆盖旧帧。
+   初始观测和每次执行后的观测都追加到同一 `video.mp4`，覆盖整个 policy episode，包含终止帧。
    不重复发送上一轮末帧；正常一轮获得恰好 16 组新图像。
 6. 将这 16 组图像和最后一组对应的 joint/endpose 发给 server，同时发送
    `executed_steps=16` 和累计 `observation_step=16/32/48/...`。
@@ -155,7 +158,10 @@ server 的 `SEED` 控制模型采样，client 的 `--seed` 控制仿真场景，
 7. 每次动作后检查 `env.eval_success` 和 `env.take_action_cnt >= env.step_lim`。
    成功或达到上限立即停止，即使当前 16 步尚未执行完；不足 16 帧不补齐、不提交下一次 infer。
    保存 episode 结果，通过 `finally` 关闭环境；下一 episode 使用新 seed、重新 reset。
-   退出时关闭 WebSocket，server 清理该连接的缓存。遇到初始化或推理错误，记录错误并结束程序。
+   遇到 RoboTwin 的 `UnStableError`（物体不稳定）时关闭当前环境，记录跳过的 seed，
+   将 seed 加 1 后重新执行同一 episode 的初始化、文本生成和 policy rollout，
+   直到可正常模拟；下一次 rollout 先 reset server 缓存。跳过的 seed 不占 `--episodes` 数量。
+   退出时关闭 WebSocket，server 清理该连接的缓存。其他初始化或推理错误仍记录后报错退出。
 
 默认 `--state-source command` 保留现有训练数据的 get_obs state 语义。
 若选择 `measured`，脚本用 `robot.get_left_arm_real_jointState()` 和
@@ -172,8 +178,10 @@ Robotwin 的一次 take_action 内部含路径规划和多次物理推进，因�
 robotwin_sim/
   metrics.json
   episode000/
-    step000000_action_joint.npy
-    step000016_action_joint.npy
+    seed100000/
+      video.mp4
+      step000000_action_joint.npy
+      step000016_action_joint.npy
   episode001/
     ...
 ```
@@ -182,7 +190,18 @@ robotwin_sim/
 终止发生在块内时实际执行更少。`metrics.json` 保存任务、文本、server 地址、控制模式、
 state 来源和各 episode 的 seed、实际 instruction、文本来源/类型、状态、success、执行步数、
 policy 闭环耗时及各次请求的 server 耗时（闭环耗时不包含专家预运行及场景初始化）。
-脚本不保存观测视频，若需视频可以在每次 get_obs 后自行增加 recorder。
+`episodes` 保存正常结束或因其他错误退出的 episode；`skipped_seeds` 单独保存
+`UnStableError` 尝试的 episode 编号、seed、`skipped_unstable` 状态和错误原因。
+动作文件按 episode/seed 分目录，保留重试前已保存的动作，避免不同 seed 的结果相互覆盖。
+默认在每个 `episodeXXX/seedXXXX/` 下保存完整 policy 观测视频 `video.mp4`，
+头部相机在上、左右腕部相机在下；保持各相机原始像素，空白区域补黑。
+视频包含初始帧及每次 `take_action()` 返回后的观测，正常结束时帧数为实际执行步数加 1，
+包括最后不足 16 步的动作块；不包含专家预运行。
+默认播放 FPS 为 30，可用 `--video-fps` 调整；这不是逐物理步录像，也不表示仿真实际耗时。
+`--render-freq 0` 时同样保存视频。视频边执行边写入，正常结束或异常退出时关闭编码器；
+若执行途中发生 `UnStableError`，保留该 seed 已获取的画面，重试写入新 seed 的目录。
+初始化阶段尚未获取 policy 观测就失败的 seed 不生成视频。
+正常结束的 episode 在 `metrics.json` 中记录 `video_path`、`video_frames` 和 `video_fps`。
 
 自动生成文本通常需要专家预运行，因为多数任务在 `play_once()` 中填充文本占位参数，
 仅有 task-name 或初始 `get_instruction()` 不足以获得完整描述；例如 `adjust_bottle` 包括瓶子和手臂。
@@ -190,9 +209,11 @@ policy 闭环耗时及各次请求的 server 耗时（闭环耗时不包含专�
 但不按专家成功率筛选/跳过 seed，也不替代官方 benchmark 的评估流程。
 若 RoboTwin 生成失败并退回原始 task-name，脚本报错退出，避免把任务类名当作模型指令；
 可以检查任务描述/物体描述文件，或通过 `--instruction` 显式覆盖。
-某个 seed 初始化或专家预运行失败也会记录并退出，不会隐式跳过该 seed 或将其计为模型失败。
+初始化、专家预运行、重建场景或 policy 执行遇到 `UnStableError` 都会记录并换下一个 seed 重试，
+不设重试次数上限，也不将该尝试计为模型失败；其他异常仍记录后退出。
 当前检查覆盖模拟环境中的动作分块、图像时间顺序、提前成功、实测状态替换、自动文本生成与重建场景、
-手动覆盖和异常清理；未在本机运行真实 RoboTwin 仿真。
+手动覆盖、连续不稳定 seed 重试、MP4 编解码、视频帧顺序/颜色、提前结束和异常时录像收尾；
+未在本机运行真实 RoboTwin 仿真。
 
 ## Server 的机器人配置
 
