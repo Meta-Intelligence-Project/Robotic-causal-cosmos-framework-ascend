@@ -306,7 +306,7 @@ def main():
                         env,
                         client,
                         state_source=args.state_source,
-                        output=output / f"episode{episode:03d}" / f"seed{seed}",
+                        output=output / f"seed{seed}",
                         video_fps=args.video_fps,
                     )
                 )

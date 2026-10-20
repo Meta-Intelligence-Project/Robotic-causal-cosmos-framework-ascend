@@ -238,13 +238,12 @@ Robotwin 的一次 take_action 内部含路径规划和多次物理推进，因�
 ```text
 robotwin_sim/
   metrics.json
-  episode000/
-    seed100000/
-      video.mp4
-      prediction.mp4
-      step000000_action_joint.npy
-      step000016_action_joint.npy
-  episode001/
+  seed100000/
+    video.mp4
+    prediction.mp4
+    step000000_action_joint.npy
+    step000016_action_joint.npy
+  seed100001/
     ...
 ```
 
@@ -259,8 +258,8 @@ episode metrics 记录完整预测视频的路径、帧数及 FPS；不再保存
 `--video-fps` 只影响真实观测的 `video.mp4`。
 `episodes` 保存正常结束或因其他错误退出的 episode；`skipped_seeds` 单独保存
 `UnStableError` 尝试的 episode 编号、seed、`skipped_unstable` 状态和错误原因。
-动作文件按 episode/seed 分目录，保留重试前已保存的动作，避免不同 seed 的结果相互覆盖。
-默认在每个 `episodeXXX/seedXXXX/` 下保存完整 policy 观测视频 `video.mp4`，
+动作文件直接按仿真 seed 分目录，保留重试前已保存的动作，避免不同 seed 的结果相互覆盖。
+输出根目录下直接创建 `seedXXXX/`，在其中保存完整 policy 观测视频 `video.mp4`，
 布局与训练 `concat_view` 对齐：头部相机保持原尺寸 `H × W` 放在上方，
 左右腕部相机先分别双线性 resize 为 `(H//2) × (W//2)` 和
 `(H//2) × (W-W//2)`，再左右拼接到底部。拼接尺寸为 `(H+H//2) × W`；

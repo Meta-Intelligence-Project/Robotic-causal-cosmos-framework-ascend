@@ -453,14 +453,14 @@ def test_unstable_seeds_are_retried_without_consuming_episodes(automatic_main, t
     assert [record["seed"] for record in metrics["skipped_seeds"]] == [42, 43]
     assert all(record["status"] == "skipped_unstable" for record in metrics["skipped_seeds"])
     assert all("UnStableError" in record["error"] for record in metrics["skipped_seeds"])
-    assert (tmp_path / "episode000" / "seed44" / "step000000_action_joint.npy").is_file()
+    assert (tmp_path / "seed44" / "step000000_action_joint.npy").is_file()
     if phase == "rollout":
         # Failed attempts' predictions must not be overwritten by the retry.
-        assert (tmp_path / "episode000" / "seed42" / "step000000_action_joint.npy").is_file()
+        assert (tmp_path / "seed42" / "step000000_action_joint.npy").is_file()
         import cv2
 
-        for episode, seed, frames in ((0, 42, 1), (0, 43, 1), (0, 44, 3), (1, 45, 3)):
-            capture = cv2.VideoCapture(str(tmp_path / f"episode{episode:03d}" / f"seed{seed}" / "video.mp4"))
+        for seed, frames in ((42, 1), (43, 1), (44, 3), (45, 3)):
+            capture = cv2.VideoCapture(str(tmp_path / f"seed{seed}" / "video.mp4"))
             try:
                 assert capture.isOpened()
                 assert capture.get(cv2.CAP_PROP_FRAME_COUNT) == frames
