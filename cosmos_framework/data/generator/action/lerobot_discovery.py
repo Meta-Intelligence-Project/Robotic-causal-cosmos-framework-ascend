@@ -13,7 +13,7 @@ def discover_dataset_roots(paths):
         if not path.is_dir():
             raise FileNotFoundError(f"Dataset directory does not exist: {path}")
         found = False
-        for directory, children, _ in os.walk(path):
+        for directory, children, _ in os.walk(path, followlinks=True):
             children.sort()
             root = Path(directory)
             info_path = root / "meta/info.json"
