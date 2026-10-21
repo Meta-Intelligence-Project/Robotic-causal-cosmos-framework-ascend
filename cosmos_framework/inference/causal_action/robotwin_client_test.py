@@ -232,7 +232,7 @@ def test_robotwin_root_is_required_even_with_environment_variable(monkeypatch, c
 
 
 @pytest.mark.parametrize("fail_setup", [False, True])
-def test_main_loads_config_resets_each_episode_and_always_closes_env(monkeypatch, tmp_path, fail_setup):
+def test_main_loads_config_resets_each_episode_and_always_closes_env(monkeypatch, tmp_path, fail_setup, capsys):
     client, envs, closed = FakeClient(), [], []
     config = dict(camera={}, data_type={})
 
@@ -295,6 +295,17 @@ def test_main_loads_config_resets_each_episode_and_always_closes_env(monkeypatch
     if not fail_setup:
         assert metrics["episodes"][0]["instruction"] == "Adjust."
         assert metrics["episodes"][0]["instruction_source"] == "override"
+        for record in metrics["episodes"]:
+            requests_path = tmp_path / f"seed{record['seed']}" / "requests.json"
+            assert record["requests_path"] == str(requests_path)
+            assert "requests" not in record
+            requests = json.loads(requests_path.read_text())
+            assert [request["observation_step"] for request in requests] == [0]
+            assert requests[0]["infer_ms"] == 1.0
+        stdout = capsys.readouterr().out
+        assert "Episode 0, seed 42" in stdout
+        assert "requests" not in stdout
+        assert "infer_ms" not in stdout
 
 
 @pytest.fixture

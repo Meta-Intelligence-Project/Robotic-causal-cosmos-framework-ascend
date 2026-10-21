@@ -310,8 +310,10 @@ def main():
                         video_fps=args.video_fps,
                     )
                 )
+                requests_path = output / f"seed{seed}" / "requests.json"
+                requests_path.write_text(json.dumps(record.pop("requests"), ensure_ascii=False, indent=2))
+                record["requests_path"] = str(requests_path)
                 record["status"] = "finished"
-                print(json.dumps(record), flush=True)
             except helpers.UnStableError as error:
                 record.update(status="skipped_unstable", error=f"{type(error).__name__}: {error}")
                 print(
