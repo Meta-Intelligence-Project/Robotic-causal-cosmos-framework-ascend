@@ -1,0 +1,255 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+"""Replay one physical, absolute unified55 EEF episode without a policy server.
+
+Run in the RoboTwin Python environment (NumPy, PyArrow, OpenCV and FFmpeg).
+--dataset-root must name a LeRobot root containing meta/info.json and data/,
+e.g. /path/to/robotwin_processed/RoboTwin__adjust_bottle/clean.
+--prepare-only exports action.npy without importing RoboTwin/SAPIEN.
+Outputs under --output/seed{seed}/: action.npy [T,16], observations.npz
+(initial state then one state per action), video.mp4, metrics.json.
+Stops on task success or step limit.
+
+EEF actions are derived next-recorded-pose targets, not original Cartesian
+commands. Each take_action call replans a path, so replay has no fixed 30 Hz
+physics cadence. The original scene also needs its original seed/config/assets;
+an episode index is not a simulator seed.
+"""
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from cosmos_framework.inference.causal_action.robotwin_client import (
+    VideoRecorder,
+    camera_images,
+    episode_finished,
+    load_robotwin,
+    native_state,
+    positive_int,
+)
+
+
+def unit_quaternion(q):
+    q = np.asarray(q, dtype=np.float64)
+    norm = np.linalg.norm(q, axis=-1, keepdims=True)
+    if not np.isfinite(q).all() or (norm < 1e-8).any():
+        raise ValueError("Quaternion must be finite and nonzero")
+    return q / norm
+
+
+def quaternion_product(a, b):
+    """Hamilton product of broadcastable wxyz quaternions."""
+    aw, av, bw, bv = a[..., :1], a[..., 1:], b[..., :1], b[..., 1:]
+    return np.concatenate(
+        [aw * bw - (av * bv).sum(axis=-1, keepdims=True), aw * bv + bw * av + np.cross(av, bv)], axis=-1
+    )
+
+
+def load_actions(root, episode_index, *, pose_frame, world_from_base=None):
+    """Read unnormalized action_unified rows; no extra temporal shift or stride."""
+    import pyarrow.dataset as ds
+
+    info = json.loads((root / "meta/info.json").read_text())
+    columns = ["frame_index", "action_unified", "mask_action"]
+    table = (
+        ds.dataset(root / "data", format="parquet")
+        .to_table(columns=columns, filter=ds.field("episode_index") == episode_index)
+        .sort_by("frame_index")
+    )
+    if not table.num_rows:
+        raise ValueError(f"Episode {episode_index} is empty or missing in {root}")
+    frames = np.asarray(table["frame_index"].to_pylist(), dtype=np.int64)
+    if not np.array_equal(frames, np.arange(len(frames))):
+        raise ValueError("Episode frame_index must be contiguous, starting at zero")
+    action = np.asarray(table["action_unified"].to_pylist(), dtype=np.float64)
+    mask = np.asarray(table["mask_action"].to_pylist(), dtype=np.float64)
+    if action.shape != (len(frames), 55) or mask.shape != action.shape:
+        raise ValueError("action_unified and mask_action must have shape [T,55]")
+    slots = np.r_[14:28, 28:30]
+    if not np.isfinite(mask[:, slots]).all() or not (mask[:, slots] == 1).all():
+        raise ValueError("Both EEFs [14:28] and grippers [28:30] must be valid in every action row")
+    if not np.isfinite(action[:, slots]).all():
+        raise ValueError("EEF/gripper actions must be finite")
+    if ((action[:, 28:30] < 0) | (action[:, 28:30] > 1)).any():
+        raise ValueError("RoboTwin gripper targets must be normalized to [0,1]")
+
+    if pose_frame == "base":
+        if world_from_base is None:
+            transform = info.get("custom", {}).get("eef_enrichment", {}).get("T_world_base")
+            if transform is None:
+                raise ValueError(
+                    "Base-frame poses require metadata custom.eef_enrichment.T_world_base or --world-from-base"
+                )
+            world_from_base = transform["position"] + transform["quaternion_wxyz"]
+        transform = np.asarray(world_from_base, dtype=np.float64)
+        if transform.shape != (7,) or not np.isfinite(transform).all():
+            raise ValueError("world-from-base must be finite [x,y,z,qw,qx,qy,qz]")
+        translation, rotation = transform[:3], unit_quaternion(transform[3:])
+    else:
+        if world_from_base is not None:
+            raise ValueError("--world-from-base only applies to --pose-frame base")
+        translation, rotation = np.zeros(3), np.array([1.0, 0.0, 0.0, 0.0])
+
+    parts = []
+    for start, gripper in ((14, 28), (21, 29)):
+        pose = action[:, start : start + 7]
+        xyz = pose[:, :3]
+        q = unit_quaternion(pose[:, [6, 3, 4, 5]])  # unified xyzw -> RoboTwin wxyz
+        # T_world_eef = T_world_base @ T_base_eef, including orientation.
+        uv = np.cross(rotation[1:], xyz)
+        xyz = xyz + 2 * (rotation[0] * uv + np.cross(rotation[1:], uv)) + translation
+        parts.extend([xyz, quaternion_product(rotation, q), action[:, gripper : gripper + 1]])
+    return np.concatenate(parts, axis=1), frames, info
+
+
+def pose_errors(target, observed):
+    position = np.linalg.norm(target[:, :3] - observed[:, :3], axis=-1)
+    dot = np.sum(unit_quaternion(target[:, 3:7]) * unit_quaternion(observed[:, 3:7]), axis=-1)
+    angle = 2 * np.arccos(np.clip(np.abs(dot), 0, 1))
+    return position, angle
+
+
+def replay(env, actions, frames, output, *, video_fps):
+    """Save initial observation at row 0; action i produces observation i+1."""
+    eef, measured, command, success = [], [], [], []
+    executed = 0
+
+    def capture(video):
+        observation = env.get_obs()
+        images = camera_images(observation)
+        video.append(images)
+        state = native_state(observation, env, state_source="measured")
+        eef.append(np.concatenate([observation["endpose"][f"{side}_endpose"] for side in ("left", "right")]))
+        # Real arm qpos; gripper getter is still a command value, so exclude it here.
+        measured.append(np.concatenate([state["joint_action"][f"{side}_arm"] for side in ("left", "right")]))
+        command.append(np.asarray(observation["joint_action"]["vector"]).copy())
+        success.append(bool(env.eval_success))
+
+    try:
+        with VideoRecorder(output, fps=video_fps) as video:
+            capture(video)
+            for action in actions:
+                if episode_finished(env):
+                    break
+                env.take_action(action.copy(), action_type="ee")
+                executed += 1
+                capture(video)
+    finally:
+        np.savez_compressed(
+            output / "observations.npz",
+            eef_world_wxyz=np.asarray(eef),  # [N+1,14]: left pose, right pose
+            measured_arm_qpos=np.asarray(measured),
+            joint_command=np.asarray(command),  # includes commanded grippers
+            eval_success=np.asarray(success),
+            executed_action=actions[:executed],
+            source_frame_index=frames[:executed],
+        )
+    error_metrics = {}
+    observed = np.asarray(eef)[1:]
+    if executed:
+        for side, target_start, observed_start in (("left", 0, 0), ("right", 8, 7)):
+            position, angle = pose_errors(
+                actions[:executed, target_start : target_start + 7], observed[:, observed_start : observed_start + 7]
+            )
+            error_metrics[side] = dict(
+                position_mean_m=float(position.mean()),
+                position_max_m=float(position.max()),
+                rotation_mean_rad=float(angle.mean()),
+                rotation_max_rad=float(angle.max()),
+            )
+    return dict(
+        executed_steps=executed,
+        observation_frames=len(eef),
+        eval_success=bool(env.eval_success),
+        stop_reason="success" if env.eval_success else "step_limit" if episode_finished(env) else "actions_exhausted",
+        tracking_error=error_metrics,
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--dataset-root", required=True, type=Path)
+    parser.add_argument("--episode-index", type=int, default=0)
+    parser.add_argument("--robotwin-root", help="Required unless --prepare-only")
+    parser.add_argument("--task-name", help="Defaults to meta/info.json custom.source.task")
+    parser.add_argument("--task-config", default="demo_clean", help="Use demo_randomized for randomized data")
+    parser.add_argument("--seed", required=True, type=int, help="Simulator scene seed; not an episode index")
+    parser.add_argument("--pose-frame", choices=["base", "world"], default="base", help="Frame of unified EEF slots")
+    parser.add_argument(
+        "--world-from-base", nargs=7, type=float, metavar="VALUE", help="Override base transform: xyz+wxyz"
+    )
+    parser.add_argument("--max-steps", type=positive_int, help="Optional action count limit")
+    parser.add_argument("--video-fps", type=positive_int, default=30, help="Playback FPS; does not set physics cadence")
+    parser.add_argument("--prepare-only", action="store_true", help="Export native actions without starting RoboTwin")
+    parser.add_argument("--output", type=Path, default=Path("outputs/robotwin_eef_replay"))
+    args = parser.parse_args()
+    if not args.prepare_only and args.robotwin_root is None:
+        parser.error("--robotwin-root is required for simulator replay")
+    root = args.dataset_root.expanduser().resolve()
+    output = args.output.expanduser().resolve() / f"seed{args.seed}"
+    actions, frames, info = load_actions(
+        root, args.episode_index, pose_frame=args.pose_frame, world_from_base=args.world_from_base
+    )
+    args.task_name = args.task_name or info.get("custom", {}).get("source", {}).get("task")
+    if not args.task_name and not args.prepare_only:
+        parser.error("--task-name is required when dataset metadata does not specify the task")
+    if args.max_steps is not None:
+        actions, frames = actions[: args.max_steps], frames[: args.max_steps]
+    output.mkdir(parents=True, exist_ok=True)
+    np.save(output / "action.npy", actions)
+    summary = dict(
+        dataset_root=str(root),
+        episode_index=args.episode_index,
+        task=args.task_name,
+        task_config=args.task_config,
+        seed=args.seed,
+        source_pose_frame=args.pose_frame,
+        world_from_base=(args.world_from_base or info.get("custom", {}).get("eef_enrichment", {}).get("T_world_base"))
+        if args.pose_frame == "base"
+        else None,
+        action_format="left xyz+wxyz+gripper, right xyz+wxyz+gripper; world frame",
+        action_steps=len(actions),
+        video_fps=args.video_fps,
+        status="prepared",
+    )
+    try:
+        if not args.prepare_only:
+            helpers = load_robotwin(args.robotwin_root)
+            task_args, _ = helpers.load_task_args(
+                dict(
+                    task_name=args.task_name,
+                    task_config=args.task_config,
+                    policy_name="eef_replay",
+                    ckpt_setting="dataset",
+                )
+            )
+            task_args.update(
+                eval_mode=True, eval_video_log=False, eval_video_save_dir=None, render_freq=0, save_data=False
+            )
+            task_args["camera"].update(collect_head_camera=True, collect_wrist_camera=True)
+            task_args["data_type"].update(rgb=True, qpos=True, endpose=True)
+            env = helpers.class_decorator(args.task_name)
+            env.suc, env.test_num = 0, 0
+            try:
+                env.setup_demo(now_ep_num=0, seed=args.seed, is_test=True, **task_args)
+                summary.update(replay(env, actions, frames, output, video_fps=args.video_fps))
+                summary["status"] = "finished"
+            finally:
+                helpers.safe_close_env(env)
+    except Exception as error:
+        summary.update(status="error", error=f"{type(error).__name__}: {error}")
+        raise
+    finally:
+        (output / "metrics.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2))
+    print(f"{summary['status']}: {output}, actions={actions.shape}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
