@@ -307,39 +307,36 @@ The dataset must contain `episode_index`, `frame_index`, `action_unified` and `m
 
 By default, `--pose-frame base` interprets EEF poses in the shared robot base frame. The script reads `custom.eef_enrichment.T_world_base` from `meta/info.json`, using its `position` and `quaternion_wxyz` fields, and transforms both position and orientation into the world frame. To override that transform, pass `--world-from-base x y z qw qx qy qz`. If the unified EEF slots already contain world-frame poses, use `--pose-frame world` and omit `--world-from-base`. Both modes interpret the input quaternion as `xyzw` and export `wxyz` for RoboTwin.
 
-For simulation, use a working RoboTwin Python environment with NumPy, PyArrow, OpenCV and msgpack, plus FFmpeg with the `libx264` encoder on `PATH`. The RoboTwin checkout must include `scripts/eval_policy_xpolicylab.py`, which supplies the task/config helpers. The scene seed, task configuration, robot and assets must match the data you intend to replay. The episode index does not identify the simulator seed.
+For simulation, use a working RoboTwin Python environment with NumPy, PyArrow, OpenCV and msgpack, plus FFmpeg with the `libx264` encoder on `PATH`. The RoboTwin checkout must include `scripts/eval_policy_xpolicylab.py`, which supplies the task/config helpers. The script automatically uses `--episode-index` as the simulator seed; there is no separate `--seed` option. This is a replay convention, not a recovered collection seed. The current dataset metadata does not retain that original seed mapping, so this convention does not guarantee the original scene layout. Exact scene reproduction would also require matching task configuration, robot and assets.
 
 ### Export actions without starting the simulator
 
-Run from the Cosmos repository root. Replace the paths and set `SIM_SEED` to the intended scene seed; `0` below is only an example.
+Run from the Cosmos repository root and replace the paths. The example selects episode 1, uses simulator seed 1 and writes to `episode001/`. The default episode index is 0, producing `episode000/` with seed 0.
 
 ```bash
 cd /path/to/cosmos-framework
 export DATASET_ROOT=/path/to/robotwin_processed/RoboTwin__adjust_bottle/clean
-export SIM_SEED=0
 
 python examples/action_pretrain/robotwin_eef_replay.py \
   --dataset-root "$DATASET_ROOT" \
-  --episode-index 0 \
-  --seed "$SIM_SEED" \
+  --episode-index 1 \
   --prepare-only \
   --output outputs/robotwin_eef_replay
 ```
 
-`--prepare-only` requires NumPy, PyArrow and msgpack but does not import RoboTwin/SAPIEN. It validates and exports the actions, writing only `action.npy` and `metrics.json` under `outputs/robotwin_eef_replay/seed${SIM_SEED}/`. This checks data preparation, not simulator execution or task success.
+`--prepare-only` requires NumPy, PyArrow, msgpack, OpenCV and FFmpeg but does not import RoboTwin/SAPIEN. It validates and exports the actions and dataset reference video, writing `action.npy`, `video_data.mp4` and `metrics.json` under `outputs/robotwin_eef_replay/episode001/`. This checks data preparation and video extraction, not simulator execution or task success.
 
 ### Run the replay in a RoboTwin environment
 
-Using the same dataset and seed variables, run the following on a machine with a working RoboTwin installation:
+Using the same dataset variable, run the following on a machine with a working RoboTwin installation:
 
 ```bash
 python examples/action_pretrain/robotwin_eef_replay.py \
   --robotwin-root /path/to/RoboTwin \
   --dataset-root "$DATASET_ROOT" \
-  --episode-index 0 \
+  --episode-index 1 \
   --task-name adjust_bottle \
   --task-config demo_clean \
-  --seed "$SIM_SEED" \
   --output outputs/robotwin_eef_replay
 ```
 
@@ -349,16 +346,21 @@ Each exported action has 16 values: `[left xyz, left qw,qx,qy,qz, left gripper, 
 
 ### Output files
 
-All files are written directly under `--output/seed{seed}/`:
+All files are written directly under `--output/episode{episode_index:03d}/`, for example `outputs/robotwin_eef_replay/episode001/`. The directory is keyed by the selected dataset episode. Rerunning the same episode in the same output root overwrites files with the same names.
 
 | File               | Contents                                                                                                                               |
 | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
 | `action.npy`       | World-frame EEF/gripper control targets, shape `[T,16]`; T is the selected action count after applying `--max-steps`.                  |
 | `observations.npz` | Initial and subsequent EEF poses, measured arm qpos, joint/gripper commands, success flags, executed actions and source frame indices. |
 | `video.mp4`        | H.264 video of simulation RGB observations: head camera on top, resized left/right wrist cameras side by side below.                   |
+| `video_data.mp4`   | H.264 reference video extracted from the selected dataset episode, using the same three-view layout and the dataset's FPS.             |
 | `metrics.json`     | Dataset/scene settings, run status, execution count, stop reason, task success and mean/max position and rotation tracking errors.     |
 
 In `observations.npz`, `eef_world_wxyz` has shape `[N+1,14]` (left pose followed by right pose), `measured_arm_qpos` contains actual arm joint positions, and `joint_command` contains drive targets including commanded gripper values. `eval_success` aligns with the N+1 observations. `executed_action` and `source_frame_index` have N rows; their row i corresponds to observation row i+1. Separate RGB image files are not written.
+
+Reference video extraction uses the per-camera chunk/file indices and episode timestamps in `meta/episodes/chunk-*/file-*.parquet`, together with `meta/info.json`'s `video_path`, to select this episode from the packed source videos. All three dataset camera videos must be available and have the same FPS as the dataset. Frames are streamed into the same head/wrist layout used by `video.mp4`, preserving the source head-camera resolution. `--video-fps` controls simulation-video playback only; the reference retains the dataset's FPS.
+
+The reference contains the selected action prefix plus one following observation when available, capped at the episode's recorded frame count. For example, `--max-steps 32` exports up to 33 reference frames. For a full episode with L action rows and L recorded video frames, the reference has L frames; the simulation can record L+1 frames because it also observes the final executed target. Early simulation success or a task step limit does not shorten the already exported reference. `metrics.json` records `video_data_path`, `video_data_frames`, `video_data_fps`, and `seed_source="episode_index"`.
 
 The EEF targets in the enriched RoboTwin data are derived from the next recorded pose. RoboTwin replans a trajectory for each target, so this replay does not guarantee the original physical timing or trajectory. The video FPS controls playback only; it does not set the simulation/control frequency. A finished replay is not necessarily a successful task: check `eval_success`, `stop_reason` and the measured tracking errors in `metrics.json`.
 

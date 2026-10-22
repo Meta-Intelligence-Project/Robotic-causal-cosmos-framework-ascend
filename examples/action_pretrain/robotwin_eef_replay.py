@@ -6,15 +6,16 @@
 Run in the RoboTwin Python environment (NumPy, PyArrow, OpenCV and FFmpeg).
 --dataset-root must name a LeRobot root containing meta/info.json and data/,
 e.g. /path/to/robotwin_processed/RoboTwin__adjust_bottle/clean.
---prepare-only exports action.npy without importing RoboTwin/SAPIEN.
-Outputs under --output/seed{seed}/: action.npy [T,16], observations.npz
-(initial state then one state per action), video.mp4, metrics.json.
+--prepare-only exports actions and the dataset video without importing RoboTwin/SAPIEN.
+Outputs under --output/episode{episode_index:03d}/: action.npy [T,16],
+observations.npz (initial state then one state per action), video.mp4,
+video_data.mp4 (dataset reference), metrics.json. Simulator seed equals episode_index.
 Stops on task success or step limit.
 
 EEF actions are derived next-recorded-pose targets, not original Cartesian
 commands. Each take_action call replans a path, so replay has no fixed 30 Hz
-physics cadence. The original scene also needs its original seed/config/assets;
-an episode index is not a simulator seed.
+physics cadence. Using episode_index as seed is a replay convention; it does not
+recover the original collection seed or guarantee the original scene layout.
 """
 
 import argparse
@@ -26,6 +27,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from cosmos_framework.inference.causal_action.client import H264VideoWriter
 from cosmos_framework.inference.causal_action.robotwin_client import (
     VideoRecorder,
     camera_images,
@@ -109,6 +111,65 @@ def load_actions(root, episode_index, *, pose_frame, world_from_base=None):
     return np.concatenate(parts, axis=1), frames, info
 
 
+class DatasetVideoRecorder(VideoRecorder):
+    """Use the simulator video's three-view layout with a separate output path."""
+
+    def __init__(self, path, *, fps):
+        H264VideoWriter.__init__(self, path, fps=fps)
+
+
+def save_dataset_video(root, episode_index, info, output, *, max_frames):
+    """Extract this episode from packed LeRobot v3 videos, one frame per source row."""
+    import cv2
+    import pyarrow.dataset as ds
+
+    episodes = ds.dataset(root / "meta/episodes", format="parquet").to_table(
+        filter=ds.field("episode_index") == episode_index
+    )
+    if episodes.num_rows != 1:
+        raise ValueError(f"Expected one video metadata row for episode {episode_index}")
+    episode = episodes.to_pylist()[0]
+    fps = float(info["fps"])
+    count = min(int(episode["length"]), max_frames)
+    if count < 1:
+        raise ValueError("Dataset episode must contain video frames")
+    captures = {}
+    path = output / "video_data.mp4"
+    try:
+        for key in ("cam_high", "cam_left_wrist", "cam_right_wrist"):
+            video_key = f"observation.images.{key}"
+            prefix = f"videos/{video_key}"
+            source = root / info["video_path"].format(
+                video_key=video_key,
+                chunk_index=int(episode[f"{prefix}/chunk_index"]),
+                file_index=int(episode[f"{prefix}/file_index"]),
+            )
+            capture = cv2.VideoCapture(str(source))
+            captures[key] = capture
+            if not capture.isOpened():
+                raise ValueError(f"Cannot open dataset video: {source}")
+            source_fps = capture.get(cv2.CAP_PROP_FPS)
+            if not np.isclose(source_fps, fps):
+                raise ValueError(f"Dataset video FPS {source_fps} differs from action FPS {fps}: {source}")
+            begin = round(float(episode[f"{prefix}/from_timestamp"]) * fps)
+            end = round(float(episode[f"{prefix}/to_timestamp"]) * fps)
+            if end - begin < count or not capture.set(cv2.CAP_PROP_POS_FRAMES, begin):
+                raise ValueError(f"Cannot select {count} episode frames from {source}")
+        with DatasetVideoRecorder(path, fps=fps) as video:
+            for _ in range(count):
+                images = {}
+                for key, capture in captures.items():
+                    ok, frame = capture.read()
+                    if not ok:
+                        raise ValueError(f"Dataset video ended before all {count} episode frames were read: {key}")
+                    images[key] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                video.append(images)
+    finally:
+        for capture in captures.values():
+            capture.release()
+    return dict(video_data_path=str(path), video_data_frames=count, video_data_fps=fps)
+
+
 def pose_errors(target, observed):
     position = np.linalg.norm(target[:, :3] - observed[:, :3], axis=-1)
     dot = np.sum(unit_quaternion(target[:, 3:7]) * unit_quaternion(observed[:, 3:7]), axis=-1)
@@ -176,24 +237,26 @@ def replay(env, actions, frames, output, *, video_fps):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dataset-root", required=True, type=Path)
-    parser.add_argument("--episode-index", type=int, default=0)
+    parser.add_argument("--episode-index", type=int, default=0, help="Dataset episode and simulator seed (default: 0)")
     parser.add_argument("--robotwin-root", help="Required unless --prepare-only")
     parser.add_argument("--task-name", help="Defaults to meta/info.json custom.source.task")
     parser.add_argument("--task-config", default="demo_clean", help="Use demo_randomized for randomized data")
-    parser.add_argument("--seed", required=True, type=int, help="Simulator scene seed; not an episode index")
     parser.add_argument("--pose-frame", choices=["base", "world"], default="base", help="Frame of unified EEF slots")
     parser.add_argument(
         "--world-from-base", nargs=7, type=float, metavar="VALUE", help="Override base transform: xyz+wxyz"
     )
     parser.add_argument("--max-steps", type=positive_int, help="Optional action count limit")
     parser.add_argument("--video-fps", type=positive_int, default=30, help="Playback FPS; does not set physics cadence")
-    parser.add_argument("--prepare-only", action="store_true", help="Export native actions without starting RoboTwin")
+    parser.add_argument(
+        "--prepare-only", action="store_true", help="Export native actions and dataset video without RoboTwin"
+    )
     parser.add_argument("--output", type=Path, default=Path("outputs/robotwin_eef_replay"))
     args = parser.parse_args()
+    seed = args.episode_index
     if not args.prepare_only and args.robotwin_root is None:
         parser.error("--robotwin-root is required for simulator replay")
     root = args.dataset_root.expanduser().resolve()
-    output = args.output.expanduser().resolve() / f"seed{args.seed}"
+    output = args.output.expanduser().resolve() / f"episode{args.episode_index:03d}"
     actions, frames, info = load_actions(
         root, args.episode_index, pose_frame=args.pose_frame, world_from_base=args.world_from_base
     )
@@ -209,7 +272,8 @@ def main():
         episode_index=args.episode_index,
         task=args.task_name,
         task_config=args.task_config,
-        seed=args.seed,
+        seed=seed,
+        seed_source="episode_index",
         source_pose_frame=args.pose_frame,
         world_from_base=(args.world_from_base or info.get("custom", {}).get("eef_enrichment", {}).get("T_world_base"))
         if args.pose_frame == "base"
@@ -220,6 +284,7 @@ def main():
         status="prepared",
     )
     try:
+        summary.update(save_dataset_video(root, args.episode_index, info, output, max_frames=len(actions) + 1))
         if not args.prepare_only:
             helpers = load_robotwin(args.robotwin_root)
             task_args, _ = helpers.load_task_args(
@@ -238,7 +303,7 @@ def main():
             env = helpers.class_decorator(args.task_name)
             env.suc, env.test_num = 0, 0
             try:
-                env.setup_demo(now_ep_num=0, seed=args.seed, is_test=True, **task_args)
+                env.setup_demo(now_ep_num=args.episode_index, seed=seed, is_test=True, **task_args)
                 summary.update(replay(env, actions, frames, output, video_fps=args.video_fps))
                 summary["status"] = "finished"
             finally:
