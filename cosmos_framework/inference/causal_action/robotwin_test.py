@@ -19,7 +19,7 @@ def make_adapter(*, eef=True, joint=True):
     if eef:
         mask[14:28] = True
     mask[28:30] = True
-    return RobotwinAdapter(ActionStateTemplate55(), state_mask=mask, action_mask=mask)
+    return RobotwinAdapter(ActionStateTemplate55(), state_mask=mask, action_mask=mask, eef_pose_frame="world")
 
 
 def native_state():
@@ -87,7 +87,7 @@ def test_statistics_source_masks_must_be_unambiguous_and_config_must_be_covered(
     adapter = make_adapter()
     q = Quantiles(torch.zeros(55), torch.ones(55), adapter.state_mask)
     mask = adapter.state_mask.tolist()
-    source = dict(state_mask=mask, action_mask=mask)
+    source = dict(state_mask=mask, action_mask=mask, eef_pose_frame="world")
     statistics = BlockStatistics(q, q, dict(sources=[source, source]))
     loaded = RobotwinAdapter.from_statistics(adapter.template, statistics)
     assert loaded.available_control_modes == ["joint", "eef"]
@@ -99,7 +99,7 @@ def test_statistics_source_masks_must_be_unambiguous_and_config_must_be_covered(
     config.write_text(json.dumps(dict(state_mask=other, action_mask=other)))
     assert RobotwinAdapter.from_statistics(adapter.template, statistics, config).available_control_modes == ["joint"]
     statistics.state.valid = torch.tensor(other)
-    config.write_text(json.dumps(dict(state_mask=mask, action_mask=mask)))
+    config.write_text(json.dumps(dict(state_mask=mask, action_mask=mask, eef_pose_frame="world")))
     with pytest.raises(ValueError, match="Statistics do not cover"):
         RobotwinAdapter.from_statistics(adapter.template, statistics, config)
 

@@ -369,14 +369,58 @@ server 负责 `state_mask` 和 `action_mask`。默认从统计文件的
 `valid` 并集当成当前机器人的 mask。当前 Robotwin 统计满足这一条件。
 
 若统计中没有来源 mask，或者包含不同机器人，可传 `--robot-config /path/to/robot.json`。
-JSON 字段为 `state_mask`、`action_mask`（各 55 个 bool 或精确的 0/1），以及
-可选 `left_arm_dof`、`right_arm_dof`（默认均为 6，取值 1..7）。
+JSON 可覆盖 `state_mask`、`action_mask`（各 55 个 bool 或精确的 0/1），以及
+`left_arm_dof`、`right_arm_dof`（默认均为 6，取值 1..7）。
+覆盖 mask 时必须同时提供两套；两套均省略时，仍从统计的来源记录加载。
 server 会校验模板、统计覆盖、关节槽位以及相对动作所需的 state anchor。
 reset 和连接断开只清空 episode 数据，保留启动时加载的配置。
 
-当前 Robotwin 训练来源只启用左右六关节和夹爪，`available_control_modes=["joint"]`。
+只启用左右六关节和夹爪的旧统计对应 `available_control_modes=["joint"]`。
 EEF 返回 `None`，不能作为动作执行；只有 action mask 同时覆盖双臂 EEF 和夹爪时，
 才会开放 `eef`。输入同时提供 joint 和 EEF 不会改变模型训练过的有效维度。
+
+### EEF 坐标系配置
+
+client 的原生 EEF state 和 server 返回的 EEF action 均使用世界系 `xyz+wxyz`。
+模型内部的 unified55 使用 `xyz+xyzw`，坐标系必须与训练数据一致。
+启用任意 EEF state/action 槽位时，adapter 必须获得 `eef_pose_frame`：
+
+- `base`：训练 EEF 位于共享双臂基座系，必须同时提供 `T_world_base`。
+  输入 state 做世界系到基座系转换；输出 action 在反归一化和绝对目标解码后做反向转换。
+  位置和姿态都会转换，夹爪、关节值保持原有语义。
+- `world`：训练 EEF 已处于世界系，只转换四元数顺序，不传 `T_world_base`。
+
+未显式配置时，server 从统计 `provenance.sources` 的 `eef_pose_frame/T_world_base`
+字段读取，或根据各来源 `source` 路径读取 `meta/info.json` 的 `custom.eef_enrichment`。
+数据元信息必须明确记录 `unified_quaternion="xyzw"`，以及 `unified_pose_frame`
+（`world`、`base` 或当前数据的 `shared ALOHA dual-arm URDF root/base frame`）。
+所有来源的坐标系和变换必须一致；缺失、未知或不一致时报错，要求显式传入 `--robot-config`。
+server 无法访问统计中记录的数据路径时，也应使用该参数。
+未启用 EEF 的旧关节配置不需要这些字段。
+
+可以只提供坐标配置，mask 继续由训练统计加载。以下为当前 ALOHA 数据元信息对应的示例；
+实际使用时应复制目标数据的 `T_world_base`，并确保仿真机器人的基座放置与其一致。
+四元数会归一化；`base` 模式的位置 mask 必须整组启用或关闭 xyz。
+
+```json
+{
+  "eef_pose_frame": "base",
+  "T_world_base": {
+    "position": [0, -0.65, 0],
+    "quaternion_wxyz": [0.707, 0, 0, 0.707]
+  }
+}
+```
+
+将其保存为 `/path/to/robot.json` 后，把 `--robot-config /path/to/robot.json`
+追加到 server 启动命令或 `robotwin_server_template.sh` 后即可。
+这不会给旧 checkpoint 增加未训练的 EEF 能力，checkpoint、统计和 mask 仍须匹配。
+
+数据回放从所选数据集元信息加载相同变换，先将基座系 state 转成世界系原生请求；
+server 再恢复为模型使用的基座系。连接后会核对 server metadata 的
+`native_eef_pose_frame`、`unified_eef_pose_frame` 和 `T_world_base`，启用 EEF 时不一致即报错。
+离线执行前缀推理也从当前数据集加载该变换，避免将基座系数据再次当成世界系转换。
+独立 `robotwin_eef_replay.py` 已自行完成基座系到世界系转换，不应再叠加一次。
 
 ## 仿真器客户端协议
 
@@ -442,7 +486,8 @@ with CausalPolicyClient("ws://127.0.0.1:8000", control_mode=control_mode) as cli
 `[x,y,z,qw,qx,qy,qz]`；夹爪也可放在 endpose 下作为 joint_action 缺失时的补充。
 若两处都提供夹爪，则以 joint_action 中的值为准。直接发送 get_obs() 的这两个字典即可。
 server 只读取 state_mask 启用的字段；有效字段缺失、形状错误或非法值会报错。
-无效字段忽略并清零，内部四元数转换成 unified55 的 xyzw 后再进行校验和归一化。
+无效字段忽略并清零。EEF 根据配置从世界系转换到训练坐标系，
+内部四元数转换成 unified55 的 xyzw 后再进行校验和归一化。
 
 RoboTwin 的 `get_obs().joint_action` 关节值来自 drive target，并非实际 qpos。
 如需实测关节状态，client 应明确调用 `get_*_arm_real_jointState()` 后替换对应字段，
@@ -469,11 +514,12 @@ server 将首个真实观测 latent 和每轮前 16 步对应的预测 latent �
 `action` 是含以下两个键的字典：
 
 - `joint`：`float32 [32,left_dof+right_dof+2]`，每行顺序为左关节、左夹爪、右关节、右夹爪。
-- `eef`：`float32 [32,16]`，每行顺序为左 xyz+wxyz、左夹爪、右 xyz+wxyz、右夹爪。
+- `eef`：世界系 `float32 [32,16]`，每行顺序为左 xyz+wxyz、左夹爪、右 xyz+wxyz、右夹爪。
 
 未训练的执行模式值为 `None`；两种模式都有效时同时返回，由 client 选择。
 动作已经反归一化并恢复成绝对目标，client 不再加初始位姿，也不需要知道 unified55 槽位。
-启动时加 `--return-unified-action` 可额外返回内部 `action_unified [32,55]` 用于调试。
+启动时加 `--return-unified-action` 可额外返回内部 `action_unified [32,55]` 用于调试，
+该数组保持训练坐标系的 `xyzw` 表示，不做世界系转换。
 启动时加 `--return-video-latents` 可返回本轮预测的 `video_latents`
 （`[1,C,2,H_latent,W_latent]`，不包含观测前缀）；默认仍联合预测 video/action，
 该选项只控制是否额外传输本轮 latent，不影响 server 为整段视频记录所选 latent。

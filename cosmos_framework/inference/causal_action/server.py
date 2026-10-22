@@ -86,7 +86,7 @@ def parser():
     p.add_argument("--statistics", help="Training state/delta quantiles; otherwise read from --sources-file")
     p.add_argument("--sources-file")
     p.add_argument("--source-index", type=int, default=0)
-    p.add_argument("--robot-config", help="JSON with state_mask, action_mask and optional left/right_arm_dof")
+    p.add_argument("--robot-config", help="JSON overriding source masks, arm DOFs, eef_pose_frame and T_world_base")
     p.add_argument(
         "--template", default="cosmos_framework.data.generator.action.action_state_template.ActionStateTemplate55"
     )
