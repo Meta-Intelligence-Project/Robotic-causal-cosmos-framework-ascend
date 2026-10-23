@@ -289,8 +289,10 @@ class OmniMoTCausalModel(OmniMoTModel):
         causal_num_blocks: int | None,
         causal_block_size: int,
         causal_history_blocks: int,
+        causal_use_kv_cache: bool = True,
     ) -> dict[str, list[torch.Tensor]]:
-        del n_sample, has_negative_prompt
+        # This switch belongs to causal action inference; video retains its rolling cache.
+        del n_sample, has_negative_prompt, causal_use_kv_cache
         target_frames = self._validate_causal_inference_request(
             data_batch=data_batch,
             sequence_plans=sequence_plans,

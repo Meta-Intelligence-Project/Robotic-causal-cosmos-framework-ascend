@@ -1075,6 +1075,13 @@ class Cosmos3VFMNetwork(PreTrainedModel):
             1 if replicated_attention_io_cp else (self.parallel_dims.cp_size if self.parallel_dims else 1)
         )
 
+        inference_attention_plan = getattr(packed_seq.teacher_forcing, "inference_attention_plan", None)
+        if inference_attention_plan is not None and (
+            inference_attention_plan.layout is not teacher_forcing_layout
+            or inference_attention_plan.max_kv_tokens != self.config.teacher_forcing_tnd_max_kv_tokens
+        ):
+            raise ValueError("Inference attention plan must be rebuilt after changing its layout or TND limit")
+
         input_pack, attention_meta, natten_metadata_list = build_packed_sequence(
             runtime_joint_attn_implementation,
             packed_sequence=packed_sequence,
@@ -1100,6 +1107,10 @@ class Cosmos3VFMNetwork(PreTrainedModel):
             teacher_forcing_layout=teacher_forcing_layout,
             teacher_forcing_dense_mode=self.config.teacher_forcing_dense_mode,
             teacher_forcing_tnd_max_kv_tokens=self.config.teacher_forcing_tnd_max_kv_tokens,
+            teacher_forcing_tnd_plan=None if inference_attention_plan is None else inference_attention_plan.full_plan,
+            teacher_forcing_target_only_plan=(
+                None if inference_attention_plan is None else inference_attention_plan.target_only
+            ),
         )
 
         if (

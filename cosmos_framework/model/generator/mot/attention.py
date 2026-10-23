@@ -106,6 +106,7 @@ class TeacherForcingAttentionInfo(SplitInfo):
         self.dense_gen_mask = dense_gen_mask
         self.sample_gen_masks = sample_gen_masks
         self.tnd_plan: TNDPlan | None = None
+        self.target_only_tnd_plan: tuple[torch.Tensor, TNDPlan] | None = None
 
 
 AttentionMaskType = SplitInfo
@@ -722,6 +723,8 @@ def build_packed_sequence(
     teacher_forcing_layout: TeacherForcingLayout | None = None,
     teacher_forcing_dense_mode: str = "global",
     teacher_forcing_tnd_max_kv_tokens: int = 131072,
+    teacher_forcing_tnd_plan: TNDPlan | None = None,
+    teacher_forcing_target_only_plan: tuple[torch.Tensor, TNDPlan] | None = None,
 ) -> tuple[SequencePack, AttentionMaskType, list | None]:
     """
     Build the model input pack and attention meta for joint attention.
@@ -775,11 +778,21 @@ def build_packed_sequence(
         )
         make_pack = sequence_pack_from_packed_sequence
         if teacher_forcing_dense_mode == "grouped_tnd":
-            attention_meta.tnd_plan = build_tnd_plan(
-                teacher_forcing_layout,
-                device=device,
-                max_kv_tokens=teacher_forcing_tnd_max_kv_tokens,
-            )
+            if teacher_forcing_tnd_plan is None:
+                attention_meta.tnd_plan = build_tnd_plan(
+                    teacher_forcing_layout,
+                    device=device,
+                    max_kv_tokens=teacher_forcing_tnd_max_kv_tokens,
+                )
+            else:
+                if (
+                    teacher_forcing_tnd_plan.num_queries != teacher_forcing_layout.gen_query_indexes.numel()
+                    or teacher_forcing_tnd_plan.num_keys != sum(sample_lens)
+                    or any(chunk.query_indexes.device != device for chunk in teacher_forcing_tnd_plan.chunks)
+                ):
+                    raise ValueError("Precomputed teacher-forcing TND plan does not match the packed sequence")
+                attention_meta.tnd_plan = teacher_forcing_tnd_plan
+            attention_meta.target_only_tnd_plan = teacher_forcing_target_only_plan
     elif teacher_forcing_layout is not None:
         raise ValueError(
             "teacher_forcing_layout requires joint_attn_implementation='teacher_forcing', "

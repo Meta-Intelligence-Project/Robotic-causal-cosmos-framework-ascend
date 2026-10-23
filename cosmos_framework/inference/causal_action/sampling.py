@@ -8,6 +8,9 @@ from cosmos_framework.data.generator.sequence_packing.causal_action import Causa
 from cosmos_framework.model.generator.diffusion.samplers.fixed_step import FixedStepSampler
 from cosmos_framework.model.generator.mot.causal_action_cache import action_attention_cache
 
+from .plan_cache import prepare_attention_plan
+from .prefix_cache import action_prefix_cache
+
 
 @torch.no_grad()
 def sample_prepared(
@@ -75,6 +78,14 @@ def sample_prepared(
         raise ValueError("Inference block size must match delta statistics and pre-packing geometry")
     options_batch = data_batch or {}
     preview = options_batch.get("causal_action_preview", False)
+    cache_mode = options_batch.get("causal_action_cache_mode", "full")
+    if cache_mode not in ("off", "plans", "full"):
+        raise ValueError("causal_action_cache_mode must be off, plans, or full")
+    # Preview generates multiple blocks, and custom samplers may enable input
+    # gradients. Keep those callers on the reference execution path.
+    full_cache = cache_mode == "full" and causal_use_kv_cache and not preview and sampler is None
+    target_net = net or model.net
+    full_cache = full_cache and not target_net.training
     current_block = int(options_batch.get("causal_action_current_block", 0))
     if not 0 <= current_block < len(metadata.states):
         raise ValueError("Requested block has no measured state")
@@ -99,13 +110,17 @@ def sample_prepared(
                 raise ValueError("History must be explicitly supplied as observed video")
         history_v.mul_(packed.vision.condition_mask[0].to(history_v.device))
         history_a.mul_(packed.action.condition_mask[0].to(history_a.device))
-        templates[name] = expand_action_sequence(
-            packed, [history_v.to(model.precision)], geometry
-        )
+        templates[name] = expand_action_sequence(packed, [history_v.to(model.precision)], geometry)
         templates[name].to_cuda()
+        # Plans encode grouped-TND visibility only. KV=False also permits the
+        # original dense backends, which must not inherit TND hardware limits.
+        if cache_mode != "off" and model.config.teacher_forcing_dense_mode == "grouped_tnd":
+            prepare_attention_plan(templates[name], max_kv_tokens=model.config.teacher_forcing_tnd_max_kv_tokens)
     af = metadata.action_frame_ids.to(state.device)
-    target_net = net or model.net
-    with action_attention_cache(target_net, causal_use_kv_cache) as cache:
+    cache_context = (
+        action_prefix_cache(target_net) if full_cache else action_attention_cache(target_net, causal_use_kv_cache)
+    )
+    with cache_context as cache:
         for b, start in enumerate(range(1, t, causal_block_size)):
             if not preview and b != current_block:
                 continue
@@ -168,8 +183,13 @@ def sample_prepared(
             if has_noisy_actions:
                 history_a[am[:, 0]] = state[nv:].reshape(ashape)[am[:, 0]]
     return {
-        "vision": [history_v if preview else history_v[:, :, : min(t, prediction_block_span(current_block, causal_block_size)[1])]],
+        "vision": [
+            history_v
+            if preview
+            else history_v[:, :, : min(t, prediction_block_span(current_block, causal_block_size)[1])]
+        ],
         "action": [history_a.masked_fill(~valid_action, 0)],
         "generated_action_mask": [generated_action_mask],
+        "inference_cache": {"requested_mode": cache_mode, "full_cache": full_cache, **cache.get("stats", {})},
         "preview_semantics": "真值 state 条件预览" if preview else "当前块生成，等待完整执行反馈",
     }

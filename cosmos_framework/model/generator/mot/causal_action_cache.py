@@ -78,7 +78,10 @@ def action_attention_cache(net, enabled):
                     packed_key_states_normalized=packed_key_states_normalized,
                 )
                 layout = attention_mask.layout
-                target, plan = target_only_plan(layout, attention_mask.tnd_plan)
+                cached_plan = getattr(attention_mask, "target_only_tnd_plan", None)
+                target, plan = (
+                    cached_plan if cached_plan is not None else target_only_plan(layout, attention_mask.tnd_plan)
+                )
                 fixed = torch.where(layout.stream_ids != 1)[0]
                 key = get_all_seq(
                     packed_key_states_normalized if packed_key_states_normalized is not None else packed_key_states

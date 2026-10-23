@@ -23,6 +23,12 @@ def aligned_action_schedule(schedule, packed):
 class OmniMoTCausalActionModel(OmniMoTModel):
     network_cls = CausalActionNetwork
 
+    def generate_samples_from_batch(self, data_batch, net=None, sampler=None, guidance=1.0, *args, **kwargs):
+        # num_steps follows five optional positional arguments after guidance.
+        if len(args) < 6:
+            kwargs.setdefault("num_steps", 10)
+        return super().generate_samples_from_batch(data_batch, net, sampler, guidance, *args, **kwargs)
+
     def __init__(self, config):
         # Reuse geometry/backend validation without relaxing the video model's contract.
         import copy

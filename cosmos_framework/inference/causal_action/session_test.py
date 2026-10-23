@@ -56,7 +56,11 @@ def test_session_absolute_field_and_history_reset():
         fresh.generate_current_block(**data)
 
 
-def test_model_session_decodes_with_current_template():
+@pytest.mark.parametrize(
+    ("sampling_options", "expected_guidance", "expected_steps"),
+    [({}, 1.0, 10), ({"guidance": 3.0, "num_steps": 5}, 3.0, 5)],
+)
+def test_model_session_decodes_with_current_template(sampling_options, expected_guidance, expected_steps):
     template, data = inputs()
     planner = SegmentPlanner(
         max_action_steps=32, overlap_action_steps=0, geometry=CausalBlockGeometry(temporal_compression_factor=4)
@@ -85,8 +89,10 @@ def test_model_session_decodes_with_current_template():
     class Model:
         def generate_samples_from_batch(self, batch, **kwargs):
             assert kwargs["causal_block_size"] == 2
+            assert kwargs["guidance"] == expected_guidance
+            assert kwargs["num_steps"] == expected_steps
             return dict(action=[sample["action"]])
 
-    session = CausalActionSession.for_model(Model(), batch_builder, template=template)
+    session = CausalActionSession.for_model(Model(), batch_builder, template=template, **sampling_options)
     decoded = session.generate_current_block(**data)
     torch.testing.assert_close(decoded, target, atol=1e-5, rtol=1e-5)

@@ -2605,6 +2605,7 @@ class OmniMoTModel(ImaginaireModel):
         causal_num_blocks: int | None,
         causal_block_size: int,
         causal_history_blocks: int,
+        causal_use_kv_cache: bool = True,
     ) -> dict[str, list[torch.Tensor]] | None:
         """Subclass hook for causal inference after ordinary input preparation."""
 
@@ -2642,6 +2643,7 @@ class OmniMoTModel(ImaginaireModel):
         causal_num_blocks: int | None = None,
         causal_block_size: int = 1,
         causal_history_blocks: int = 16,
+        causal_use_kv_cache: bool = True,
         **kwargs,
     ) -> dict[str, list[torch.Tensor]]:
         """
@@ -2676,6 +2678,8 @@ class OmniMoTModel(ImaginaireModel):
             sigma_max (float): Maximum sigma for the EDM sampler.
             skip_text_tokens_for_cfg (bool): If True, skip text tokens in unconditional branch.
             normalize_cfg (bool): If True, normalize the CFG output.
+            causal_use_kv_cache (bool): Enable fixed-history caching in causal
+                action inference. Other inference modes retain their own cache behavior.
             upsample_task (str | None): Canonical V4.2 task resolved by the
                 inference caller. ``None`` disables native prompt upsampling.
                 Otherwise, the conditional captions in
@@ -2811,6 +2815,7 @@ class OmniMoTModel(ImaginaireModel):
             causal_num_blocks=causal_num_blocks,
             causal_block_size=causal_block_size,
             causal_history_blocks=causal_history_blocks,
+            causal_use_kv_cache=causal_use_kv_cache,
         )
         if causal_result is not None:
             return causal_result

@@ -39,6 +39,9 @@ class CausalActionSession:
         """
         from cosmos_framework.inference.causal_action.outputs import real_actions
 
+        sampling_options.setdefault("guidance", 1.0)
+        sampling_options.setdefault("num_steps", 10)
+
         def planner(**inputs):
             batch = batch_builder(**inputs)
             metadata = batch["sequence_plan"][0].causal_action_metadata

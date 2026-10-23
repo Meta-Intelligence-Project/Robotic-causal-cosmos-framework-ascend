@@ -23,8 +23,8 @@ def main():
     p.add_argument("--index", type=int, default=0)
     p.add_argument("--resolution", default="480")
     p.add_argument("--output", required=True)
-    p.add_argument("--steps", type=int, default=20)
-    p.add_argument("--guidance", type=float, default=3.0)
+    p.add_argument("--steps", type=int, default=10)
+    p.add_argument("--guidance", type=float, default=1.0)
     p.add_argument("--actions-per-block", type=int, default=32)
     p.add_argument("--max-action-steps", type=int, default=96)
     p.add_argument("--overlap-action-steps", type=int, default=16)
@@ -32,6 +32,15 @@ def main():
     p.add_argument("--current-block", type=int, default=None)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--kv-cache", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument(
+        "--cache-mode",
+        choices=["off", "plans", "full"],
+        default="full",
+        help=(
+            "Request-local optimization: off=legacy reference, plans=exact cached indices, "
+            "full=compact prefix replay (default; BF16 outputs can differ; task quality is not validated)"
+        ),
+    )
     p.add_argument("--allow-mock-statistics", action="store_true")
     p.add_argument("--mock-state-stats-path", default="")
     p.add_argument("--mock-delta-stats-path", default="")
@@ -107,6 +116,7 @@ def main():
     dataset.set_mode(args.mode)
     batch = custom_collate_fn([dataset[args.index]])
     batch["causal_action_preview"] = args.preview_ground_truth_states
+    batch["causal_action_cache_mode"] = args.cache_mode
     batch["causal_action_current_block"] = args.current_block if args.current_block is not None else 0
     if not args.preview_ground_truth_states:
         plan = batch["sequence_plan"][0]
