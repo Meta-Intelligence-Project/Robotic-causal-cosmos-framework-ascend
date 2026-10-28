@@ -98,6 +98,43 @@ def test_pacing_keeps_model_and_wall_time_separate_and_server_progresses_without
     assert len(emitted) == 7 and result["continuous_rtc"]
 
 
+def test_slowdown_changes_only_future_intervals_and_preserves_the_servo_clock():
+    clock = FakeClock()
+    session = FakeSession(clock)
+    original = session.get_action
+
+    def adapt(**observation):
+        if session.tick == 1:
+            session.execution_hz = 1.0
+        return original(**observation)
+
+    session.get_action = adapt
+    result = replay(session, clock)
+    assert session.calls == [(0, 100.0), (1, 100.5), (2, 101.5)]
+    assert [row["execution_hz"] for row in result["action_trace"]] == [2, 1, 1]
+    assert result["initial_execution_hz"] == 2
+    assert result["execution_hz"] == 1
+    assert result["wall_seconds"] == 2.5
+    assert result["model_seconds"] == 0.1
+    assert [r["scheduled_seconds"] for r in result["servo_trace"]] == [i / 4 for i in range(11)]
+    assert result["servo_frames"][-1].item() == 2
+    assert all(row["lateness_seconds"] == 0 for row in result["action_trace"] + result["servo_trace"])
+
+
+def test_unexpected_speed_increase_is_rejected():
+    clock = FakeClock()
+    session = FakeSession(clock)
+    original = session.get_action
+
+    def accelerate(**observation):
+        session.execution_hz = 3.0
+        return original(**observation)
+
+    session.get_action = accelerate
+    with pytest.raises(RuntimeError, match="decreases only"):
+        replay(session, clock)
+
+
 def test_lateness_is_recorded_without_dropping_or_replaying_waypoints_or_servo_events():
     clock = FakeClock()
     session = FakeSession(clock)

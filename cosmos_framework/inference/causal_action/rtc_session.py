@@ -13,7 +13,7 @@ import math
 import warnings
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from numbers import Real
 from threading import RLock, get_ident
 from time import perf_counter
@@ -22,6 +22,7 @@ import torch
 
 from cosmos_framework.inference.causal_action.rtc import RTCPrefix
 from cosmos_framework.inference.causal_action.rtc_calibration import measure_rtc_latency
+from cosmos_framework.inference.causal_action.rtc_pacing import RTCExecutionPolicy
 
 
 class RTCError(RuntimeError):
@@ -61,6 +62,9 @@ class _Request:
     inputs: dict
     prefix: torch.Tensor
     action_mask: torch.Tensor
+    submitted_at: float
+    execution_hz: float
+    history_seconds: float
 
 
 def _positive_int(name, value):
@@ -124,6 +128,12 @@ class RTCSession:
     execution rate with synchronized wall time. This class neither sleeps nor
     drives hardware. RTC requires ``d <= s <= H-d``.
 
+    Optional ``execution_policy`` fits recent history/latency pairs on the CPU
+    to predict the next request's wall-time budget and only slow consumption.
+    Its callback must return True after the client accepts each new rate.
+    A rate never changes
+    while an RTC request is in flight; its committed prefix remains fixed.
+
     A result is published only when its actual delay does not exceed its reserved
     prefix. Prefix commands are restored exactly, and already consumed outputs
     are skipped using absolute ticks. When supplied, ``ordinary_planner`` permits
@@ -149,6 +159,8 @@ class RTCSession:
         calibration_warmups=1,
         calibration_samples=2,
         calibration_margin_steps=1,
+        execution_policy=None,
+        execution_rate_callback=None,
     ):
         if not callable(planner):
             raise ValueError("planner must be callable")
@@ -164,7 +176,7 @@ class RTCSession:
         self.initial_delay_steps = (
             None if initial_delay_steps is None else _positive_int("initial_delay_steps", initial_delay_steps)
         )
-        if self.initial_delay_steps is not None:
+        if self.initial_delay_steps is not None and execution_policy is None:
             self._check_geometry(self.initial_delay_steps, self.min_execution_steps)
         if ordinary_planner is not None and not callable(ordinary_planner):
             raise ValueError("ordinary_planner must be callable")
@@ -183,6 +195,21 @@ class RTCSession:
         # Model time remains fixed at controller_hz. Only the external client's
         # waypoint consumption rate changes the wall-clock latency budget.
         self.execution_hz = _frequency(self.controller_hz if execution_hz is None else execution_hz, "execution_hz")
+        if execution_policy is not None and not isinstance(execution_policy, RTCExecutionPolicy):
+            raise ValueError("execution_policy must be an RTCExecutionPolicy")
+        if execution_policy is not None and not callable(execution_rate_callback):
+            raise ValueError("Adaptive execution requires an execution_rate_callback that acknowledges client pacing")
+        if execution_rate_callback is not None and not callable(execution_rate_callback):
+            raise ValueError("execution_rate_callback must be callable or None")
+        self.execution_policy = execution_policy
+        if execution_policy is not None:
+            # An integer prefix length contains no wall-time observation for
+            # online fitting. Adaptive sessions always measure startup requests.
+            self._configured_delay_steps = self.initial_delay_steps = None
+        self._execution_rate_callback = execution_rate_callback
+        self._execution_advice = None
+        self._execution_rate_changes = 0
+        self._adaptive_delay_steps = None
         self.planner = planner
         self._ordinary_planner = ordinary_planner
         self._synchronize = synchronize
@@ -205,6 +232,8 @@ class RTCSession:
             [] if self.initial_delay_steps is None else [self.initial_delay_steps], maxlen=self.delay_history_size
         )
         self._history = deque(maxlen=self.history_steps)
+        self._delay_seconds = deque(maxlen=self.delay_history_size)
+        self._latency_samples = deque(maxlen=self.delay_history_size)
 
     def _validate_actions(self, actions):
         if (
@@ -221,6 +250,58 @@ class RTCSession:
     def _check_geometry(self, delay, execution_steps):
         if not delay <= execution_steps <= self.horizon - delay:
             raise ValueError(f"RTC requires d <= s <= H-d; got d={delay}, s={execution_steps}, H={self.horizon}")
+
+    def _history_seconds(self, tick):
+        blocks = min(tick // self.horizon, self.history_steps // self.horizon)
+        return blocks * self.horizon / self.controller_hz
+
+    def _update_execution_budget(self, *, history_tick, execution_steps):
+        """Apply an acknowledged slower rate before submitting a new request.
+
+        The caller holds the lock and there must be no request in flight. History
+        follows complete action blocks on the model time grid. Runtime seconds
+        remain valid when the waypoint rate changes; old tick delays do not.
+        """
+        if self.execution_policy is None or not self._rtc_enabled:
+            return
+        if self._pending is not None:
+            raise RTCError("Cannot change execution pacing while an RTC request is in flight")
+        advice = self.execution_policy.recommend(
+            self._history_seconds(history_tick),
+            horizon=self.horizon,
+            execution_steps=execution_steps,
+            current_hz=self.execution_hz,
+            samples=tuple(self._latency_samples),
+            observed_seconds=max(self._delay_seconds, default=0.0),
+        )
+        self._execution_advice = asdict(advice)
+        if not advice.feasible:
+            self._reject_execution_budget(f"Adaptive RTC execution budget is infeasible: {advice.reason}")
+            return
+        if advice.recommended_hz < self.execution_hz:
+            # A rate in server metadata cannot pace a robot. The client must
+            # commit its future waypoint schedule before this rate is installed.
+            try:
+                acknowledged = self._execution_rate_callback(advice.recommended_hz)
+            except Exception as exc:
+                self._reject_execution_budget(f"Client execution-rate acknowledgement failed: {exc}")
+                return
+            if acknowledged is not True:
+                self._reject_execution_budget(
+                    f"Client did not acknowledge the required slower waypoint rate {advice.recommended_hz:g} Hz"
+                )
+                return
+            self.execution_hz = advice.recommended_hz
+            self._execution_rate_changes += 1
+        self._adaptive_delay_steps = advice.delay_steps
+        self._delays.clear()
+        self._delays.append(advice.delay_steps)
+
+    def _reject_execution_budget(self, reason):
+        if self._ordinary_planner is None:
+            self._error = RTCDeadlineMiss(reason)
+            raise self._error
+        self._fallback(reason, replan=False)
 
     def _raise_state_error(self):
         if self._closed:
@@ -284,8 +365,9 @@ class RTCSession:
         """Measure full RTC requests before starting the external control clock.
 
         The first get_action also calls this lazily. Calibration outputs are
-        discarded and no command tick advances. Explicit integer delay budgets
-        retain the existing manual path without startup measurement.
+        discarded and no command tick advances. Fixed-rate sessions with an
+        explicit integer delay retain the manual path. Adaptive sessions always
+        measure startup, since an integer budget is not a latency observation.
         """
         with self._lock:
             self._raise_state_error()
@@ -313,10 +395,22 @@ class RTCSession:
                 if revision != self._revision:
                     raise RTCError("Episode changed during startup calibration")
                 self._calibration = calibration
+                if self.execution_policy is not None:
+                    for seconds in calibration["sample_seconds"]:
+                        self._delay_seconds.append(seconds)
+                        self._latency_samples.append((0.0, seconds))
+                    self._update_execution_budget(history_tick=0, execution_steps=self.min_execution_steps)
+                    if self._rtc_enabled:
+                        calibration.update(
+                            delay_steps=self._adaptive_delay_steps,
+                            execution_hz=self.execution_hz,
+                            playback_speed=self.execution_hz / self.controller_hz,
+                            adaptive_execution=dict(self._execution_advice),
+                        )
                 delay = calibration["delay_steps"]
                 self.initial_delay_steps = delay
                 self._delays.append(delay)
-                if not delay <= self.min_execution_steps <= self.horizon - delay:
+                if self._rtc_enabled and not delay <= self.min_execution_steps <= self.horizon - delay:
                     self._fallback(
                         f"Measured RTC latency {calibration['max_seconds']:.3f}s needs {delay} control steps "
                         f"including margin at {self.execution_hz:g} waypoints/s; "
@@ -369,10 +463,18 @@ class RTCSession:
                     self._error = RTCBufferUnderrun("RTC action buffer exhausted before a new plan was available")
                     raise self._error
                 self._fallback("RTC action buffer exhausted before the next plan was ready", replan=True)
+            if self._rtc_enabled and self._pending is None:
+                # Anticipate the next request's history before consuming more of
+                # the old plan. The submitted request then keeps its own prefix
+                # and rate until publication, even if history grows meanwhile.
+                self._update_execution_budget(
+                    history_tick=max(self._tick, self._chunk_start_tick + self.min_execution_steps),
+                    execution_steps=max(offset, self.min_execution_steps),
+                )
             if self._rtc_enabled:
                 state, sm, current_image, am = self._measurement(state, state_mask, image, action_mask)
                 if self._pending is None and offset >= self.min_execution_steps:
-                    delay = max(self._delays)
+                    delay = self._adaptive_delay_steps if self.execution_policy is not None else max(self._delays)
                     try:
                         self._check_geometry(delay, offset)
                     except ValueError as exc:
@@ -386,7 +488,16 @@ class RTCSession:
                             state, sm, current_image, am, RTCPrefix(prefix.clone(), delay, self.beta)
                         )
                         request = _Request(
-                            self._revision, self._tick, self._chunk_start_tick, delay, inputs, prefix, am.clone()
+                            self._revision,
+                            self._tick,
+                            self._chunk_start_tick,
+                            delay,
+                            inputs,
+                            prefix,
+                            am.clone(),
+                            perf_counter(),
+                            self.execution_hz,
+                            self._history_seconds(self._tick),
                         )
                         self._pending = request
                         self._future = self._executor.submit(self._run_request, request)
@@ -441,7 +552,7 @@ class RTCSession:
 
     def _run_request(self, request):
         self._worker_thread = get_ident()
-        started = perf_counter()
+        started = request.submitted_at
         try:
             inputs = dict(request.inputs)
             inputs["history"] = tuple(RTCObservation(x.tick, x.image.clone()) for x in inputs["history"])
@@ -459,16 +570,21 @@ class RTCSession:
                 if not self._rtc_enabled:
                     return
                 actual_delay = self._tick - request.tick
+                elapsed_seconds = perf_counter() - started
                 self._last_request = dict(
                     observation_tick=request.tick,
                     previous_chunk_start_tick=request.chunk_start_tick,
                     publish_tick=self._tick,
                     estimated_delay_steps=request.delay_steps,
                     actual_delay_steps=actual_delay,
-                    elapsed_seconds=perf_counter() - started,
+                    elapsed_seconds=elapsed_seconds,
+                    execution_hz=request.execution_hz,
+                    history_seconds=request.history_seconds,
                     accepted=False,
                 )
                 self._delays.append(actual_delay)
+                self._delay_seconds.append(elapsed_seconds)
+                self._latency_samples.append((request.history_seconds, elapsed_seconds))
                 if self._error is not None:
                     return
                 if actual_delay > request.delay_steps or actual_delay >= self.horizon:
@@ -513,6 +629,14 @@ class RTCSession:
                 "controller_hz": self.controller_hz,
                 "execution_hz": self.execution_hz,
                 "playback_speed": self.execution_hz / self.controller_hz,
+                "adaptive_execution": self.execution_policy is not None,
+                "execution_advice": None if self._execution_advice is None else dict(self._execution_advice),
+                "execution_rate_changes": self._execution_rate_changes,
+                "delay_history_seconds": list(self._delay_seconds),
+                "latency_samples": [
+                    {"history_seconds": history, "elapsed_seconds": seconds}
+                    for history, seconds in self._latency_samples
+                ],
                 "delay_history_steps": list(self._delays),
                 "estimated_delay_steps": max(self._delays) if self._delays else None,
                 "rtc_enabled": self._rtc_enabled,
@@ -582,9 +706,14 @@ class RTCSession:
                 self._rtc_enabled = True
                 self._ordinary_replan_needed = False
                 self._fallback_reason = self._calibration = None
+                self._execution_advice = None
+                self._execution_rate_changes = 0
+                self._adaptive_delay_steps = None
                 self._ordinary_requests = 0
                 self._history.clear()
                 self._delays.clear()
+                self._delay_seconds.clear()
+                self._latency_samples.clear()
                 if self.initial_delay_steps is not None:
                     self._delays.append(self.initial_delay_steps)
         finally:
@@ -626,6 +755,8 @@ class RTCSession:
         calibration_warmups=1,
         calibration_samples=2,
         calibration_margin_steps=1,
+        execution_policy=None,
+        execution_rate_callback=None,
         **sampling_options,
     ):
         """Adapt the model to RTC without using future states or old anchors.
@@ -643,6 +774,9 @@ class RTCSession:
         inference, with no RTC prefix in the model batch.
         ``execution_hz`` changes only latency budgeting; the external client must
         actually pace its waypoints at that rate. It does not change model FPS.
+        An optional ``execution_policy`` can reduce that rate as history grows,
+        provided ``execution_rate_callback`` acknowledges actual client pacing.
+        Fit history seconds use the model clock; measured delays use wall time.
         """
         from cosmos_framework.data.generator.action.block_state import prediction_block_ids
         from cosmos_framework.inference.causal_action.outputs import real_actions
@@ -731,4 +865,6 @@ class RTCSession:
             calibration_warmups=calibration_warmups,
             calibration_samples=calibration_samples,
             calibration_margin_steps=calibration_margin_steps,
+            execution_policy=execution_policy,
+            execution_rate_callback=execution_rate_callback,
         )

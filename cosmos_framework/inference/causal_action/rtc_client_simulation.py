@@ -99,6 +99,8 @@ def replay_rtc_client(
     rejection; such a run raises instead of returning a continuous-RTC result.
     ``continuous_rtc`` means that RTC remained active throughout this replay;
     the timing traces must still be checked for scheduling gaps and lateness.
+    A session may acknowledge a slower execution rate before returning a command.
+    That rate controls the upcoming interval; elapsed intervals are never retimed.
     """
     if isinstance(action_steps, bool) or not isinstance(action_steps, int) or action_steps < 1:
         raise ValueError("action_steps must be a positive integer")
@@ -110,6 +112,7 @@ def replay_rtc_client(
             raise ValueError(f"{name} must be callable")
     controller_hz = _frequency(session.controller_hz, "controller_hz")
     execution_hz = _frequency(getattr(session, "execution_hz", controller_hz), "execution_hz")
+    initial_execution_hz = execution_hz
     servo_hz = _frequency(servo_hz, "servo_hz")
     if servo_hz < execution_hz:
         raise ValueError("servo_hz must be at least execution_hz to represent every waypoint interval")
@@ -129,7 +132,7 @@ def replay_rtc_client(
 
     started = read_clock()
     commands, frames, action_trace, servo_trace = [], [], [], []
-    period = 1 / execution_hz
+    offset = 0.0
     servo_index = 0
     previous = target = None
 
@@ -175,7 +178,6 @@ def replay_rtc_client(
 
     for step in range(action_steps):
         tick = first_tick + step
-        offset = step * period
         wait_until(offset)
         observation = observation_at(tick)
         before = _active_status(session)
@@ -187,6 +189,11 @@ def replay_rtc_client(
         after = _active_status(session)
         if after["tick"] != tick + 1:
             raise RuntimeError("One client command must advance exactly one RTC action tick")
+        next_hz = _frequency(getattr(session, "execution_hz", execution_hz), "execution_hz")
+        if next_hz > execution_hz:
+            raise RuntimeError("The paced client permits execution-rate decreases only")
+        execution_hz = next_hz
+        period = 1 / execution_hz
         if (
             not isinstance(command, torch.Tensor)
             or command.device.type != "cpu"
@@ -202,6 +209,7 @@ def replay_rtc_client(
         action_trace.append(
             dict(
                 tick=tick,
+                execution_hz=execution_hz,
                 scheduled_seconds=offset,
                 started_seconds=call_started - started,
                 completed_seconds=call_completed - started,
@@ -214,18 +222,20 @@ def replay_rtc_client(
                 last_request_after=after.get("last_request"),
             )
         )
-        interval_end = (step + 1) * period
+        interval_end = offset + period
         while servo_index / servo_hz < interval_end - 1e-12:
             servo_offset = servo_index / servo_hz
             alpha = min(1.0, max(0.0, (servo_offset - offset) / period))
             emit_frame(tick, servo_offset, alpha)
+        offset = interval_end
 
     # Include the last target itself, even if the endpoint lies off the servo grid.
-    emit_frame(first_tick + action_steps - 1, action_steps * period, 1.0)
+    emit_frame(first_tick + action_steps - 1, offset, 1.0)
     ended = read_clock()
     return dict(
         controller_hz=controller_hz,
         execution_hz=execution_hz,
+        initial_execution_hz=initial_execution_hz,
         servo_hz=servo_hz,
         speed_ratio=execution_hz / controller_hz,
         first_tick=first_tick,
