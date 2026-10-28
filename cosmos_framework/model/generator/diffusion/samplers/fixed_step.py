@@ -104,6 +104,9 @@ class FixedStepSampler:
             zip(t_list[:-1], t_list[1:]),
         ):
             timestep = torch.tensor(sigma_cur * self.num_train_timesteps, device=device)
+            set_sigma = getattr(velocity_fn, "set_integration_sigma", None)
+            if set_sigma is not None:
+                set_sigma(sigma_cur)
             v_pred = velocity_fn(latent, timestep.reshape(1, 1))
 
             def _sde_step(

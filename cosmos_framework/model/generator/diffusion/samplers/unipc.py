@@ -6,10 +6,10 @@ from typing import Callable, Optional
 import attrs
 import torch
 
-from cosmos_framework.utils.config import make_freezable
-from cosmos_framework.utils.progress_bar import progress_bar
 from cosmos_framework.model.generator.diffusion.samplers.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from cosmos_framework.model.generator.diffusion.samplers.utils import run_multiseed
+from cosmos_framework.utils.config import make_freezable
+from cosmos_framework.utils.progress_bar import progress_bar
 
 
 @make_freezable
@@ -80,7 +80,13 @@ class UniPCSampler(torch.nn.Module):
         timesteps = sample_scheduler[0].timesteps if isinstance(sample_scheduler, list) else sample_scheduler.timesteps
         latent = noise
 
-        for timestep in progress_bar(timesteps, desc="Sampling", total=len(timesteps)):
+        for step_index, timestep in enumerate(progress_bar(timesteps, desc="Sampling", total=len(timesteps))):
+            # RTC clean estimates need the actual integration sigma, not the
+            # scheduler's quantized integer network timestep.
+            set_sigma = getattr(velocity_fn, "set_integration_sigma", None)
+            if set_sigma is not None:
+                scheduler = sample_scheduler[0] if isinstance(sample_scheduler, list) else sample_scheduler
+                set_sigma(scheduler.sigmas[step_index])
             velocity_pred = velocity_fn(latent, timestep.reshape(1, 1))
 
             def _scheduler_step(

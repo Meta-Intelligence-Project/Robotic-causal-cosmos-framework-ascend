@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 
 
-def main():
+def _parse_args(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--sources-file", required=True)
@@ -48,8 +48,40 @@ def main():
         "--preview-ground-truth-states", action="store_true", help="Explicit offline truth-state conditioned preview"
     )
     p.add_argument("--decode-video", action="store_true")
+    p.add_argument(
+        "--enable_rtc",
+        "--enable-rtc",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable RTC prefix guidance (default: off without a prefix). Requires --rtc-prefix and "
+            "--rtc-delay-steps; full cache mode uses gradient-compatible prefix caching. "
+            "Legacy prefix-only invocations remain supported."
+        ),
+    )
+    p.add_argument(
+        "--rtc-prefix", type=Path, help="JSON or tensor .pt: remaining absolute actions aligned to this observation"
+    )
+    p.add_argument("--rtc-delay-steps", type=int, help="Number of already committed actions in the RTC prefix")
+    p.add_argument("--rtc-beta", type=float, default=5.0, help="RTC VJP guidance gain cap")
     p.add_argument("--override", action="append", default=[])
-    args = p.parse_args()
+    args = p.parse_args(argv)
+    if (args.rtc_prefix is None) != (args.rtc_delay_steps is None):
+        p.error("--rtc-prefix and --rtc-delay-steps must be supplied together")
+    if args.enable_rtc is False and args.rtc_prefix is not None:
+        p.error("RTC is explicitly disabled; remove the prefix arguments or use --enable_rtc")
+    if args.enable_rtc is True and args.rtc_prefix is None:
+        p.error("--enable_rtc requires --rtc-prefix and --rtc-delay-steps")
+    if args.enable_rtc is None:
+        # Supplying the existing prefix pair remains an explicit RTC opt-in.
+        args.enable_rtc = args.rtc_prefix is not None
+    if args.enable_rtc and (args.mode != "policy" or args.preview_ground_truth_states):
+        p.error("RTC requires policy mode without truth-state preview")
+    return args
+
+
+def main():
+    args = _parse_args()
     os.environ.setdefault("COSMOS_DEVICE", "npu")
     os.environ["WAN_VAE_PATH"] = args.vae
     import torch
@@ -61,6 +93,7 @@ def main():
     )
     from cosmos_framework.data.generator.joint_dataloader import custom_collate_fn
     from cosmos_framework.inference.causal_action.outputs import real_actions
+    from cosmos_framework.inference.causal_action.rtc import RTCPrefix
     from cosmos_framework.utils import distributed
     from cosmos_framework.utils.generator.model_loader import load_model_from_checkpoint
 
@@ -93,7 +126,7 @@ def main():
         keys_to_skip_loading=["net_ema."],
         seed=args.seed,
     )
-    model.net.eval()
+    model.net.eval().requires_grad_(False)
     mixture = get_causal_action_dataset(
         sources_file=args.sources_file,
         template=args.template,
@@ -118,6 +151,19 @@ def main():
     batch["causal_action_preview"] = args.preview_ground_truth_states
     batch["causal_action_cache_mode"] = args.cache_mode
     batch["causal_action_current_block"] = args.current_block if args.current_block is not None else 0
+    if args.enable_rtc:
+        previous = (
+            json.loads(args.rtc_prefix.read_text())
+            if args.rtc_prefix.suffix.lower() == ".json"
+            else torch.load(args.rtc_prefix, map_location="cpu", weights_only=True)
+        )
+        if isinstance(previous, dict):
+            previous = previous["previous_actions"]
+        batch["causal_action_rtc"] = RTCPrefix(
+            previous_actions=torch.as_tensor(previous, dtype=torch.float32),
+            delay_steps=args.rtc_delay_steps,
+            beta=args.rtc_beta,
+        )
     if not args.preview_ground_truth_states:
         plan = batch["sequence_plan"][0]
         # Offline input supplies real observations before the requested block.
@@ -143,7 +189,13 @@ def main():
         )
         actions = real_actions(result, batch)
         torch.save(
-            dict(vision_latents=[v.cpu() for v in result["vision"]], action=[a.cpu() for a in actions]),
+            dict(
+                vision_latents=[v.cpu() for v in result["vision"]],
+                action=[a.cpu() for a in actions],
+                rtc_enabled=bool((result.get("rtc") or {}).get("enabled", False)),
+                rtc=result.get("rtc"),
+                inference_cache=result.get("inference_cache"),
+            ),
             outdir / "sample.pt",
         )
         if args.decode_video:
@@ -158,7 +210,15 @@ def main():
         peak_gib=torch.cuda.max_memory_allocated() / 2**30,
         mode=args.mode,
         semantics=result["preview_semantics"],
-        kv_cache=args.kv_cache,
+        kv_cache=args.kv_cache
+        and (
+            batch.get("causal_action_rtc") is None
+            or result.get("inference_cache", {}).get("gradient_safe_prefix", False)
+        ),
+        kv_cache_requested=args.kv_cache,
+        inference_cache=result.get("inference_cache"),
+        rtc_enabled=bool((result.get("rtc") or {}).get("enabled", False)),
+        rtc=result.get("rtc"),
         action_shape=list(actions[0].shape),
     )
     (outdir / "metrics.json").write_text(json.dumps(metrics, indent=2))

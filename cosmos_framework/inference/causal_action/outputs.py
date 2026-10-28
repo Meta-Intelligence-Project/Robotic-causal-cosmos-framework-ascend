@@ -14,15 +14,23 @@ def real_actions(result, batch):
         keep = mask.any(-1)
         if "generated_action_mask" in result:
             keep &= result["generated_action_mask"][i].to(keep.device)
+        selected_mask = mask[keep]
+        if len(selected_mask) and not (selected_mask == selected_mask[0]).all():
+            raise ValueError("Generated physical actions must share one valid channel mask")
         blocks = prediction_block_ids(metadata.action_frame_ids.to(action.device)[keep], metadata.block_size)
         delta = metadata.statistics.action.denormalize(action[keep], mask[keep])
-        outputs.append(
-            metadata.template.decode_action_delta(
-                delta,
-                metadata.anchors.to(action.device)[blocks],
-                mask[0],
-            )
+        physical = metadata.template.decode_action_delta(
+            delta,
+            metadata.anchors.to(action.device)[blocks],
+            selected_mask[0] if len(selected_mask) else mask[0],
         )
+        if "rtc_committed_actions" in result:
+            committed = result["rtc_committed_actions"][i].to(physical)
+            if committed.ndim != 2 or committed.shape[1] != physical.shape[1] or len(committed) > len(physical):
+                raise ValueError("RTC committed prefix must align with generated physical actions")
+            physical = physical.clone()
+            physical[: len(committed)] = committed
+        outputs.append(physical)
     return outputs
 
 

@@ -10,6 +10,8 @@ from cosmos_framework.model.generator.mot.causal_action_cache import action_atte
 
 from .plan_cache import prepare_attention_plan
 from .prefix_cache import action_prefix_cache
+from .rtc import RTCPrefix, guided_velocity, prepare_prefix
+from .rtc_prefix_cache import action_rtc_prefix_cache
 
 
 @torch.no_grad()
@@ -46,8 +48,6 @@ def sample_prepared(
         raise ValueError("Causal action inference currently requires batch size 1")
     if velocity_postprocess_builder is not None:
         raise ValueError("Causal action v1 does not support velocity postprocessing")
-    if model.config.teacher_forcing_dense_mode != "grouped_tnd" and causal_use_kv_cache:
-        raise ValueError("Action KV cache requires grouped_tnd")
     if causal_block_size < 1 or causal_history_blocks < 1:
         raise ValueError("Block/history must be positive")
     data = gen_data_clean
@@ -78,17 +78,74 @@ def sample_prepared(
         raise ValueError("Inference block size must match delta statistics and pre-packing geometry")
     options_batch = data_batch or {}
     preview = options_batch.get("causal_action_preview", False)
+    rtc_prefix = options_batch.get("causal_action_rtc")
+    if rtc_prefix is not None and not isinstance(rtc_prefix, RTCPrefix):
+        raise TypeError("causal_action_rtc must be an RTCPrefix with absolute physical action targets")
+    if rtc_prefix is not None and (preview or not has_noisy_actions):
+        raise ValueError("RTC requires current-block action prediction, not preview or forward dynamics")
+    if rtc_prefix is not None and torch.is_inference_mode_enabled():
+        raise RuntimeError("RTC input VJP requires no_grad, not torch.inference_mode")
     cache_mode = options_batch.get("causal_action_cache_mode", "full")
     if cache_mode not in ("off", "plans", "full"):
         raise ValueError("causal_action_cache_mode must be off, plans, or full")
     # Preview generates multiple blocks, and custom samplers may enable input
     # gradients. Keep those callers on the reference execution path.
-    full_cache = cache_mode == "full" and causal_use_kv_cache and not preview and sampler is None
+    value_cache = causal_use_kv_cache and rtc_prefix is None
+    if model.config.teacher_forcing_dense_mode != "grouped_tnd" and value_cache:
+        raise ValueError("Action KV cache requires grouped_tnd")
+    full_cache = cache_mode == "full" and value_cache and not preview and sampler is None
     target_net = net or model.net
     full_cache = full_cache and not target_net.training
+    rtc_full_cache = False
+    rtc_cache_fallback = None
+    if rtc_prefix is not None and cache_mode == "full" and causal_use_kv_cache:
+        language = getattr(getattr(target_net, "language_model", None), "model", None)
+        if model.config.teacher_forcing_dense_mode != "grouped_tnd":
+            rtc_cache_fallback = "gradient_prefix_cache_requires_grouped_tnd"
+        elif any(parameter.requires_grad for parameter in target_net.parameters()):
+            # Keep existing eval callers valid. Explicitly freezing inference
+            # weights opts them into input-only gradient prefix caching.
+            rtc_cache_fallback = "gradient_prefix_cache_requires_frozen_weights"
+        elif language is None:
+            rtc_cache_fallback = "gradient_prefix_cache_requires_causal_language_model"
+        elif getattr(getattr(language, "rotary_emb", None), "rope_type", "default") != "default":
+            rtc_cache_fallback = "gradient_prefix_cache_requires_fixed_rope"
+        elif getattr(getattr(language, "config", None), "num_experts", 0):
+            rtc_cache_fallback = "gradient_prefix_cache_requires_dense_model"
+        else:
+            rtc_full_cache = not target_net.training
     current_block = int(options_batch.get("causal_action_current_block", 0))
     if not 0 <= current_block < len(metadata.states):
         raise ValueError("Requested block has no measured state")
+    rtc = None if rtc_prefix is None else prepare_prefix(rtc_prefix, metadata, current_block, device=state.device)
+    if rtc is not None and target_net.training:
+        raise ValueError("RTC requires an eval-mode network")
+    rtc_info = None
+    if rtc is not None:
+        scale = getattr(getattr(selected, "cfg", None), "num_train_timesteps", None)
+        if scale is None:
+            scale = getattr(selected, "num_train_timesteps", 1000.0)
+        timestep_scale = float(scale)
+        if not 0 < timestep_scale < float("inf"):
+            raise ValueError("RTC sampler timestep scale must be finite and positive")
+        rtc_target = torch.zeros_like(state)
+        rtc_weights = torch.zeros_like(state)
+        rtc_target[nv:].reshape(ashape)[rtc.action_indexes] = rtc.normalized_targets
+        rtc_weights[nv:].reshape(ashape)[rtc.action_indexes] = rtc.weights
+        rtc_has_guidance = rtc.beta > 0 and bool(rtc_weights.any())
+        rtc_info = {
+            "enabled": True,
+            "delay_steps": rtc.delay_steps,
+            "overlap_steps": len(rtc.absolute_prefix),
+            "beta": rtc.beta,
+            "vjp_calls": 0,
+            "timestep_scale": timestep_scale,
+            "value_cache_disabled_for_input_vjp": not rtc_full_cache,
+            "legacy_value_cache_disabled_for_input_vjp": True,
+            "gradient_safe_prefix": rtc_full_cache,
+            "cache_fallback_reason": rtc_cache_fallback,
+            "solver": type(selected).__name__,
+        }
     geometry = CausalActionGeometry((causal_block_size,), (causal_history_blocks,))
     valid_action = metadata.action_mask.to(state.device)
     if has_noisy_actions:
@@ -110,6 +167,8 @@ def sample_prepared(
                 raise ValueError("History must be explicitly supplied as observed video")
         history_v.mul_(packed.vision.condition_mask[0].to(history_v.device))
         history_a.mul_(packed.action.condition_mask[0].to(history_a.device))
+        if rtc is not None and packed.action.condition_mask[0][rtc.action_indexes].any():
+            raise ValueError("RTC action targets must be predicted, not supplied as clean conditions")
         templates[name] = expand_action_sequence(packed, [history_v.to(model.precision)], geometry)
         templates[name].to_cuda()
         # Plans encode grouped-TND visibility only. KV=False also permits the
@@ -118,7 +177,11 @@ def sample_prepared(
             prepare_attention_plan(templates[name], max_kv_tokens=model.config.teacher_forcing_tnd_max_kv_tokens)
     af = metadata.action_frame_ids.to(state.device)
     cache_context = (
-        action_prefix_cache(target_net) if full_cache else action_attention_cache(target_net, causal_use_kv_cache)
+        action_rtc_prefix_cache(target_net)
+        if rtc_full_cache
+        else action_prefix_cache(target_net)
+        if full_cache
+        else action_attention_cache(target_net, value_cache)
     )
     with cache_context as cache:
         for b, start in enumerate(range(1, t, causal_block_size)):
@@ -144,8 +207,13 @@ def sample_prepared(
                     ((preview_history_vision or data.x0_tokens_vision)[0] if preview else history_v).to(model.precision)
                 ]
             frozen = state.clone()
+            integration_sigma = None
 
-            def velocity_fn(noise_x, timestep):
+            def set_integration_sigma(sigma):
+                nonlocal integration_sigma
+                integration_sigma = float(sigma)
+
+            def base_velocity_fn(noise_x, timestep):
                 x = torch.where(active, noise_x[0], frozen)
                 vision = x[:nv].reshape(vshape)
                 action = x[nv:].reshape(ashape) if has_noisy_actions else data.x0_tokens_action[0]
@@ -174,6 +242,28 @@ def sample_prepared(
                     guided *= (torch.norm(c) / (torch.norm(guided) + 1e-8)).clamp(0, 1)
                 return [guided]
 
+            def velocity_fn(noise_x, timestep):
+                nonlocal integration_sigma
+                if rtc is None or not rtc_has_guidance:
+                    return base_velocity_fn(noise_x, timestep)
+                if integration_sigma is None:
+                    raise ValueError("An RTC sampler must call velocity_fn.set_integration_sigma(sigma) each step")
+                sigma, integration_sigma = integration_sigma, None
+                velocity = guided_velocity(
+                    noise_x[0],
+                    lambda value: base_velocity_fn([value], timestep)[0],
+                    sigma=sigma,
+                    target_flat=rtc_target,
+                    weights_flat=rtc_weights,
+                    beta=rtc.beta,
+                )
+                if sigma > 0:
+                    rtc_info["vjp_calls"] += 1
+                return [velocity * active]
+
+            if rtc is not None:
+                velocity_fn.set_integration_sigma = set_integration_sigma
+
             options = dict(num_steps=num_steps, shift=shift, seed=[None])
             if isinstance(selected, FixedStepSampler):
                 options.update(condition_reference=[frozen], condition_mask=[(~active).float()])
@@ -182,6 +272,10 @@ def sample_prepared(
             history_v[:, :, start:end] = state[:nv].reshape(vshape)[:, :, start:end]
             if has_noisy_actions:
                 history_a[am[:, 0]] = state[nv:].reshape(ashape)[am[:, 0]]
+                if rtc is not None and rtc.delay_steps:
+                    # These commands are already committed to execution. Preserve
+                    # normalized model output, then restore physical values on export.
+                    history_a[rtc.action_indexes[: rtc.delay_steps]] = rtc.normalized_targets[: rtc.delay_steps]
     return {
         "vision": [
             history_v
@@ -190,6 +284,22 @@ def sample_prepared(
         ],
         "action": [history_a.masked_fill(~valid_action, 0)],
         "generated_action_mask": [generated_action_mask],
-        "inference_cache": {"requested_mode": cache_mode, "full_cache": full_cache, **cache.get("stats", {})},
-        "preview_semantics": "真值 state 条件预览" if preview else "当前块生成，等待完整执行反馈",
+        "inference_cache": {
+            "requested_mode": cache_mode,
+            "full_cache": full_cache or rtc_full_cache,
+            **cache.get("stats", {}),
+            **({"gradient_safe_prefix": rtc_full_cache} if rtc is not None else {}),
+        },
+        **(
+            {"rtc": rtc_info, "rtc_committed_actions": [rtc.absolute_prefix[: rtc.delay_steps].detach().clone()]}
+            if rtc is not None
+            else {}
+        ),
+        "preview_semantics": (
+            "真值 state 条件预览"
+            if preview
+            else "RTC当前块生成，已保留提交前缀"
+            if rtc is not None
+            else "当前块生成，等待完整执行反馈"
+        ),
     }
