@@ -159,6 +159,11 @@ This command validates one guided prediction; it does not run a robot controller
 
 ## Asynchronous execution adapter
 
+For the WebSocket model server and a RoboTwin client that runs this session on
+the controller side, see [causal_action_server.md](causal_action_server.md).
+The RPC path shares the same model planner and measures request latency on the
+client, including transport.
+
 The execution process owns the clock and hardware. `RTCSession` neither sleeps
 to simulate control periods nor sends commands to a robot. It returns one CPU
 absolute action for each call to `get_action`. Startup calibration and ordinary

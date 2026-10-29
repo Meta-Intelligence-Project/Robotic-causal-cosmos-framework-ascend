@@ -112,6 +112,75 @@ def _validate_batch_frequency(batch, batch_builder, metadata, controller_hz):
             raise ValueError("conditioning_fps times video_stride must match conditioning_fps_action")
 
 
+def make_model_planner(
+    model, batch_builder, *, template, horizon, controller_hz=30.0, history_blocks=8, **sampling_options
+):
+    """Share the validated ordinary/RTC model path between local and RPC planners."""
+    from cosmos_framework.data.generator.action.block_state import prediction_block_ids
+    from cosmos_framework.inference.causal_action.outputs import real_actions
+
+    history_blocks = _positive_int("history_blocks", history_blocks)
+    controller_hz = _frequency(controller_hz, "controller_hz")
+    builder_hz = getattr(batch_builder, "controller_hz", None)
+    if builder_hz is not None and not math.isclose(
+        _frequency(builder_hz, "batch_builder.controller_hz"), controller_hz, rel_tol=1e-6, abs_tol=1e-6
+    ):
+        raise ValueError("batch_builder.controller_hz must match RTC controller_hz")
+    sampling_options = dict(sampling_options)
+    sampling_options.setdefault("guidance", 1.0)
+    sampling_options.setdefault("num_steps", 10)
+    if any(k in sampling_options for k in ("causal_block_size", "causal_history_blocks")):
+        raise ValueError("RTC geometry is supplied by the batch metadata and history_blocks")
+
+    def planner(**inputs):
+        kwargs = getattr(model, "tensor_kwargs", {})
+        device = torch.device(kwargs["device"]) if "device" in kwargs else torch.device("cpu")
+        if device.type in ("cuda", "npu"):
+            getattr(torch, device.type).set_device(device)
+        batch = batch_builder(**inputs)
+        metadata = batch["sequence_plan"][0].causal_action_metadata
+        _validate_batch_frequency(batch, batch_builder, metadata, controller_hz)
+        current = int(batch.get("causal_action_current_block", len(metadata.states) - 1))
+        if not 0 <= current < len(metadata.states):
+            raise ValueError("Requested RTC block has no measured state")
+        if metadata.template is None or metadata.template.template_id != template.template_id:
+            raise ValueError("RTC batch must preserve the action template")
+        # Templates normalize quaternions at both the controller and batch
+        # boundary. Tolerate only FP32 normalization roundoff, not an old
+        # block's measured state or a predicted anchor.
+        if not torch.allclose(
+            metadata.anchors[current].detach().cpu().double(),
+            inputs["state"].double(),
+            atol=1e-6,
+            rtol=0,
+        ):
+            raise ValueError("RTC batch must preserve the fresh measured state as current anchor")
+        if not torch.equal(metadata.state_mask[current].cpu(), inputs["state_mask"]):
+            raise ValueError("RTC batch must preserve measured state validity")
+        indexes = prediction_block_ids(metadata.action_frame_ids, metadata.block_size) == current
+        if int(indexes.sum()) != horizon:
+            raise ValueError("RTC batch must preserve the action prediction horizon")
+        if not torch.equal(metadata.action_mask[indexes].cpu(), inputs["action_mask"].expand(horizon, -1)):
+            raise ValueError("RTC batch must preserve action validity")
+        batch["causal_action_current_block"] = current
+        batch["causal_action_preview"] = False
+        if inputs["rtc"] is None:
+            # A custom builder may reuse a dictionary. Ordinary fallback
+            # must not inherit an old prefix or trigger committed export.
+            batch.pop("causal_action_rtc", None)
+        else:
+            batch["causal_action_rtc"] = inputs["rtc"]
+        generated = model.generate_samples_from_batch(
+            batch,
+            causal_block_size=metadata.block_size,
+            causal_history_blocks=history_blocks,
+            **sampling_options,
+        )
+        return real_actions(generated, batch)[0].detach().float().cpu()
+
+    return planner
+
+
 class RTCSession:
     """Execute an absolute action buffer while asynchronously replanning.
 
@@ -778,68 +847,18 @@ class RTCSession:
         provided ``execution_rate_callback`` acknowledges actual client pacing.
         Fit history seconds use the model clock; measured delays use wall time.
         """
-        from cosmos_framework.data.generator.action.block_state import prediction_block_ids
-        from cosmos_framework.inference.causal_action.outputs import real_actions
-
         history_blocks = _positive_int("history_blocks", history_blocks)
         controller_hz = _frequency(controller_hz, "controller_hz")
-        builder_hz = getattr(batch_builder, "controller_hz", None)
-        if builder_hz is not None and not math.isclose(
-            _frequency(builder_hz, "batch_builder.controller_hz"), controller_hz, rel_tol=1e-6, abs_tol=1e-6
-        ):
-            raise ValueError("batch_builder.controller_hz must match RTC controller_hz")
-        sampling_options = dict(sampling_options)
-        sampling_options.setdefault("guidance", 1.0)
-        sampling_options.setdefault("num_steps", 10)
-        if any(k in sampling_options for k in ("causal_block_size", "causal_history_blocks")):
-            raise ValueError("RTC geometry is supplied by the batch metadata and history_blocks")
         horizon = len(initial_actions)
-
-        def planner(**inputs):
-            kwargs = getattr(model, "tensor_kwargs", {})
-            device = torch.device(kwargs["device"]) if "device" in kwargs else torch.device("cpu")
-            if device.type in ("cuda", "npu"):
-                getattr(torch, device.type).set_device(device)
-            batch = batch_builder(**inputs)
-            metadata = batch["sequence_plan"][0].causal_action_metadata
-            _validate_batch_frequency(batch, batch_builder, metadata, controller_hz)
-            current = int(batch.get("causal_action_current_block", len(metadata.states) - 1))
-            if not 0 <= current < len(metadata.states):
-                raise ValueError("Requested RTC block has no measured state")
-            if metadata.template is None or metadata.template.template_id != template.template_id:
-                raise ValueError("RTC batch must preserve the action template")
-            # Templates normalize quaternions at both the controller and batch
-            # boundary. Tolerate only FP32 normalization roundoff, not an old
-            # block's measured state or a predicted anchor.
-            if not torch.allclose(
-                metadata.anchors[current].detach().cpu().double(),
-                inputs["state"].double(),
-                atol=1e-6,
-                rtol=0,
-            ):
-                raise ValueError("RTC batch must preserve the fresh measured state as current anchor")
-            if not torch.equal(metadata.state_mask[current].cpu(), inputs["state_mask"]):
-                raise ValueError("RTC batch must preserve measured state validity")
-            indexes = prediction_block_ids(metadata.action_frame_ids, metadata.block_size) == current
-            if int(indexes.sum()) != horizon:
-                raise ValueError("RTC batch must preserve the action prediction horizon")
-            if not torch.equal(metadata.action_mask[indexes].cpu(), inputs["action_mask"].expand(horizon, -1)):
-                raise ValueError("RTC batch must preserve action validity")
-            batch["causal_action_current_block"] = current
-            batch["causal_action_preview"] = False
-            if inputs["rtc"] is None:
-                # A custom builder may reuse a dictionary. Ordinary fallback
-                # must not inherit an old prefix or trigger committed export.
-                batch.pop("causal_action_rtc", None)
-            else:
-                batch["causal_action_rtc"] = inputs["rtc"]
-            generated = model.generate_samples_from_batch(
-                batch,
-                causal_block_size=metadata.block_size,
-                causal_history_blocks=history_blocks,
-                **sampling_options,
-            )
-            return real_actions(generated, batch)[0].detach().float().cpu()
+        planner = make_model_planner(
+            model,
+            batch_builder,
+            template=template,
+            horizon=horizon,
+            controller_hz=controller_hz,
+            history_blocks=history_blocks,
+            **sampling_options,
+        )
 
         def synchronize():
             kwargs = getattr(model, "tensor_kwargs", {})
