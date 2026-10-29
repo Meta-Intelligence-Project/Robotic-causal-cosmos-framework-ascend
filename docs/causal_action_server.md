@@ -103,14 +103,23 @@ python examples/action_pretrain/robotwin_client.py \
   --server-uri ws://SERVER_IP:8000 \
   --task-name adjust_bottle --task-config demo_clean \
   --control-mode joint --state-source measured \
-  --enable_rtc --execution-hz 30 --servo-hz 30 \
+  --enable_rtc --initial-execution-hz 30 --servo-hz 30 \
   --max-waypoints 48 \
   --output outputs/causal_action/robotwin_sim
 ```
 
-`--execution-hz` is the requested initial rate of consuming model waypoints.
-Startup calibration can reduce it, and the online fit can reduce it further as
-history grows. `--servo-hz` is separate: the adapter interpolates targets and
+`--initial-execution-hz` sets the requested starting rate of consuming model
+waypoints; it defaults to the server's model rate when omitted. With adaptive RTC,
+startup calibration can reduce it before motion starts, and the online fit can
+reduce it further as history grows. The runtime `execution_hz` status field
+reports the current execution rate. Without adaptive RTC, the requested rate
+stays fixed. `--execution-hz` remains a compatibility alias.
+
+In `metrics.json`, `requested_execution_hz` records this pre-calibration target;
+`initial_execution_hz` records the actual rate when movement starts after
+calibration, which can be lower.
+
+`--servo-hz` is separate: the adapter interpolates targets and
 issues native joint/EEF commands at that higher rate. The local rate callback
 acknowledges a slowdown by changing the adapter's actual future schedule.
 Moving to a target immediately and then sleeping would not implement this
@@ -134,8 +143,10 @@ servo timing, rate changes, session state and RPC timing. This entry point does
 not import the source branch's prediction-video decoding engine.
 
 `examples/action_pretrain/robotwin_client_template.sh` forwards these settings
-through environment variables. Activate the existing RoboTwin environment first.
-It also supports `PRINT_ONLY=1`.
+through environment variables. Use `INITIAL_EXECUTION_HZ` for the requested
+starting rate; the older `EXECUTION_HZ` variable is a fallback when the new one is
+unset or empty. Activate the existing RoboTwin environment first. The script
+also supports `PRINT_ONLY=1`.
 
 ## Transport, latency and resets
 

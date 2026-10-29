@@ -377,7 +377,12 @@ def parser():
     p.add_argument("--enable_rtc", "--enable-rtc", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--adaptive-execution", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument(
-        "--execution-hz", type=positive_frequency, help="Desired waypoint rate; online calibration may reduce it"
+        "--initial-execution-hz",
+        "--execution-hz",
+        dest="execution_hz",
+        type=positive_frequency,
+        metavar="HZ",
+        help="Initial waypoint rate in Hz (defaults to model rate); adaptive RTC may reduce it before and during execution",
     )
     p.add_argument("--servo-hz", type=positive_frequency, default=30.0)
     p.add_argument("--request-timeout", type=positive_frequency, default=120.0)

@@ -17,7 +17,8 @@ CMD=("${PYTHON_BIN:-python}" "$SCRIPT_DIR/robotwin_client.py"
     --extra-latency-seconds "${EXTRA_LATENCY_SECONDS:-0}"
     --minimum-execution-hz "${MINIMUM_EXECUTION_HZ:-0}"
     --output "${OUTPUT_ROOT:-outputs/causal_action/robotwin_sim}")
-[[ -n "${EXECUTION_HZ:-}" ]] && CMD+=(--execution-hz "$EXECUTION_HZ")
+initial_execution_hz="${INITIAL_EXECUTION_HZ:-${EXECUTION_HZ:-}}"
+[[ -n "$initial_execution_hz" ]] && CMD+=(--initial-execution-hz "$initial_execution_hz")
 [[ -n "${MAX_WAYPOINTS:-}" ]] && CMD+=(--max-waypoints "$MAX_WAYPOINTS")
 [[ -n "${MAX_STEPS:-}" ]] && CMD+=(--max-steps "$MAX_STEPS")
 [[ -n "${INSTRUCTION:-}" ]] && CMD+=(--instruction "$INSTRUCTION")
