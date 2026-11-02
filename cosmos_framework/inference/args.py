@@ -13,6 +13,7 @@ import torch
 from typing_extensions import assert_never
 from tyro.conf import Suppress
 
+from cosmos_framework.data.generator.utils import ACTION_RES_SIZE_INFO
 from cosmos_framework.inference.common.args import (
     IMAGE_EXTENSIONS,
     VIDEO_EXTENSIONS,
@@ -594,7 +595,8 @@ class SoundDataOverrides(OverridesBase):
 class ActionDataArgs(ArgsBase):
     action_path: ResolvedFilePath | None = None
     domain_name: str = ""
-    image_size: pydantic.PositiveInt = 256
+    image_size: pydantic.PositiveInt
+    action_video_prepared: bool = False
     action_chunk_size: pydantic.PositiveInt = 16
     raw_action_dim: int | None = None
     view_point: str | None = None
@@ -608,13 +610,15 @@ class ActionDataOverrides(OverridesBase):
     domain_name: Training[str | None] = None
     """Action domain name passed to get_domain_id()."""
     image_size: Training[pydantic.PositiveInt | None] = None
-    """Target image height in pixels (aspect-ratio-preserving resize)."""
+    """Action camera resolution tier (256 or 480); match the training recipe."""
+    action_video_prepared: Training[bool | None] = None
+    """Whether vision_path already has the target camera sizes and layout."""
     action_chunk_size: Training[pydantic.PositiveInt | None] = None
     """Number of action steps to predict."""
     raw_action_dim: Training[pydantic.PositiveInt | None] = None
     """Dimension of the raw action data. Required when action_path is not provided."""
     view_point: Training[str | None] = None
-    """Viewpoint description for the action prompt."""
+    """Input camera layout: ego_view or standard AgiBot concat_view."""
 
     @override
     def download(self, output_dir: Path):
@@ -625,7 +629,11 @@ class ActionDataOverrides(OverridesBase):
         if self.domain_name is None:
             self.domain_name = ""
         if self.image_size is None:
+            if sample_meta.model_mode.is_action:
+                raise ValueError("Action inference requires an explicit image_size tier (256 or 480) matching training")
             self.image_size = 256
+        if self.action_video_prepared is None:
+            self.action_video_prepared = False
         if self.action_chunk_size is None:
             self.action_chunk_size = 16
         if self.view_point is None:
@@ -634,6 +642,12 @@ class ActionDataOverrides(OverridesBase):
         mode = sample_meta.model_mode
         if not mode.is_action:
             return
+        if str(self.image_size) not in ACTION_RES_SIZE_INFO:
+            raise ValueError(
+                f"Unsupported action image_size: {self.image_size}; available: {list(ACTION_RES_SIZE_INFO)}"
+            )
+        if self.view_point not in ("ego_view", "concat_view"):
+            raise ValueError(f"Unsupported action view_point: {self.view_point}")
         if not model_config.action_gen:
             raise ValueError(
                 f"model_mode={mode.value!r} requires a model with action support "

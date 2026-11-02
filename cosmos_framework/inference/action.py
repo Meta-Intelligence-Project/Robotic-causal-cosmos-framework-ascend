@@ -18,12 +18,11 @@ from cosmos_framework.data.generator.action.domain_utils import EMBODIMENT_TO_RA
 from cosmos_framework.data.generator.action.json_formatter import ActionPromptJsonFormatter
 from cosmos_framework.data.generator.action.transforms import (
     build_sequence_plan_from_mode,
-    find_closest_target_size,
-    reflection_pad_to_target,
 )
+from cosmos_framework.data.generator.action.video_view import VideoViewConfig
+from cosmos_framework.data.generator.utils import ACTION_RES_SIZE_INFO
 from cosmos_framework.inference.args import ModelMode
 from cosmos_framework.inference.vision import read_media_frames
-from cosmos_framework.utils.generator.data_utils import get_vision_data_resolution
 
 
 def _load_actions(
@@ -58,6 +57,7 @@ def _format_prompt(
     action: torch.Tensor,
     fps: torch.Tensor,
     image_size: torch.Tensor,
+    additional_view_description: str = "",
 ) -> str:
     """Helper function to build the action prompt with optional duration and resolution info."""
     data_dict = {
@@ -67,6 +67,7 @@ def _format_prompt(
         "action": action,
         "conditioning_fps": fps,
         "image_size": image_size,
+        "additional_view_description": additional_view_description,
     }
     prompt_json_formatter = ActionPromptJsonFormatter()
     ai_caption = prompt_json_formatter(data_dict)[prompt_json_formatter.caption_key]
@@ -86,12 +87,12 @@ def build_action_batch(
     model_mode: ModelMode,
     action_chunk_size: int,
     fps: int,
-    resolution: str | None = None,
     input_video_key: str,
+    additional_view_description: str = "",
     batch_size: int = 1,
     device: Any = "cuda",
 ) -> dict:
-    """Build an Action data batch from pre-loaded video and action tensors."""
+    """Build an Action batch from spatially prepared video and action tensors."""
     target_frames = action_chunk_size + 1
     _, num_frames, h, w = video.shape
 
@@ -101,14 +102,7 @@ def build_action_batch(
     elif num_frames > target_frames:
         video = video[:, :target_frames]
 
-    if resolution is None:
-        resolution = get_vision_data_resolution((h, w))
-
-    target_w, target_h = find_closest_target_size(h, w, resolution)
-    pad_dict: dict[str, Any] = {"video": video}
-    reflection_pad_to_target(pad_dict, ["video"], keep_aspect_ratio=True, target_w=target_w, target_h=target_h)
-    video_padded = pad_dict["video"]
-    padded_image_size = pad_dict["image_size"]
+    image_size = torch.tensor([h, w, h, w], dtype=torch.float32)
 
     sequence_plan = build_sequence_plan_from_mode(
         mode=model_mode.value,
@@ -120,10 +114,11 @@ def build_action_batch(
     ai_caption = _format_prompt(
         prompt=prompt,
         view_point=view_point,
-        video=video_padded,
+        video=video,
         action=action,
         fps=torch.tensor(fps, dtype=torch.long),
-        image_size=padded_image_size,
+        image_size=image_size,
+        additional_view_description=additional_view_description,
     )
 
     action_processing_record = ActionProcessingRecord(
@@ -132,14 +127,14 @@ def build_action_batch(
     )
 
     return {
-        input_video_key: [[video_padded]] * batch_size,
+        input_video_key: [[video]] * batch_size,
         "action": [[action]] * batch_size,
         **make_batched_action_processing_fields(action_processing_record, batch_size),
         "mode": [model_mode.value] * batch_size,
         "ai_caption": [ai_caption] * batch_size,
         "prompt": [prompt] * batch_size,
         "conditioning_fps": [torch.tensor(fps, dtype=torch.long)] * batch_size,
-        "image_size": padded_image_size.unsqueeze(0).to(device=device),
+        "image_size": image_size.unsqueeze(0).repeat(batch_size, 1).to(device=device),
         "domain_id": [torch.tensor(get_domain_id(domain_name), dtype=torch.long)] * batch_size,
         "sequence_plan": [sequence_plan] * batch_size,
     }
@@ -156,6 +151,7 @@ def get_action_sample_data(
     domain_name: str,
     view_point: str = "ego_view",
     resolution: str,
+    action_video_prepared: bool = False,
     action_chunk_size: int,
     max_action_dim: int,
     fps: int,
@@ -170,6 +166,30 @@ def get_action_sample_data(
 
     raw_action_dim = EMBODIMENT_TO_RAW_ACTION_DIM[domain_name]
     frames, _ = read_media_frames(Path(vision_path), max_frames=action_chunk_size + 1)
+    if frames.shape[1] == 0:
+        raise ValueError("Action input media must contain at least one frame")
+    view = VideoViewConfig(cameras={role: role for role in ("head", "left", "right")}, resolution=resolution)
+    cameras = frames.permute(1, 0, 2, 3)
+    if view_point == "ego_view":
+        cameras = {"head": cameras}
+    elif view_point == "concat_view":
+        height, width = frames.shape[-2:]
+        if height % 3 or width % 2:
+            raise ValueError("AgiBot concat input requires three equal-height bands and two equal-width wrist views")
+        head_height = height // 3 * 2
+        cameras = {
+            "head": cameras[:, :, :head_height],
+            "left": cameras[:, :, head_height:, : width // 2],
+            "right": cameras[:, :, head_height:, width // 2 :],
+        }
+    else:
+        raise ValueError(f"Unsupported action viewpoint: {view_point}")
+    if action_video_prepared:
+        height, width = cameras["head"].shape[-2:]
+        if (width, height) not in ACTION_RES_SIZE_INFO[str(resolution)].values():
+            raise ValueError(f"Prepared action input does not match resolution {resolution}: {width}x{height}")
+    else:
+        frames = view.compose(cameras, frames.shape[1], viewpoint=view_point)
     assert action_path is not None or raw_action_dim is not None, (
         "Either action_path or raw_action_dim must be provided"
     )
@@ -185,7 +205,7 @@ def get_action_sample_data(
         model_mode=model_mode,
         action_chunk_size=action_chunk_size,
         fps=fps,
-        resolution=resolution,
+        additional_view_description=view.describe(viewpoint=view_point),
         input_video_key=model_config.input_video_key,
         batch_size=batch_size,
         device=device,

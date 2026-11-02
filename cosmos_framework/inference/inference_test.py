@@ -396,3 +396,171 @@ def test_reasoner_defaults_validate_against_overrides() -> None:
     filtered = {k: v for k, v in defaults.items() if k in OmniSampleOverrides.model_fields}
     assert set(defaults) - set(filtered) == set(), f"defaults has unknown fields: {set(defaults) - set(filtered)}"
     OmniSampleOverrides.model_validate(filtered)
+
+
+@pytest.mark.parametrize("resolution,target_size", [("256", (256, 320)), ("480", (480, 640))])
+@pytest.mark.parametrize("viewpoint", ["ego_view", "concat_view"])
+def test_action_inference_matches_camera_preparation_and_training_metadata(
+    monkeypatch, resolution, target_size, viewpoint
+):
+    import torch
+
+    from cosmos_framework.data.generator.action.transforms import ActionTransformPipeline
+    from cosmos_framework.data.generator.action.video_view import VideoViewConfig
+    from cosmos_framework.inference import action
+    from cosmos_framework.inference.args import ModelMode
+    from cosmos_framework.utils.generator.data_utils import get_vision_data_resolution
+
+    view = VideoViewConfig(cameras={role: role for role in ("head", "left", "right")}, resolution=resolution)
+    cameras = {
+        "head": torch.full((2, 3, 96, 128), 17, dtype=torch.uint8),
+        "left": torch.full((2, 3, 48, 64), 81, dtype=torch.uint8),
+        "right": torch.full((2, 3, 48, 64), 191, dtype=torch.uint8),
+    }
+    source_video = cameras["head"].permute(1, 0, 2, 3)
+    if viewpoint == "concat_view":
+        source_video = torch.cat(
+            [source_video, torch.cat([cameras["left"], cameras["right"]], dim=-1).permute(1, 0, 2, 3)], dim=-2
+        )
+    monkeypatch.setattr(action, "read_media_frames", lambda *args, **kwargs: (source_video, 30.0))
+    batch = action.get_action_sample_data(
+        SimpleNamespace(input_video_key="video"),
+        batch_size=2,
+        prompt="Pick up the cup.",
+        vision_path=Path("observation.png"),
+        model_mode=ModelMode.POLICY,
+        action_path=None,
+        domain_name="agibotworld",
+        view_point=viewpoint,
+        resolution=resolution,
+        action_chunk_size=4,
+        max_action_dim=55,
+        fps=30,
+        device="cpu",
+    )
+    prepared = view.compose(cameras, 2, viewpoint=viewpoint)
+    prepared = torch.cat([prepared, prepared[:, -1:].repeat(1, 3, 1, 1)], dim=1)
+    training = ActionTransformPipeline(max_action_dim=55, format_prompt_as_json=True)(
+        {
+            "video": prepared,
+            "action": torch.zeros(4, 55),
+            "mode": "policy",
+            "ai_caption": "Pick up the cup.",
+            "viewpoint": viewpoint,
+            "additional_view_description": view.describe(viewpoint=viewpoint),
+            "conditioning_fps": torch.tensor(30),
+        }
+    )
+    h, w = target_size
+    final_h = h if viewpoint == "ego_view" else h + h // 2
+    for video in batch["video"]:
+        assert video[0].shape == (3, 5, final_h, w)
+        assert video[0].dtype == torch.uint8
+        assert torch.equal(video[0], training["video"])
+    assert batch["image_size"].tolist() == [[final_h, w, final_h, w]] * 2
+    assert batch["image_size"][0].tolist() == training["image_size"].tolist()
+    assert json.loads(batch["ai_caption"][0]) == training["ai_caption"]
+    assert get_vision_data_resolution(tuple(batch["image_size"][0, :2].int().tolist())) == (
+        get_vision_data_resolution(tuple(training["image_size"][:2].int().tolist()))
+    )
+
+
+@pytest.mark.parametrize("viewpoint,height,width", [("ego_view", 480, 640), ("concat_view", 720, 640)])
+def test_action_prepared_media_passes_through_without_interpolation(monkeypatch, viewpoint, height, width):
+    import torch
+
+    from cosmos_framework.inference import action
+    from cosmos_framework.inference.args import ModelMode
+
+    frames = torch.randint(256, (3, 5, height, width), dtype=torch.uint8)
+    monkeypatch.setattr(action, "read_media_frames", lambda *args, **kwargs: (frames, 30.0))
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Prepared action media must pass through without camera preparation")
+
+    monkeypatch.setattr(action.VideoViewConfig, "compose", forbidden)
+    batch = action.get_action_sample_data(
+        SimpleNamespace(input_video_key="video"),
+        batch_size=1,
+        prompt="Pick up the cup.",
+        vision_path=Path("prepared.png"),
+        model_mode=ModelMode.POLICY,
+        action_path=None,
+        domain_name="agibotworld",
+        view_point=viewpoint,
+        resolution="480",
+        action_video_prepared=True,
+        action_chunk_size=4,
+        max_action_dim=55,
+        fps=30,
+        device="cpu",
+    )
+    assert batch["video"][0][0] is frames
+    assert batch["image_size"].tolist() == [[height, width, height, width]]
+
+
+@pytest.mark.parametrize(
+    "viewpoint,height,width,prepared,error",
+    [
+        ("concat_view", 721, 640, False, "concat input"),
+        ("concat_view", 720, 641, False, "concat input"),
+        ("ego_view", 240, 320, True, "Prepared action input"),
+        ("concat_view", 360, 320, True, "Prepared action input"),
+        ("unknown", 480, 640, False, "viewpoint"),
+    ],
+)
+def test_action_media_rejects_ambiguous_layout_or_invalid_prepared_size(
+    monkeypatch, viewpoint, height, width, prepared, error
+):
+    import torch
+
+    from cosmos_framework.inference import action
+    from cosmos_framework.inference.args import ModelMode
+
+    monkeypatch.setattr(
+        action, "read_media_frames", lambda *args, **kwargs: (torch.zeros(3, 1, height, width, dtype=torch.uint8), 30)
+    )
+    with pytest.raises(ValueError, match=error):
+        action.get_action_sample_data(
+            SimpleNamespace(input_video_key="video"),
+            batch_size=1,
+            prompt="Pick up the cup.",
+            vision_path=Path("observation.png"),
+            model_mode=ModelMode.POLICY,
+            action_path=None,
+            domain_name="agibotworld",
+            view_point=viewpoint,
+            resolution="480",
+            action_video_prepared=prepared,
+            action_chunk_size=4,
+            max_action_dim=55,
+            fps=30,
+            device="cpu",
+        )
+
+
+@pytest.mark.parametrize("num_frames", [1, 5, 7])
+def test_action_batch_only_aligns_time_and_preserves_spatial_pixels(num_frames):
+    import torch
+
+    from cosmos_framework.inference.action import build_action_batch
+    from cosmos_framework.inference.args import ModelMode
+
+    frames = torch.arange(num_frames, dtype=torch.uint8)[None, :, None, None].expand(3, num_frames, 17, 23)
+    batch = build_action_batch(
+        video=frames,
+        action=torch.zeros(4, 55),
+        raw_action_dim=29,
+        prompt="Pick up the cup.",
+        view_point="ego_view",
+        domain_name="agibotworld",
+        model_mode=ModelMode.POLICY,
+        action_chunk_size=4,
+        fps=30,
+        input_video_key="video",
+        device="cpu",
+    )
+    video = batch["video"][0][0]
+    assert video.shape == (3, 5, 17, 23)
+    assert video[0, :, 0, 0].tolist() == [min(index, num_frames - 1) for index in range(5)]
+    assert batch["image_size"].tolist() == [[17, 23, 17, 23]]

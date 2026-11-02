@@ -40,7 +40,7 @@ class CausalActionSFTDataset(ActionSFTDataset):
         joint_mode_weights=None,
         use_state=True,
     ):
-        super().__init__(base._dataset, base._transform, base._resolution)
+        super().__init__(base._dataset, base._transform)
         if mode not in (*MODES, "joint"):
             raise ValueError(f"Unsupported causal action mode: {mode}")
         if not use_state or (statistics_path is None and statistics is None):
@@ -110,7 +110,7 @@ class CausalActionSFTDataset(ActionSFTDataset):
         ):
             raw.pop(key, None)
         raw["mode"] = mode
-        result = self._transform(raw, self._resolution, action_normalizer=None)
+        result = self._transform(raw, action_normalizer=None)
         length = result["action"].shape[0]
         if result["action"].shape[-1] != self.template.width:
             raise ValueError("The shared action transform must use template.width without extra padding")

@@ -100,12 +100,14 @@ def get_causal_action_dataset(
             log.info(f"Action source group: {source['root']}; datasets={len(roots)}")
             profile = source["reader"]
             options = replace(READERS[profile].default_read_options, **source.get("read_options", {}))
+            video_view = replace(READERS[profile].default_video_view, resolution=resolution)
             build_reader = partial(
                 _build_reader,
                 profile=profile,
                 template=template,
                 planner=planner,
                 read_options=options,
+                video_view=video_view,
                 use_subtask=source.get("use_subtask", False),
                 viewpoint=source["viewpoint"],
                 split="train",
@@ -139,7 +141,7 @@ def get_causal_action_dataset(
                         delta_stats_path=mock_delta_stats_path,
                     )
                 dataset = CausalActionSFTDataset(
-                    ActionSFTDataset(reader, transform, resolution),
+                    ActionSFTDataset(reader, transform),
                     mode=source.get("mode", mode),
                     statistics_path=None,
                     statistics=statistics,

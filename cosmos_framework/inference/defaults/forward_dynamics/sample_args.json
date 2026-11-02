@@ -19,6 +19,5 @@
     "image_save_quality": 95,
     "enable_sound": false,
     "domain_name": "",
-    "image_size": 256,
     "action_chunk_size": 16
 }

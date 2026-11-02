@@ -73,6 +73,20 @@ VIDEO_RES_SIZE_INFO: dict[str, dict[str, tuple[int, int]]] = {
     },
 }
 
+ACTION_RES_SIZE_INFO: dict[str, dict[str, tuple[int, int]]] = {
+    # Our desired 256 resolution is the one below (commented).
+    # Desired: "256": {"1,1": (336, 336), "4,3": (384, 288), "3,4": (288, 384), "16,9": (448, 256), "9,16": (256, 448)},
+    "256": {
+        "1,1": (256, 256),
+        "4,3": (320, 256),
+        "3,4": (256, 320),
+        "5,4": (320, 256),
+        "4,5": (256, 320),
+        "16,9": (448, 256),
+        "9,16": (256, 448),
+    },
+    "480": {"1,1": (512, 512), "4,3": (640, 480), "3,4": (480, 640), "16,9": (640, 352), "9,16": (352, 640)},
+}
 
 def get_aspect_ratios_from_wdinfos(wdinfos: list[str]) -> list[str]:
     aspect_ratios = []
