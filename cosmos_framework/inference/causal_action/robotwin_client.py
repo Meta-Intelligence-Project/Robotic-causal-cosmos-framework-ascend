@@ -100,11 +100,13 @@ def rollout(
     """Execute one episode with local timing and a background network planner.
 
     Each model waypoint advances the session once. Servo interpolation does not
-    create observation ticks. The bootstrap and prepare calls run before motion;
-    RTC prepare measures the complete RPC while the simulator remains stationary;
-    ordinary asynchronous prepare only starts ahead-of-trigger VAE work.
-    A fallback is reported and may block the following waypoint request. Missed
-    servo deadlines are skipped, rather than emitted as a burst of old commands.
+    create observation ticks. The bootstrap and prepare calls run before motion.
+    Both asynchronous modes calibrate complete RPCs when adaptive execution is
+    enabled, and share the same trigger/handoff schedule. RTC additionally guides
+    the new prediction with the old action prefix. Acknowledged rate reductions
+    stretch future interpolation intervals without changing the model time grid.
+    A late handoff may wait; missed servo deadlines are skipped, rather than
+    emitted as a burst of old commands.
     The final target is sent unless the episode ends before it can be executed.
 
     This adapter implements a RoboTwin interpolation policy. Hardware clients
@@ -199,7 +201,9 @@ def rollout(
         rtc_active_throughout = bool(status.get("rtc_enabled", False))
         while not episode_finished(env) and (max_waypoints is None or issued < max_waypoints):
             wait_until(deadline)
-            measurement = _measurement(env, adapter, resolution, state_source, prepare_image)
+            # Bootstrap already owns tick zero. A live camera can change while
+            # startup inference runs, so capture a fresh image only after tick 0.
+            measurement = first if issued == 0 else _measurement(env, adapter, resolution, state_source, prepare_image)
             if not torch.equal(torch.as_tensor(measurement["image_size"]).detach().cpu(), image_size):
                 raise ValueError("Camera layout/content geometry changed within the episode; reset is required")
             before = session.status()
@@ -293,7 +297,7 @@ def rollout(
             initial_execution_hz=initial_hz,
             final_execution_hz=pacer["hz"],
             servo_hz=servo_hz,
-            adaptive_execution=bool(enable_rtc and adaptive_execution),
+            adaptive_execution=bool(final_status.get("adaptive_execution", False)),
             continuous_rtc=bool(enable_rtc and rtc_active_throughout),
             execution_mode=final_status.get("execution_mode"),
             state_source=state_source,
@@ -383,7 +387,7 @@ def parser():
         "--execution-mode",
         choices=("auto", "blocking", "async"),
         default="auto",
-        help="auto: streaming VAE selects async without RTC; blocking is an explicit baseline",
+        help="auto: asynchronous execution with optional RTC guidance; blocking is an explicit non-RTC baseline",
     )
     p.add_argument("--adaptive-execution", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument(
@@ -392,7 +396,7 @@ def parser():
         dest="execution_hz",
         type=positive_frequency,
         metavar="HZ",
-        help="Initial waypoint rate in Hz (defaults to model rate); adaptive RTC may reduce it before and during execution",
+        help="Initial waypoint rate in Hz (defaults to model rate); adaptive execution may reduce it before and during motion",
     )
     p.add_argument("--servo-hz", type=positive_frequency, default=30.0)
     p.add_argument("--request-timeout", type=positive_frequency, default=120.0)

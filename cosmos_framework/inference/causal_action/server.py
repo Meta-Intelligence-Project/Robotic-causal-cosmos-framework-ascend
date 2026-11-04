@@ -242,10 +242,14 @@ def parser():
     p.add_argument(
         "--action-horizon", "--action_horizon", type=int, default=32, help="Number of real predicted action steps"
     )
+    p.add_argument("--history-padding", "--history_padding", choices=("repeat_first",), default="repeat_first")
     p.add_argument(
-        "--history-padding", "--history_padding", choices=("available", "repeat_first"), default="repeat_first"
+        "--streaming-vae",
+        "--streaming_vae",
+        action="store_true",
+        default=True,
+        help="Compatibility flag; streaming VAE is always enabled",
     )
-    p.add_argument("--streaming-vae", "--streaming_vae", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--steps", type=int, default=10)
     p.add_argument("--guidance", type=float, default=1.0)
     p.add_argument(
@@ -266,6 +270,13 @@ def parser():
     p.add_argument("--resolution", default="480")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--cache-mode", choices=("off", "plans", "full"), default="full")
+    p.add_argument(
+        "--npu-replay-graph",
+        "--npu_replay_graph",
+        action="store_true",
+        default=False,
+        help="Opt in to fixed-shape NPU replay graphs for compatible ordinary inference; RTC stays eager",
+    )
     p.add_argument("--enable_rtc", "--enable-rtc", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--override", action="append", default=[])
     return p

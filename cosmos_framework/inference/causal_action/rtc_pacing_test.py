@@ -5,7 +5,76 @@ from collections import deque
 
 import pytest
 
-from cosmos_framework.inference.causal_action.rtc_pacing import RTCExecutionPolicy
+from cosmos_framework.inference.causal_action.rtc_pacing import RTCExecutionPolicy, fit_latency
+
+
+def test_public_fit_reports_unavailable_without_a_completed_or_observed_latency():
+    estimate = fit_latency(2.4)
+    assert estimate == dict(
+        fit_mode="unavailable",
+        sample_count=0,
+        distinct_history_count=0,
+        history_min_seconds=None,
+        history_max_seconds=None,
+        intercept_seconds=0.0,
+        slope_seconds_per_history_second=0.0,
+        predicted_seconds=0.0,
+        residual_seconds=0.0,
+        maximum_seconds=0.0,
+    )
+
+
+def test_public_fit_reports_constant_for_a_fixed_encoded_padded_history():
+    history = 1024 / 30
+    estimate = fit_latency(history, samples=((history, 1.1), (history, 1.3)))
+    assert estimate["fit_mode"] == "constant"
+    assert estimate["sample_count"] == 2 and estimate["distinct_history_count"] == 1
+    assert estimate["history_min_seconds"] == estimate["history_max_seconds"] == history
+    assert estimate["intercept_seconds"] == estimate["predicted_seconds"] == estimate["maximum_seconds"] == 1.3
+    assert estimate["slope_seconds_per_history_second"] == estimate["residual_seconds"] == 0.0
+
+
+def test_public_fit_extrapolates_the_cpu_line_without_execution_policy_margins():
+    estimate = fit_latency(6, samples=((0, 1), (2, 2), (4, 3)))
+    assert estimate["fit_mode"] == "linear"
+    assert estimate["sample_count"] == estimate["distinct_history_count"] == 3
+    assert estimate["intercept_seconds"] == pytest.approx(1)
+    assert estimate["slope_seconds_per_history_second"] == pytest.approx(0.5)
+    assert estimate["predicted_seconds"] == pytest.approx(4)
+    assert estimate["maximum_seconds"] == 3
+    assert estimate["residual_seconds"] == pytest.approx(0)
+
+
+@pytest.mark.parametrize("samples", [(), ((0, 1), (2, 2), (4, 3))])
+def test_public_fit_does_not_count_elapsed_lower_bounds_as_completed_samples(samples):
+    estimate = fit_latency(6, samples=samples, observed_seconds=10)
+    assert estimate["sample_count"] == len(samples)
+    assert estimate["maximum_seconds"] == (3 if samples else 0)
+    assert estimate["predicted_seconds"] == (4 if samples else 10)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        dict(history_seconds=True),
+        dict(history_seconds=-1),
+        dict(history_seconds=float("nan")),
+        dict(history_seconds=float("inf")),
+        dict(observed_seconds=True),
+        dict(observed_seconds=-1),
+        dict(observed_seconds=float("nan")),
+        dict(observed_seconds=float("inf")),
+        dict(samples=None),
+        dict(samples=((0,),)),
+        dict(samples=((-1, 2),)),
+        dict(samples=((1, -2),)),
+        dict(samples=((True, 2),)),
+        dict(samples=((1, float("nan")),)),
+    ],
+)
+def test_public_fit_rejects_invalid_inputs_without_a_policy(options):
+    with pytest.raises(ValueError):
+        fit_latency(**({"history_seconds": 0} | options))
 
 
 def recommend(policy, *, history=3.0, rate=3.0, samples=((0, 2), (1, 3), (2, 4)), **options):
@@ -29,6 +98,7 @@ def test_cpu_line_is_fitted_from_the_supplied_completed_requests():
     assert advice.slope_seconds_per_history_second == pytest.approx(1)
     assert advice.predicted_seconds == pytest.approx(5)
     assert advice.residual_seconds == pytest.approx(0)
+    assert advice.maximum_seconds == 4
     assert advice.budget_seconds == pytest.approx(6)
     assert advice.recommended_hz == pytest.approx(2.5)
 
@@ -204,3 +274,136 @@ def test_invalid_requests_are_rejected(options):
     arguments = dict(history_seconds=0, horizon=32, execution_steps=16, current_hz=3, samples=((0, 2),))
     with pytest.raises(ValueError):
         RTCExecutionPolicy().recommend(**(arguments | options))
+
+
+def handoff(policy=None, **options):
+    arguments = dict(history_seconds=0, overlap_steps=8, current_hz=30, samples=((0, 2),))
+    return (policy or RTCExecutionPolicy()).recommend_handoff(**(arguments | options))
+
+
+def test_fixed_handoff_uses_only_the_overlap_budget_and_preserves_its_delay():
+    advice = handoff()
+    assert advice.feasible
+    assert advice.budget_seconds == pytest.approx(2.4)
+    assert advice.recommended_hz == pytest.approx(7 / 2.4)
+    assert advice.delay_steps == 8
+    # A small observed delay does not shrink the hard committed prefix.
+    fast = handoff(samples=((0, 0.01),))
+    assert fast.recommended_hz == 30
+    assert fast.delay_steps == 8
+
+
+def test_fixed_handoff_reuses_the_online_history_fit():
+    advice = handoff(history_seconds=3, samples=((0, 2), (1, 3), (2, 4)))
+    assert advice.feasible and advice.fit_mode == "linear"
+    assert advice.predicted_seconds == pytest.approx(5)
+    assert advice.maximum_seconds == 4
+    assert advice.budget_seconds == pytest.approx(6)
+    assert advice.recommended_hz == pytest.approx(7 / 6)
+    assert advice.delay_steps == 8
+
+
+def test_fixed_handoff_does_not_fabricate_startup_measurements():
+    advice = handoff(samples=())
+    assert not advice.feasible and advice.reason == "no_latency_samples"
+    assert advice.budget_seconds is None
+    assert advice.delay_steps == 8
+
+
+def test_pending_handoff_spends_only_the_remaining_wall_budget():
+    advice = handoff(elapsed_seconds=1, remaining_steps=3)
+    assert advice.feasible
+    assert advice.recommended_hz == pytest.approx(3 / 1.4)
+    assert advice.delay_steps == 8
+
+
+def test_last_old_command_still_has_one_interval_before_handoff():
+    advice = handoff(elapsed_seconds=2, remaining_steps=1, current_hz=3)
+    assert advice.feasible
+    assert advice.recommended_hz == pytest.approx(2.5)
+    assert advice.delay_steps == 8
+
+
+def test_pending_elapsed_time_is_a_lower_bound_on_total_latency():
+    advice = handoff(elapsed_seconds=3, remaining_steps=1)
+    assert advice.feasible
+    assert advice.budget_seconds == pytest.approx(3.6)
+    assert advice.recommended_hz == pytest.approx(1 / 0.6)
+
+
+def test_exhausted_pending_estimate_is_not_reported_as_a_deadline_guarantee():
+    advice = handoff(RTCExecutionPolicy(latency_factor=1), elapsed_seconds=2, remaining_steps=1)
+    assert not advice.feasible and advice.reason == "latency_estimate_exhausted"
+    assert advice.delay_steps == 8
+    assert advice.recommended_hz == 30
+
+
+@pytest.mark.parametrize("margin", [8, 9])
+def test_fixed_handoff_reports_a_margin_that_exhausts_the_overlap(margin):
+    advice = handoff(RTCExecutionPolicy(margin_steps=margin))
+    assert not advice.feasible and advice.reason == "margin_exhausts_prefix"
+    assert advice.delay_steps == 8
+
+
+def test_no_rate_can_create_more_control_steps_at_the_handoff():
+    advice = handoff(elapsed_seconds=2, remaining_steps=0)
+    assert not advice.feasible and advice.reason == "no_remaining_steps"
+    assert advice.delay_steps == 8
+
+
+@pytest.mark.parametrize("pending", [False, True])
+def test_fixed_handoff_minimum_rate_is_enforced(pending):
+    options = dict(elapsed_seconds=1, remaining_steps=1) if pending else {}
+    advice = handoff(RTCExecutionPolicy(minimum_execution_hz=10), **options)
+    assert not advice.feasible and advice.reason == "minimum_execution_hz"
+    assert advice.delay_steps == 8
+
+
+def test_fixed_handoff_accepts_an_exactly_feasible_minimum_rate():
+    advice = handoff(RTCExecutionPolicy(latency_factor=1, minimum_execution_hz=2), samples=((0, 3.5),))
+    assert advice.feasible and advice.recommended_hz == 2
+    assert advice.delay_steps == 8
+
+
+def test_fixed_handoff_only_slows_and_never_accelerates_execution():
+    before = handoff()
+    after = handoff(current_hz=before.recommended_hz, samples=((0, 0.01),))
+    assert after.feasible and after.recommended_hz == before.recommended_hz
+    pending = handoff(current_hz=0.5, elapsed_seconds=1, remaining_steps=2)
+    assert pending.feasible and pending.recommended_hz == 0.5
+
+
+@pytest.mark.parametrize("duration", [0.1, 0.3, 1, 3.14, 11.975, 15.484, 1000])
+@pytest.mark.parametrize("pending", [False, True])
+def test_fixed_handoff_float_boundaries_preserve_the_wall_deadline(duration, pending):
+    options = dict(elapsed_seconds=duration / 2, remaining_steps=3) if pending else {}
+    advice = handoff(RTCExecutionPolicy(latency_factor=1), current_hz=10000, samples=((0, duration),), **options)
+    assert advice.feasible
+    capacity = 3 if pending else 7
+    remaining = duration / 2 if pending else duration
+    assert remaining * advice.recommended_hz <= capacity
+    assert advice.delay_steps == 8
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        dict(overlap_steps=True),
+        dict(overlap_steps=0),
+        dict(overlap_steps=8.5),
+        dict(remaining_steps=True),
+        dict(remaining_steps=-1),
+        dict(remaining_steps=9),
+        dict(remaining_steps=1.5),
+        dict(elapsed_seconds=-1),
+        dict(elapsed_seconds=float("inf")),
+        dict(elapsed_seconds=1),
+        dict(observed_seconds=float("nan")),
+        dict(current_hz=0),
+        dict(history_seconds=-1),
+        dict(samples=None),
+    ],
+)
+def test_invalid_fixed_handoff_requests_are_rejected(options):
+    with pytest.raises(ValueError):
+        handoff(**options)

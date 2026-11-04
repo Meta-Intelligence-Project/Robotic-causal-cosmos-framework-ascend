@@ -7,6 +7,23 @@ in [Real-Time Execution of Action Chunking Flow Policies](https://arxiv.org/html
 Equations 2–5. It integrates the guided velocity with the checkpoint's native
 UniPC or fixed-step sampler, rather than replacing it with the paper's Euler loop.
 
+The online WebSocket client uses the same fixed-S/R asynchronous scheduler with
+or without RTC. `enable_rtc` adds VJP guidance with `delay_steps=R-S`; it does not
+select an independent publication clock. Adaptive execution slows real waypoint
+delivery only after client acknowledgement, including while a request is pending.
+See [the online execution contract](causal_action_server.md#ownership-and-execution).
+The lower-level `RTCSession` API described below retains its original delay
+calibration and fallback behavior for existing local callers.
+
+The server's optional `--npu-replay-graph` optimization can be requested alongside
+RTC. It accelerates compatible ordinary inference; guided RTC evaluations keep
+the eager input-gradient path and their existing VJP/cache behavior. A graph
+request therefore does not change the RTC handoff or imply a lower guided-inference
+latency. The production NPU check retained ten VJPs, an exact eight-action committed
+prefix and unchanged graph counters during guided inference. Uncommitted RTC
+outputs retain their existing backward repeat variability.
+See [the graph option and validation scope](causal_action_server.md#optional-npu-replay-graph).
+
 ## Network design principles
 
 The supported RTC path preserves the causal attention visibility, measured-state

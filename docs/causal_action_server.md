@@ -13,40 +13,74 @@ protocol and fails the handshake rather than silently changing execution.
 
 The server loads the checkpoint, VAE, processor and training statistics. The
 client owns the action buffer, observation ticks, servo schedule and online
-latency fit. With RTC enabled, the existing `RTCSession` runs on the client CPU;
-its background planner performs a blocking RPC while the foreground continues
-executing the previous chunk.
+latency fit. Ordinary and RTC execution use the same `AsyncRemoteSession` on the
+client CPU. Its background planner performs an RPC while the foreground continues
+executing the previous chunk; RTC only adds VJP action-prefix guidance.
 
 ```text
 Client                                      Server
 fresh observation ------------------------> ordinary bootstrap inference
              <----------------------------- initial 32-action chunk
-remain stationary; prepare() -------------> RTC warmup and timed requests
+remain stationary; prepare() -------------> ordinary/RTC warmup and timed requests
 apply calibrated execution rate
-execute old actions; background RPC ------> current RTC + compatible prefix cache
-continue old actions <--------------------- new chunk, aligned to observation tick
+at S: execute old actions; background RPC -> current solve + optional RTC guidance
+at R: switch to new chunk[R-S] <----------- new chunk, aligned to observation tick
 ```
 
-The first chunk is generated without RTC. Startup calibration uses complete RTC
-RPCs, discards their predictions and does not advance the execution tick. Only
+The first chunk is generated without RTC. Adaptive startup calibration measures
+complete RPCs in the selected ordinary/RTC mode, discards their predictions and
+does not advance the execution tick. Only
 after `prepare()` finishes should the execution adapter start moving the robot.
 At `s=16`, the client requests the next `H=32` chunk in the background. Publication,
-committed-prefix restoration, elapsed-action skipping, deadline checks and
-fallback use the existing session logic.
+committed-prefix restoration and elapsed-action skipping use the same fixed
+handoff: an early result waits until `R=24`; a late result waits at R without
+disabling RTC or switching to another execution mode.
 
-`--enable_rtc` (alias `--enable-rtc`) is opt-in on both ends. Without it, the client
-performs the ordinary baseline: predict 32 actions, execute 16, then block for a
-fresh prediction. With RTC, adaptive execution is enabled by default in the client
-adapter; `--no-adaptive-execution` permits fixed-rate comparisons. Adaptive
+`--enable_rtc` (alias `--enable-rtc`) is opt-in on both ends. Streaming VAE is always
+enabled on the model server. Without RTC, the client's default `auto` mode uses
+pure asynchronous execution: predict 32 actions, trigger the next prediction at
+step 16 and hand off at step 24, dropping the new chunk's first eight actions.
+A late prediction waits at the handoff. `--execution-mode blocking` explicitly
+selects synchronous action delivery while retaining streaming observation encoding.
+Adaptive execution is enabled by default in the RoboTwin client adapter for both
+modes; `--no-adaptive-execution` permits fixed-rate comparisons. Adaptive
 execution fits recent `(history length, completed RPC latency)` pairs on the CPU.
 No offline latency coefficients or fixed tenfold slowdown are required.
+
+RTC reserves `delay_steps=R-S`, independently of measured wall latency. With
+H32/S16/R24, the old suffix `[16:32]` guides the new solve: the first eight rows
+are committed and restored exactly, the next eight receive decaying soft
+guidance. At R, execution starts at the new prediction's row eight. Results are
+never published early, and changing speed does not change these indexes.
+
+The client fits a wall-time budget from completed requests. Before submission it
+limits the waypoint rate to `(R-S-margin_steps)/budget_seconds`. While inference
+is pending, it can further slow the remaining old commands using the remaining
+time and steps to R. Each change requires a successful acknowledgement from the
+adapter that actually controls interpolation. The model's FPS remains fixed.
+An exhausted estimate is reported and R still provides the final wait point;
+rejected rate changes stop command delivery rather than installing a fictitious
+rate or silently removing RTC guidance.
+
+For direct Python clients, `adaptive_execution=None` selects adaptation when a
+rate callback or execution policy is supplied. Explicit `True` requires a real
+`execution_rate_callback`; explicit `False` uses the same fixed S/R schedule
+without automatic slowdown. RTC accepts `execution_mode="auto"` or `"async"`.
 
 ## Start the model server
 
 Use the existing Cosmos model environment with NPU support. The model configuration
-defaults to CFG=1, ten denoise steps, full prefix caching, 32 history blocks and
-the checkpoint's 30 Hz action-time grid. Thirty-two history blocks cover about
-34 model seconds; `--history` changes that capacity.
+defaults to CFG=1, ten denoise steps, full prefix caching, 1024 history steps and
+the checkpoint's 30 Hz action-time grid. This covers about 34 model seconds;
+`--history-steps` changes that capacity independently of the action horizon.
+The legacy `--history` alias counts 32-action units.
+
+Streaming VAE and `repeat_first` history padding are the only online encoding
+path. No streaming flag is needed; `--streaming-vae` and `--streaming_vae` remain
+accepted for existing launch commands. Disabling streaming or selecting
+`history_padding=available` is rejected. Each decision window resets the VAE,
+preencodes available historical observations and incrementally encodes incoming
+sampled frames. RTC remains an independent opt-in setting.
 
 The training statistics and robot coordinate conventions must match the checkpoint.
 For robots whose DOFs, masks or EEF frame cannot be determined unambiguously from
@@ -84,6 +118,50 @@ statistics, processor, VAE, environment and device paths for the server machine.
 `ENABLE_RTC=1` enables RTC; `PRINT_ONLY=1` prints the command without activating an
 environment or launching the model.
 
+## Optional NPU replay graph
+
+`--npu-replay-graph` (alias `--npu_replay_graph`) explicitly enables NPU replay
+graphs; its default is false. The verified configuration is ordinary
+inference on NPU with `--cache-mode full` and CFG=1. A new compatible layout needs
+an initial graph capture, so cold requests include capture cost. Each request
+still refreshes the graph's fixed-prefix K/V from its own measured history before
+replaying the current video/action tokens.
+
+The graph retains the existing `npu_fusion_attention` kernel. During capture,
+zero-dropout attention (`keep_prob=1`) uses `sync=True` to skip the unused
+auxiliary mask-stream event. The measured acceleration comes from replaying the
+fixed sequence of operations with fewer Host submissions.
+
+On 2026-11-04, the production implementation was checked on a 910B3 with the real
+0930 checkpoint: P48 history at 20 Hz (2.4 model seconds), actual 224×448 pixels,
+H32, BF16, CFG=1 and ten joint video/action denoising steps. For each timing mode,
+ten interleaved eager/graph pairs produced bitwise-equal physical actions.
+Median complete-call latency including fresh VAE encoding fell from 1.12725 to
+0.52659 seconds (2.14×); with the observed prefix already prepared it fell from
+1.04653 to 0.46044 seconds (2.27×). The first graph-enabled call took 0.78164
+seconds, including 0.08423 seconds of graph capture. These timings include model
+input preparation and CPU physical-action export, and exclude camera processing,
+RPC and robot execution.
+
+Separate requests with a changed history prefix, changed text at the same token
+length and changed text length each matched their corresponding eager outputs
+bitwise. A changed layout triggered graph recapture. This validates the tested
+input/caching paths; it does not establish bitwise equivalence for every shape,
+closed-loop task quality or a deployment latency bound.
+
+The flag can be combined with `--enable-rtc`. Guided RTC evaluations retain the
+eager input-gradient path; requesting a graph does not disable RTC or change the
+fixed S/R handoff. The model generation result's
+`inference_cache["npu_replay_graph"]` reports `requested`, `enabled` and
+`fallback_reason`; guided evaluations report `rtc_input_vjp`. Graph counters live
+under `npu_replay_graph_stats` in the cache report.
+The server handshake's `npu_replay_graph_requested` reports the configured request,
+not whether every later prediction uses a graph.
+The real-checkpoint RTC check retained ten input VJPs and the exact eight-action
+committed prefix while graph counters stayed unchanged. Uncommitted RTC outputs
+retain the existing BF16 backward variability; RTC repeatability is not claimed
+to be bitwise.
+
 ## Start a RoboTwin client
 
 Use a Python environment that can already run the RoboTwin simulator. The client
@@ -111,8 +189,8 @@ python examples/action_pretrain/robotwin_client.py \
 `--initial-execution-hz` sets the requested starting rate of consuming model
 waypoints; it defaults to the server's model rate when omitted. With adaptive RTC,
 startup calibration can reduce it before motion starts, and the online fit can
-reduce it further as history grows. The runtime `execution_hz` status field
-reports the current execution rate. Without adaptive RTC, the requested rate
+reduce it further before or during a request. The runtime `execution_hz` status
+field reports the current execution rate. Without adaptive execution, the requested rate
 stays fixed. `--execution-hz` remains a compatibility alias.
 
 In `metrics.json`, `requested_execution_hz` records this pre-calibration target;
@@ -161,8 +239,10 @@ The client uploads the genuine historical frame indexes required by the current
 window. With `raw-history-refs-v1`, the server acknowledges which historical images
 it has received; later requests refer to those ticks and upload only new history
 images and the fresh current image. The server expands references before calling
-the same model planner. This retains raw observations only: VAE encoding and model
-prefix computation follow the existing inference path on each request.
+the same model planner. Raw observations persist across decisions. VAE encoding
+advances through the current window as observations arrive, while Transformer
+prefix computation remains request-local. The next decision window resets VAE
+state and reencodes its available prefix during ongoing action execution.
 
 Only historical images enter this transport cache. A bootstrap or calibration
 current image must not substitute for a later historical observation with the
@@ -179,19 +259,44 @@ need their message sizes checked against this bound.
 
 The session's runtime timer covers local history packing, RPC encoding, upload,
 server queueing/inference, download, decoding and conversion to CPU actions.
-Startup calibration times the RPC planner as well. `request_timings` additionally
+Startup calibration times the RPC planner in the selected mode as well. `request_timings` additionally
 records the wire round-trip and server inference portions for diagnosis. The
 online latency buffer uses completed request durations on the client, so a
 slow server or network increases the predicted delay and the required slowdown.
+Ordinary and RTC async sessions both retain these samples, even without an
+execution policy. `latency_buffer_size` sets the session buffer capacity (default
+32); reset clears its episode-local samples. Each request freezes its encoded
+history length at submission, and its timer ends when validated actions can be
+published, including any wait to enqueue the next-window hint. Pending elapsed
+time is only a lower bound and is not inserted as a completed sample.
+
+`status()["latency_fit"]` exposes the CPU least-squares fit, prediction, positive
+residual, sample maximum and distinct-history count independently of whether
+automatic slowdown is enabled. `latency_history_basis` is
+`encoded_window_model_seconds`: with `repeat_first`, the model sees the full
+configured P from the first request, so samples at one P correctly use a constant
+prediction. Episode age and slowed playback do not create extra model context.
+At least two genuinely different encoded history lengths are needed to identify
+the slope of `L(T) = a + b*T`; ordinary and RTC timings stay in their own sessions.
+
+The shared policy reserves a budget from the fitted prediction, positive
+residual, recent maximum and configured headroom. Before submission, it limits
+the real waypoint rate to `(R-S-margin_steps) / latency_budget`, capped by the
+current rate. While inference is pending, it uses the remaining steps and
+remaining wall-time budget. The client must acknowledge the slower rate; S16,
+R24, model FPS and the RTC hard prefix of eight actions stay fixed. This is an
+empirical forecast, so a late result still waits at R without delivering an
+expired command.
+
 Image acquisition, client camera preparation and actuator delivery lie outside
 the planner timer; use `--extra-latency-seconds` for deployment headroom and inspect
 actual command/servo lateness.
 
 `--latency-factor`, `--margin-steps` and `--minimum-execution-hz` configure the
-adaptive budget. An unattainable minimum rate, missing acknowledgment or missed
-deadline preserves the current warning/fallback behavior. Ordinary fallback can
-pause command delivery. The client records whether RTC remained active throughout
-the episode; successful inference does not alone imply continuous RTC.
+adaptive budget. An unattainable minimum rate or missing acknowledgment stops
+command delivery. A missed deadline waits at the same R handoff and records the
+lateness. The client records whether RTC remained active throughout the episode;
+successful inference does not alone imply uninterrupted command delivery.
 
 ## Validation scope
 

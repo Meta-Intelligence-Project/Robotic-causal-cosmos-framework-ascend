@@ -21,6 +21,42 @@ class TNDChunk:
     kv_indexes: torch.Tensor
     query_ends: tuple[int, ...]
     kv_ends: tuple[int, ...]
+    query_span: tuple[int, int] | None = None
+    kv_span: tuple[int, int] | None = None
+
+    @classmethod
+    def from_lists(cls, query_indexes, kv_indexes, query_ends, kv_ends, *, device):
+        """Record contiguous selections while indices are still CPU lists.
+
+        Plan indices are immutable after construction. Keeping optional spans
+        avoids inspecting device indices, or synchronizing, in each layer.
+        Direct tensor-based construction retains the gather-only behavior.
+        """
+        return cls(
+            torch.tensor(query_indexes, dtype=torch.long, device=device),
+            torch.tensor(kv_indexes, dtype=torch.long, device=device),
+            tuple(query_ends),
+            tuple(kv_ends),
+            _contiguous_span(query_indexes),
+            _contiguous_span(kv_indexes),
+        )
+
+
+def _contiguous_span(indexes):
+    if not indexes or indexes[0] < 0:
+        return None
+    start = indexes[0]
+    return (start, start + len(indexes)) if all(index == start + i for i, index in enumerate(indexes)) else None
+
+
+def _select_tokens(tensor, indexes, span):
+    # index_select also makes noncontiguous inputs contiguous. Preserve that
+    # contract for native attention instead of passing strided Q/K/V views.
+    if span is not None and tensor.is_contiguous() and 0 <= span[0] <= span[1] <= tensor.shape[0]:
+        if span == (0, tensor.shape[0]):
+            return tensor
+        return tensor[span[0] : span[1]]
+    return tensor.index_select(0, indexes)
 
 
 @dataclass(frozen=True)
@@ -55,14 +91,7 @@ def build_tnd_plan(
 
     def flush():
         if qe:
-            chunks.append(
-                TNDChunk(
-                    torch.tensor(qs, dtype=torch.long, device=device),
-                    torch.tensor(ks, dtype=torch.long, device=device),
-                    tuple(qe),
-                    tuple(ke),
-                )
-            )
+            chunks.append(TNDChunk.from_lists(qs, ks, qe, ke, device=device))
             qs.clear()
             ks.clear()
             qe.clear()
@@ -73,19 +102,20 @@ def build_tnd_plan(
         vision = layout.split_lens[2 * sample + 1] // 2
         clean_start = koffset + und
         sample_blocks = blocks[clean_start : clean_start + vision]
-        starts = [0] + [i for i in range(1, vision) if sample_blocks[i] != sample_blocks[i - 1]] + [vision] # 获取每个block的起始位置
+        starts = (
+            [0] + [i for i in range(1, vision) if sample_blocks[i] != sample_blocks[i - 1]] + [vision]
+        )  # 获取每个block的起始位置
         for stream in (0, 1):
             for block, (start, end) in enumerate(zip(starts[:-1], starts[1:], strict=True)):
                 history_start = starts[max(0, block - history)]
-                group_k = list(range(koffset, clean_start)) # input und k
-                group_k.extend(range(clean_start + history_start, clean_start + start)) # history clean
-                group_k.extend(range(clean_start + stream * vision + start, clean_start + stream * vision + end)) # 当前帧，用stream区分clean/noise
+                group_k = list(range(koffset, clean_start))  # input und k
+                group_k.extend(range(clean_start + history_start, clean_start + start))  # history clean
+                group_k.extend(
+                    range(clean_start + stream * vision + start, clean_start + stream * vision + end)
+                )  # 当前帧，用stream区分clean/noise
                 if len(group_k) > NPU_FUSION_ATTENTION_TND_MAX_TOKENS:
                     raise ValueError("one teacher-forcing KV group exceeds the TND token limit")
-                if qe and (
-                    len(ks) + len(group_k) > max_kv_tokens
-                    or len(qe) == NPU_FUSION_ATTENTION_TND_MAX_SEQUENCES
-                ):
+                if qe and (len(ks) + len(group_k) > max_kv_tokens or len(qe) == NPU_FUSION_ATTENTION_TND_MAX_SEQUENCES):
                     flush()
                 qs.extend(range(qoffset + stream * vision + start, qoffset + stream * vision + end))
                 ks.extend(group_k)
@@ -129,9 +159,9 @@ class _NPUTeacherForcing(torch.autograd.Function):
 
         outputs, statistics, rng = [], [], []
         for chunk in plan.chunks:
-            q = query.index_select(0, chunk.query_indexes)
-            k = key.index_select(0, chunk.kv_indexes)
-            v = value.index_select(0, chunk.kv_indexes)
+            q = _select_tokens(query, chunk.query_indexes, chunk.query_span)
+            k = _select_tokens(key, chunk.kv_indexes, chunk.kv_span)
+            v = _select_tokens(value, chunk.kv_indexes, chunk.kv_span)
             result = torch_npu.npu_fusion_attention(
                 q,
                 k,
@@ -142,6 +172,9 @@ class _NPUTeacherForcing(torch.autograd.Function):
                 scale=scale,
                 keep_prob=1.0,
                 sparse_mode=0,
+                # With no dropout, capture needs no auxiliary mask stream.
+                # The default asynchronous event path cannot join ACLGraph.
+                sync=query.device.type == "npu" and torch.npu.is_current_stream_capturing(),
                 actual_seq_qlen=chunk.query_ends,
                 actual_seq_kvlen=chunk.kv_ends,
             )
@@ -149,7 +182,7 @@ class _NPUTeacherForcing(torch.autograd.Function):
             statistics.extend(result[1:3])
             rng.append(result[4:7])
             del q, k, v, result
-        output = torch.cat(outputs)
+        output = outputs[0] if len(outputs) == 1 else torch.cat(outputs)
         ctx.save_for_backward(query, key, value, output, *statistics)
         ctx.plan, ctx.scale, ctx.rng = plan, scale, rng
         return output
@@ -164,9 +197,9 @@ class _NPUTeacherForcing(torch.autograd.Function):
         offset = 0
         for i, chunk in enumerate(ctx.plan.chunks):
             end = offset + chunk.query_ends[-1]
-            q = query.index_select(0, chunk.query_indexes)
-            k = key.index_select(0, chunk.kv_indexes)
-            v = value.index_select(0, chunk.kv_indexes)
+            q = _select_tokens(query, chunk.query_indexes, chunk.query_span)
+            k = _select_tokens(key, chunk.kv_indexes, chunk.kv_span)
+            v = _select_tokens(value, chunk.kv_indexes, chunk.kv_span)
             seed, rng_offset, numels = ctx.rng[i]
             gradients = torch.ops.npu.npu_fusion_attention_grad.default(
                 q,

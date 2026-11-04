@@ -324,3 +324,123 @@ def test_invalid_cache_policy_fails_before_planning(monkeypatch):
     with pytest.raises(ValueError, match="cache_mode"):
         sampling.sample_prepared(model, **_request(model, cache_mode="unknown"))
     assert not events
+
+
+@pytest.mark.parametrize("requested", [None, False, True])
+def test_npu_graph_default_and_cpu_fallback_preserve_existing_prefix_context_signature(monkeypatch, requested):
+    model = _Model()
+    events = _spy_contexts(monkeypatch, model)
+    request = _request(model)
+    request["guidance"] = 1.0
+    if requested is not None:
+        request["data_batch"]["causal_action_npu_replay_graph"] = requested
+    # The existing spy accepts only net. Default/disabled/fallback paths must
+    # remain compatible with callers that do not implement graph kwargs.
+    result = sampling.sample_prepared(model, **request)
+    assert ("prefix", True) in events
+    assert result["inference_cache"]["full_cache"]
+    assert result["inference_cache"]["npu_replay_graph"] == {
+        "requested": bool(requested),
+        "enabled": False,
+        "fallback_reason": "requires_npu" if requested else None,
+    }
+    assert result["generated_action_mask"][0].tolist() == [False, False, True, True]
+    torch.testing.assert_close(result["vision"][0].flatten()[:3], torch.tensor([100.0, 101.0, 102.0]))
+
+
+@pytest.mark.parametrize(
+    ("requested", "rtc", "full_cache", "guidance", "device_type", "reason"),
+    [
+        (False, None, True, 1.0, "npu", None),
+        (False, object(), False, 3.0, "cpu", None),
+        (True, None, True, 1.0, "npu", None),
+        (True, object(), True, 1.0, "npu", "rtc_input_vjp"),
+        (True, object(), False, 3.0, "cpu", "rtc_input_vjp"),
+        (True, None, False, 1.0, "npu", "requires_full_prefix_cache"),
+        (True, None, True, 1.0, "cpu", "requires_npu"),
+        (True, None, True, 3.0, "npu", "requires_cfg_one"),
+        (True, None, True, 3.0, "cpu", "requires_npu"),
+    ],
+)
+def test_npu_graph_eligibility_and_fallback_priority(requested, rtc, full_cache, guidance, device_type, reason):
+    assert (
+        sampling._npu_graph_fallback_reason(
+            requested=requested,
+            rtc=rtc,
+            full_cache=full_cache,
+            guidance=guidance,
+            device=SimpleNamespace(type=device_type),
+        )
+        == reason
+    )
+
+
+@pytest.mark.parametrize("unsupported", ["off", "plans", "kv_disabled", "preview", "training", "custom_sampler"])
+def test_npu_graph_request_requires_ordinary_full_prefix_cache(monkeypatch, unsupported):
+    preview = unsupported == "preview"
+    model = _Model(preview=preview, training=unsupported == "training")
+    events = _spy_contexts(monkeypatch, model)
+    request = _request(
+        model,
+        cache_mode=unsupported if unsupported in ("off", "plans") else "full",
+        preview=preview,
+        custom_sampler=_Sampler() if unsupported == "custom_sampler" else None,
+        kv=unsupported != "kv_disabled",
+    )
+    request["guidance"] = 1.0
+    request["data_batch"]["causal_action_npu_replay_graph"] = True
+    result = sampling.sample_prepared(model, **request)
+    assert any(event[0] == "legacy" for event in events)
+    assert not result["inference_cache"]["full_cache"]
+    assert result["inference_cache"]["npu_replay_graph"] == {
+        "requested": True,
+        "enabled": False,
+        "fallback_reason": "requires_full_prefix_cache",
+    }
+    assert torch.isfinite(result["action"][0]).all()
+
+
+@pytest.mark.parametrize("guidance", [1.0, 3.0])
+def test_eligible_graph_request_routes_keyword_only_to_ordinary_prefix_context(monkeypatch, guidance):
+    model = _Model()
+    events = _spy_contexts(monkeypatch, model)
+    original_reason = sampling._npu_graph_fallback_reason
+    original_prefix = sampling.action_prefix_cache
+    entered = []
+
+    def npu_eligibility(**kwargs):
+        assert kwargs["device"].type == "cpu"
+        return original_reason(**{**kwargs, "device": SimpleNamespace(type="npu")})
+
+    def prefix(net, **kwargs):
+        entered.append((net, kwargs))
+        return original_prefix(net)
+
+    monkeypatch.setattr(sampling, "_npu_graph_fallback_reason", npu_eligibility)
+    monkeypatch.setattr(sampling, "action_prefix_cache", prefix)
+    request = _request(model)
+    request["guidance"] = guidance
+    request["data_batch"]["causal_action_npu_replay_graph"] = True
+    result = sampling.sample_prepared(model, **request)
+    enabled = guidance == 1.0
+    assert entered == [(model.net, {"npu_replay_graph": True} if enabled else {})]
+    assert ("prefix", True) in events
+    assert result["inference_cache"]["npu_replay_graph"] == {
+        "requested": True,
+        "enabled": enabled,
+        "fallback_reason": None if enabled else "requires_cfg_one",
+    }
+    assert [call["name"] for call in model.calls] == (["cond"] * 2 if enabled else ["cond", "uncond"] * 2)
+
+
+@pytest.mark.parametrize("requested", [None, 0, 1, "true", [], {}, torch.tensor(True)])
+def test_non_bool_npu_graph_request_fails_before_planning_or_sampling(monkeypatch, requested):
+    model = _Model()
+    events = _spy_contexts(monkeypatch, model)
+    request = _request(model)
+    request["data_batch"]["causal_action_npu_replay_graph"] = requested
+    with pytest.raises(TypeError, match="causal_action_npu_replay_graph must be a bool"):
+        sampling.sample_prepared(model, **request)
+    assert not events
+    assert not model.calls
+    assert not model.sampler.calls

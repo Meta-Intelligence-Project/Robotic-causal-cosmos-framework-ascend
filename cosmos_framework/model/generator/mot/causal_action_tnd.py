@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: OpenMDW-1.1
 """Linear-memory TND planner for multimodal causal teacher forcing."""
 
-import torch
-
 from cosmos_framework.model.attention.npu_fusion_attention.functions import (
     NPU_FUSION_ATTENTION_TND_MAX_SEQUENCES as MAX_SEQUENCES,
 )
@@ -25,14 +23,7 @@ def build_action_tnd_plan(layout, *, device, max_kv_tokens=131072):
 
     def flush():
         if qe:
-            chunks.append(
-                TNDChunk(
-                    torch.tensor(qs, dtype=torch.long, device=device),
-                    torch.tensor(ks, dtype=torch.long, device=device),
-                    tuple(qe),
-                    tuple(ke),
-                )
-            )
+            chunks.append(TNDChunk.from_lists(qs, ks, qe, ke, device=device))
             qs.clear()
             ks.clear()
             qe.clear()

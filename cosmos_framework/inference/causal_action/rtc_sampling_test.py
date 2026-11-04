@@ -168,7 +168,8 @@ def test_fixed_step_notifies_actual_sigma():
     assert observed == [0.73, 0.21]
 
 
-def test_frozen_rtc_full_mode_routes_to_gradient_safe_prefix(monkeypatch):
+@pytest.mark.parametrize("request_graph", [False, True])
+def test_frozen_rtc_full_mode_routes_to_gradient_safe_prefix(monkeypatch, request_graph):
     model = _CoupledModel()
     model.net.requires_grad_(False)
     _spy_contexts(monkeypatch, model)
@@ -180,7 +181,9 @@ def test_frozen_rtc_full_mode_routes_to_gradient_safe_prefix(monkeypatch):
         yield {"entries": {}, "key": None, "stats": {"compact_calls": 2}}
 
     monkeypatch.setattr(sampling, "action_rtc_prefix_cache", gradient_cache)
-    result = sampling.sample_prepared(model, **_rtc_request(model))
+    request = _rtc_request(model)
+    request["data_batch"]["causal_action_npu_replay_graph"] = request_graph
+    result = sampling.sample_prepared(model, **request)
     assert entered == [model.net]
     assert result["inference_cache"]["full_cache"]
     assert result["inference_cache"]["gradient_safe_prefix"]
@@ -189,6 +192,11 @@ def test_frozen_rtc_full_mode_routes_to_gradient_safe_prefix(monkeypatch):
     assert result["rtc"]["legacy_value_cache_disabled_for_input_vjp"]
     assert result["rtc"]["cache_fallback_reason"] is None
     assert result["rtc"]["vjp_calls"] == 2
+    assert result["inference_cache"]["npu_replay_graph"] == {
+        "requested": request_graph,
+        "enabled": False,
+        "fallback_reason": "rtc_input_vjp" if request_graph else None,
+    }
 
 
 @pytest.mark.parametrize("mode,kv", [("plans", True), ("off", True), ("full", False)])

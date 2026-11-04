@@ -3,7 +3,9 @@
 
 import copy
 import json
+import sys
 from dataclasses import asdict
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -20,15 +22,19 @@ from cosmos_framework.inference.causal_action.rtc_session import RTCObservation,
 from cosmos_framework.inference.causal_action.serving_model import (
     ServingModelPolicy,
     adapter_from_metadata,
+    load_policy,
     prepare_camera_observation,
 )
+from cosmos_framework.inference.causal_action.window_streaming_test import Tokenizer
 
 
 class Model:
     tensor_kwargs = {"device": "cpu"}
+    tensor_kwargs_fp32 = {"device": "cpu", "dtype": torch.float32}
 
     def __init__(self):
         self.net = torch.nn.Linear(1, 1)
+        self.tokenizer_vision_gen = Tokenizer()
         self.calls = []
 
     def generate_samples_from_batch(self, batch, **options):
@@ -62,7 +68,8 @@ def policy(*, enable_rtc=True, model=None, **kwargs):
             template_id=template.template_id,
         ),
     )
-    kwargs.setdefault("history_padding", "available")
+    if "history_steps" not in kwargs and "history_blocks" not in kwargs:
+        kwargs["history_blocks"] = 1
     return ServingModelPolicy(
         Model() if model is None else model, statistics=stats, adapter=adapter, enable_rtc=enable_rtc, **kwargs
     )
@@ -108,7 +115,11 @@ def test_reset_bootstraps_ordinary_inference_from_a_runtime_only_schema():
     assert result["actions"].dtype == np.float32
     batch, options = service.model.calls[-1]
     metadata = batch["sequence_plan"][0].causal_action_metadata
-    assert options == dict(causal_block_size=2, causal_history_blocks=32, num_steps=10, guidance=1.0, seed=[42])
+    assert options == dict(causal_block_size=2, causal_history_blocks=3, num_steps=10, guidance=1.0, seed=[42])
+    assert service.metadata["streaming_vae"] is True
+    assert service.metadata["npu_replay_graph_requested"] is False
+    assert batch["causal_action_npu_replay_graph"] is False
+    assert "causal_action_precomputed_vision_prefix" in batch
     assert not batch["video"][0][:, 1:].any()
     assert not batch["action"][0].any()
     assert not batch["action_raw"][0].any()
@@ -135,7 +146,7 @@ def test_service_and_local_model_planner_are_identical_for_the_same_measured_inp
         template=service.template,
         horizon=32,
         controller_hz=30,
-        history_blocks=32,
+        history_blocks=service.history_blocks,
         seed=[42],
     )
     state = service.template.sanitize(torch.from_numpy(request["state"]), service.adapter.state_mask)
@@ -155,7 +166,7 @@ def test_service_and_local_model_planner_are_identical_for_the_same_measured_inp
     batch, _ = service.model.calls[-1]
     assert batch["rtc_observation_ticks"].tolist() == list(range(16, 49, 4))
     assert not batch["video"][0][:, 9:].any()
-    assert batch["sequence_plan"][0].causal_action_metadata.anchors[1, 0] == state[0]
+    assert batch["sequence_plan"][0].causal_action_metadata.anchors[0, 0] == state[0]
 
 
 def test_repeated_startup_requests_do_not_append_hidden_history_or_mutate_weights():
@@ -167,8 +178,8 @@ def test_repeated_startup_requests_do_not_append_hidden_history_or_mutate_weight
     two = service.infer(request)["actions"]
     np.testing.assert_array_equal(one, two)
     assert [p._version for p in service.model.net.parameters()] == versions
-    assert service.builder.history_blocks == 32
-    assert all(call[0]["causal_action_current_block"] == 0 for call in service.model.calls)
+    assert service.builder.history_blocks == 1
+    assert all(call[0]["causal_action_current_block"] == 3 for call in service.model.calls)
 
 
 def test_metadata_recreates_exact_native_adapter_without_loading_any_model():
@@ -245,7 +256,125 @@ def test_repeat_first_has_full_history_at_reset_and_keeps_the_true_initial_image
 
 def test_streaming_rejects_legacy_available_padding_before_loading_a_tokenizer():
     with pytest.raises(ValueError, match="streaming_vae requires history_padding=repeat_first"):
-        policy(history_padding="available", streaming_vae=True)
+        policy(model=object(), history_padding="available")
+
+
+def test_serving_rejects_disabling_streaming_before_accessing_the_model():
+    with pytest.raises(ValueError, match="requires streaming_vae=True"):
+        policy(model=object(), streaming_vae=False)
+
+
+@pytest.mark.parametrize("flag", ["--no-streaming-vae", "--no-streaming_vae"])
+def test_cli_rejects_disabling_streaming(flag):
+    from cosmos_framework.inference.causal_action.server import parser
+
+    required = ["--checkpoint", "weights", "--processor", "processor", "--vae", "vae", "--statistics", "stats"]
+    with pytest.raises(SystemExit) as error:
+        parser().parse_args([*required, flag])
+    assert error.value.code == 2
+
+
+@pytest.mark.parametrize("flag", [None, "--streaming-vae", "--streaming_vae"])
+def test_cli_always_enables_streaming_and_keeps_rtc_independent(flag):
+    from cosmos_framework.inference.causal_action.server import parser
+
+    required = ["--checkpoint", "weights", "--processor", "processor", "--vae", "vae", "--statistics", "stats"]
+    arguments = required + ([] if flag is None else [flag])
+    args = parser().parse_args(arguments)
+    assert args.streaming_vae is True
+    assert args.enable_rtc is False
+    assert parser().parse_args([*arguments, "--enable-rtc"]).enable_rtc is True
+
+
+@pytest.mark.parametrize("flag", [None, "--npu-replay-graph", "--npu_replay_graph"])
+def test_npu_graph_cli_is_opt_in_and_can_be_combined_with_rtc(flag):
+    from cosmos_framework.inference.causal_action.server import parser
+
+    required = ["--checkpoint", "weights", "--processor", "processor", "--vae", "vae", "--statistics", "stats"]
+    arguments = required + ([] if flag is None else [flag])
+    args = parser().parse_args(arguments)
+    assert args.npu_replay_graph is (flag is not None)
+    assert args.enable_rtc is False
+    combined = parser().parse_args([*arguments, "--enable-rtc"])
+    assert combined.npu_replay_graph is (flag is not None)
+    assert combined.enable_rtc is True
+
+
+@pytest.mark.parametrize("requested", [False, True])
+def test_npu_graph_request_reaches_ordinary_and_guided_batches_without_disabling_rtc(requested):
+    service = policy(npu_replay_graph=requested, enable_rtc=True)
+    bootstrap = service.infer(reset_request())["actions"]
+    assert service.metadata["npu_replay_graph_requested"] is requested
+    ordinary, _ = service.model.calls[-1]
+    assert ordinary["causal_action_npu_replay_graph"] is requested
+    assert "causal_action_rtc" not in ordinary
+    target = bootstrap[16:]
+    result = service.infer(
+        predict_request(
+            16,
+            history=[dict(tick=t, image=image(t)) for t in range(0, 16, 4)],
+            rtc=dict(previous_actions=target, delay_steps=8, beta=5),
+        )
+    )
+    guided, _ = service.model.calls[-1]
+    assert guided["causal_action_npu_replay_graph"] is requested
+    assert isinstance(guided["causal_action_rtc"], RTCPrefix)
+    assert guided["causal_action_rtc"].delay_steps == 8
+    np.testing.assert_array_equal(result["actions"][:8], target[:8])
+
+
+def test_loader_rejects_disabling_streaming_before_loading_assets():
+    with pytest.raises(ValueError, match="requires streaming_vae=True"):
+        load_policy(SimpleNamespace(streaming_vae=False))
+
+
+@pytest.mark.parametrize("graph_option", [None, False, True])
+def test_loader_omitting_streaming_option_uses_streaming_without_loading_weights(monkeypatch, graph_option):
+    from cosmos_framework.utils import distributed
+
+    fixture = policy()
+    calls = []
+
+    def load_checkpoint(*args, **kwargs):
+        calls.append((args, kwargs))
+        return Model(), None
+
+    monkeypatch.setenv("COSMOS_DEVICE", "cpu")
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    monkeypatch.setenv("WAN_VAE_PATH", "unused")
+    monkeypatch.setattr(distributed, "init", lambda: None)
+    monkeypatch.setattr(BlockStatistics, "load", lambda path: fixture.statistics)
+    monkeypatch.setattr(RobotwinAdapter, "from_statistics", lambda *args: fixture.adapter)
+    monkeypatch.setitem(
+        sys.modules,
+        "cosmos_framework.utils.generator.model_loader",
+        SimpleNamespace(load_model_from_checkpoint=load_checkpoint),
+    )
+    args = SimpleNamespace(
+        vae="vae",
+        statistics="stats",
+        checkpoint="weights",
+        processor="processor",
+        history_steps=32,
+        execute_steps=16,
+        fps=30,
+        resolution="256",
+        steps=10,
+        guidance=1,
+        enable_rtc=False,
+        seed=42,
+    )
+    if graph_option is not None:
+        args.npu_replay_graph = graph_option
+    service = load_policy(args)
+    assert service.metadata["streaming_vae"] is True
+    assert service.window_encoder is not None
+    assert service.enable_rtc is False
+    assert service.npu_replay_graph is (graph_option is True)
+    service.infer(reset_request())
+    assert service.model.calls[-1][0]["causal_action_npu_replay_graph"] is (graph_option is True)
+    assert len(calls) == 1
+    assert calls[0][1]["keys_to_skip_loading"] == ["net_ema."]
 
 
 @pytest.mark.parametrize("past,horizon,duration", [(48, 32, "2s"), (1024, 32, "35s"), (48, 48, "3s")])
@@ -291,15 +420,7 @@ def test_async_schedule_metadata_and_cli_do_not_restrict_direct_rpc_horizon():
 
 
 def test_streaming_prefix_is_prepared_during_observation_delivery_and_passed_to_the_model():
-    from cosmos_framework.inference.causal_action.window_streaming_test import Tokenizer
-
-    service = policy(history_blocks=1, history_padding="repeat_first")
-    service.model.tokenizer_vision_gen = Tokenizer()
-    service.model.tensor_kwargs_fp32 = dict(device="cpu", dtype=torch.float32)
-    from cosmos_framework.inference.causal_action.window_streaming import ObservationWindowEncoder
-
-    service.streaming_vae = True
-    service.window_encoder = ObservationWindowEncoder(service.model, history_blocks=1, history_padding="repeat_first")
+    service = policy()
     service.infer(reset_request())
     service.prepare_window(dict(anchor_tick=16))
     assert service.window_encoder.count == 5

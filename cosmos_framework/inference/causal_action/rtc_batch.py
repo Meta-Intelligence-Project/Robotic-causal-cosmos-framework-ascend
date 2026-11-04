@@ -216,6 +216,7 @@ class RTCObservedBatchBuilder:
         if cache_mode not in ("off", "plans", "full"):
             raise ValueError("reference causal_action_cache_mode must be off, plans or full")
         self._cache_mode = cache_mode
+        self._npu_replay_graph = bool(reference_batch.get("causal_action_npu_replay_graph", False))
 
     def _image(self, image, label):
         if (
@@ -353,6 +354,7 @@ class RTCObservedBatchBuilder:
                 "causal_action_layout": self.layout_mode,
                 "causal_action_mode": ["policy"],
                 "causal_action_cache_mode": self._cache_mode,
+                "causal_action_npu_replay_graph": self._npu_replay_graph,
                 "causal_action_preview": False,
                 "is_preprocessed": False,
                 "rtc_observation_tick": tick,

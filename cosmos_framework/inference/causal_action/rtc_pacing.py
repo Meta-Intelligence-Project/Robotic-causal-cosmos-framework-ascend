@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: OpenMDW-1.1
-"""CPU-only online latency fitting for client-acknowledged RTC slowdown.
+"""CPU-only online latency fitting for ordinary and RTC execution pacing.
 
 History is measured on the checkpoint's action-time grid, not in wall seconds.
 The session supplies its bounded buffer of completed (history, latency) samples.
@@ -20,8 +20,17 @@ def _finite(name, value, *, minimum=0.0, positive=False):
     return value
 
 
-def _fit_latency(samples, history, observed):
-    """Fit the supplied recent samples without retaining values between calls."""
+def fit_latency(history_seconds, *, samples=(), observed_seconds=0.0):
+    """Fit completed ordinary or RTC requests without retaining fit state.
+
+    History is the encoded model context in model seconds, including padding,
+    rather than episode age or execution wall time. With only one distinct
+    history length, use a constant prediction instead of inventing a slope.
+    ``observed_seconds`` may supply a pending request's elapsed lower bound;
+    it does not add a completed sample or change ``maximum_seconds``.
+    """
+    history = _finite("history_seconds", history_seconds)
+    observed = _finite("observed_seconds", observed_seconds)
     points = []
     try:
         records = iter(samples)
@@ -43,6 +52,7 @@ def _fit_latency(samples, history, observed):
         slope_seconds_per_history_second=0.0,
         predicted_seconds=max(maximum, observed),
         residual_seconds=0.0,
+        maximum_seconds=maximum,
     )
     if estimate["distinct_history_count"] > 1:
         # Translate before centering so large time indexes retain small gaps.
@@ -65,7 +75,7 @@ def _fit_latency(samples, history, observed):
                 predicted_seconds=predicted,
                 residual_seconds=residual,
             )
-    return estimate, maximum
+    return estimate
 
 
 @dataclass(frozen=True)
@@ -85,6 +95,7 @@ class RTCExecutionAdvice:
     slope_seconds_per_history_second: float = 0.0
     predicted_seconds: float = 0.0
     residual_seconds: float = 0.0
+    maximum_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -134,7 +145,8 @@ class RTCExecutionPolicy:
             or not 0 < execution_steps < horizon
         ):
             raise ValueError("execution_steps must lie strictly between zero and horizon")
-        estimate, maximum = _fit_latency(samples, history, observed)
+        estimate = fit_latency(history, samples=samples, observed_seconds=observed)
+        maximum = estimate["maximum_seconds"]
         if max(maximum, observed) <= 0:
             return RTCExecutionAdvice(current_hz, None, None, False, history, "no_latency_samples", **estimate)
         budget = (
@@ -158,3 +170,78 @@ class RTCExecutionPolicy:
         if rate < self.minimum_execution_hz:
             return RTCExecutionAdvice(current_hz, budget, None, False, history, "minimum_execution_hz", **estimate)
         return RTCExecutionAdvice(rate, budget, delay, True, history, **estimate)
+
+    def recommend_handoff(
+        self,
+        history_seconds,
+        *,
+        overlap_steps,
+        current_hz,
+        samples=(),
+        observed_seconds=0.0,
+        elapsed_seconds=0.0,
+        remaining_steps=None,
+    ):
+        """Slow execution for a fixed ``D=R-S`` handoff without changing D.
+
+        Before submission, reserve ``margin_steps`` out of D. During a pending
+        request, pass the unconsumed steps to handoff and elapsed wall time.
+        The initial margin is not subtracted again on every controller tick:
+        even the last old command leaves one execution interval before R.
+
+        Elapsed time is only a lower bound on this request's duration. Including
+        it in the empirical latency budget can extend the estimate; it cannot
+        establish that inference will finish before a future deadline. An
+        exhausted estimate is reported explicitly for the caller to handle.
+        A slower rate must be acknowledged by the actuator's execution adapter
+        before the caller installs it. Model FPS and action indexes stay fixed.
+        """
+        history = _finite("history_seconds", history_seconds)
+        current_hz = _finite("current_hz", current_hz, positive=True)
+        observed = _finite("observed_seconds", observed_seconds)
+        elapsed = _finite("elapsed_seconds", elapsed_seconds)
+        if isinstance(overlap_steps, bool) or not isinstance(overlap_steps, Integral) or overlap_steps < 1:
+            raise ValueError("overlap_steps must be a positive integer")
+        overlap = int(overlap_steps)
+        pending = remaining_steps is not None
+        if pending:
+            if (
+                isinstance(remaining_steps, bool)
+                or not isinstance(remaining_steps, Integral)
+                or not 0 <= remaining_steps <= overlap
+            ):
+                raise ValueError("remaining_steps must be an integer between zero and overlap_steps")
+            capacity = int(remaining_steps)
+        else:
+            if elapsed:
+                raise ValueError("elapsed_seconds requires remaining_steps for a pending request")
+            capacity = overlap - self.margin_steps
+
+        observed = max(observed, elapsed)
+        estimate = fit_latency(history, samples=samples, observed_seconds=observed)
+        maximum = estimate["maximum_seconds"]
+        if max(maximum, observed) <= 0:
+            return RTCExecutionAdvice(current_hz, None, overlap, False, history, "no_latency_samples", **estimate)
+        budget = (
+            max(estimate["predicted_seconds"] + estimate["residual_seconds"], maximum, observed) * self.latency_factor
+            + self.extra_latency_seconds
+        )
+        if not math.isfinite(budget) or budget <= 0:
+            raise ValueError("latency budget must be positive and finite")
+        if capacity <= 0:
+            reason = "no_remaining_steps" if pending else "margin_exhausts_prefix"
+            return RTCExecutionAdvice(current_hz, budget, overlap, False, history, reason, **estimate)
+        remaining_seconds = budget - elapsed
+        if remaining_seconds <= 0:
+            return RTCExecutionAdvice(
+                current_hz, budget, overlap, False, history, "latency_estimate_exhausted", **estimate
+            )
+        rate = min(current_hz, capacity / remaining_seconds)
+        if rate <= 0 or rate < self.minimum_execution_hz:
+            return RTCExecutionAdvice(current_hz, budget, overlap, False, history, "minimum_execution_hz", **estimate)
+        # Preserve the deadline inequality at floating-point division boundaries.
+        while remaining_seconds * rate > capacity:
+            rate = math.nextafter(rate, 0.0)
+        if rate <= 0 or rate < self.minimum_execution_hz:
+            return RTCExecutionAdvice(current_hz, budget, overlap, False, history, "minimum_execution_hz", **estimate)
+        return RTCExecutionAdvice(rate, budget, overlap, True, history, **estimate)

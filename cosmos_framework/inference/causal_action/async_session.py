@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: OpenMDW-1.1
-"""Ordinary prediction on a worker, with fixed tick-aligned buffer handoffs."""
+"""Shared ordinary/RTC prediction with fixed tick-aligned buffer handoffs."""
 
 import math
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from threading import RLock, get_ident
+from time import perf_counter
 
 import torch
 
 from cosmos_framework.data.generator.action.action_state_template import ActionStateTemplate55
+from cosmos_framework.inference.causal_action.rtc_pacing import fit_latency
 
 
 class AsyncSessionError(RuntimeError):
@@ -17,7 +19,7 @@ class AsyncSessionError(RuntimeError):
 
 
 class AsyncPlannerError(AsyncSessionError):
-    """Ordinary background planning or observation transport failed."""
+    """Background planning, execution pacing or observation transport failed."""
 
 
 def resolve_async_schedule(H, S, R=None):
@@ -51,20 +53,40 @@ class _Candidate:
     anchor: int
     handoff_tick: int
     inputs: dict
+    history_seconds: float
     future: object = None
     actions: torch.Tensor | None = None
     late: bool = False
+    submitted_at: float = 0.0
+    prefix: torch.Tensor | None = None
 
 
 class AsyncRemoteSession:
     """Execute old commands until R, then use the new plan at offset R-S.
 
-    Planning uses a frozen measurement taken at S and never supplies RTC guidance.
+    Planning uses a frozen measurement taken at S. Optional RTC guides the new
+    solve with the old suffix, committing exactly R-S actions in either mode.
     A result arriving early waits for R. A late result pauses command delivery at
     R without advancing the control tick or replaying an expired command.
     """
 
-    def __init__(self, client, initial_actions, *, execution_hz=None):
+    def __init__(
+        self,
+        client,
+        initial_actions,
+        *,
+        execution_hz=None,
+        enable_rtc=False,
+        beta=5.0,
+        execution_policy=None,
+        execution_rate_callback=None,
+        calibration_warmups=1,
+        calibration_samples=2,
+        calibration_margin_steps=1,
+        latency_buffer_size=32,
+        synchronize=None,
+        clock=None,
+    ):
         self.client, self.template = client, ActionStateTemplate55()
         self._actions = self._validate_actions(initial_actions)
         self.horizon = len(self._actions)
@@ -76,24 +98,62 @@ class AsyncRemoteSession:
         )
         self.controller_hz = _frequency(client.metadata["controller_hz"], "controller_hz")
         self.execution_hz = _frequency(self.controller_hz if execution_hz is None else execution_hz, "execution_hz")
+        if type(enable_rtc) is not bool:
+            raise ValueError("enable_rtc must be a boolean")
+        if isinstance(beta, bool) or not isinstance(beta, (int, float)) or not math.isfinite(beta) or beta < 0:
+            raise ValueError("beta must be nonnegative and finite")
+        self.enable_rtc, self.beta = enable_rtc, float(beta)
+        self.delay_steps = self.handoff_steps - self.steps
+        if execution_policy is not None and not callable(execution_rate_callback):
+            raise ValueError("Adaptive async execution requires execution_rate_callback")
+        if execution_policy is not None and not callable(getattr(execution_policy, "recommend_handoff", None)):
+            raise ValueError("Execution policy must support fixed handoff budgets")
+        for value, name, minimum in (
+            (calibration_warmups, "calibration_warmups", 0),
+            (calibration_samples, "calibration_samples", 1),
+            (calibration_margin_steps, "calibration_margin_steps", 0),
+            (latency_buffer_size, "latency_buffer_size", 1),
+        ):
+            if type(value) is not int or value < minimum:
+                raise ValueError(f"{name} must be an integer >= {minimum}")
+        if synchronize is not None and not callable(synchronize):
+            raise ValueError("synchronize must be callable")
+        if clock is not None and not callable(clock):
+            raise ValueError("clock must be callable")
+        self.execution_policy = execution_policy
+        self._execution_rate_callback = execution_rate_callback
+        self._calibration_options = dict(
+            warmups=calibration_warmups,
+            samples=calibration_samples,
+            margin_steps=calibration_margin_steps,
+            synchronize=synchronize,
+        )
+        self._clock = perf_counter if clock is None else clock
         history_steps = client.metadata.get("history_steps")
         if history_steps is None:
             history_steps = client.metadata.get("history_blocks", 32) * 32
         if type(history_steps) is not int or history_steps < 0:
             raise ValueError("history_steps must be a nonnegative integer")
+        self.history_steps = history_steps
         for method in ("plan", "observe", "prepare_window"):
             if not callable(getattr(client, method, None)):
                 raise ValueError(f"Async client requires {method}")
         self._history = deque(maxlen=max(1, history_steps))
-        self._lock, self._callback_lock = RLock(), RLock()
+        self._lock, self._callback_lock, self._prepare_lock = RLock(), RLock(), RLock()
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cosmos-async-policy")
         self._worker_thread = None
+        self._rate_callback_thread = None
         self._pending = self._future = self._consumer = None
         self._tick = self._origin = self._revision = 0
         self._requests = self._published = self._late_handoffs = 0
         self._closed = self._resetting = self._prepared = self._waiting = False
         self._error = self._action_mask = self._state_mask = self._last_hint = None
         self._last_request = None
+        # Both ordinary and guided requests retain completed measurements,
+        # including when no execution-rate callback/policy is installed.
+        self._latency_samples = deque(maxlen=latency_buffer_size)
+        self._calibration = self._execution_advice = None
+        self._execution_rate_changes = 0
 
     def _validate_actions(self, actions):
         if (
@@ -178,26 +238,160 @@ class AsyncRemoteSession:
         elif not torch.equal(am, self._action_mask) or not torch.equal(sm, self._state_mask):
             raise ValueError("Robot validity masks cannot change within an async episode; reset first")
 
-    def prepare(self, **measurement):
-        values = self._measurement(**measurement) if measurement else None
+    def prepare(self, *, _expected_revision=None, **measurement):
+        if get_ident() == self._rate_callback_thread:
+            raise AsyncSessionError("Cannot prepare during execution-rate acknowledgement")
         with self._lock:
             self._check()
+            # Calibration waits while holding _prepare_lock. Reject a worker
+            # callback before it can wait for that lock and deadlock its caller.
             if get_ident() == self._worker_thread:
                 raise AsyncSessionError("Cannot prepare from the planning worker")
-            if values is not None:
-                self._accept_masks(values[1], values[3])
-            if self._prepared:
+            expected_revision = self._revision if _expected_revision is None else _expected_revision
+        with self._prepare_lock:
+            with self._lock:
+                self._check()
+                if expected_revision != self._revision:
+                    raise AsyncSessionError("Episode changed before preparing async execution")
+            values = self._measurement(**measurement) if measurement else None
+            with self._lock:
+                self._check()
+                if expected_revision != self._revision:
+                    raise AsyncSessionError("Episode changed while preparing the async measurement")
+                if values is not None:
+                    self._accept_masks(values[1], values[3])
+                if self._prepared:
+                    return self.status()
+                revision, anchor = self._revision, self._origin + self.steps
+                if self.execution_policy is not None:
+                    if values is None:
+                        raise ValueError("Adaptive async preparation needs a real current measurement")
+                    self._future = future = self._executor.submit(self._calibrate, revision, values)
+                else:
+                    future = None
+            if future is not None:
+                future.result()
+                self._update_pacing(revision)
+            self._notify("prepare_window", revision, anchor_tick=anchor)
+            with self._lock:
+                self._check()
+                if revision != self._revision:
+                    raise AsyncSessionError("Episode changed while preparing async execution")
+                self._prepared = True
                 return self.status()
-            revision, anchor = self._revision, self._origin + self.steps
-        self._notify("prepare_window", revision, anchor_tick=anchor)
+
+    def _history_seconds(self):
+        # repeat_first pads from the first request to the full encoded window.
+        # Episode age and real playback Hz do not change model input length.
+        return self.history_steps / self.controller_hz
+
+    def _rtc_prefix(self, actions):
+        if not self.enable_rtc:
+            return None
+        from cosmos_framework.inference.causal_action.rtc import RTCPrefix
+
+        return RTCPrefix(actions.clone(), self.delay_steps, self.beta)
+
+    def _calibrate(self, revision, values):
+        from cosmos_framework.inference.causal_action.rtc_calibration import measure_rtc_latency
+
+        state, sm, image, am = values
         with self._lock:
-            self._check()
-            if revision != self._revision:
-                raise AsyncSessionError("Episode changed while preparing async execution")
-            self._prepared = True
-            return self.status()
+            self._worker_thread = get_ident()
+            prefix = self._actions[: self.horizon - self.steps].clone()
+            history_seconds = self._history_seconds()
+
+        def run():
+            with self._lock:
+                if not self._live(revision):
+                    raise AsyncSessionError("Episode changed during startup calibration")
+            actions = self.client.plan(
+                state=state.clone(),
+                state_mask=sm.clone(),
+                image=image.clone(),
+                action_mask=am.clone(),
+                history=(),
+                tick=0,
+                revision=revision,
+                rtc=self._rtc_prefix(prefix),
+            )
+            if len(self._validate_actions(actions)) != self.horizon:
+                raise ValueError("Calibration planner must preserve the prediction horizon")
+
+        try:
+            measured = measure_rtc_latency(
+                run, controller_hz=self.execution_hz, clock=self._clock, **self._calibration_options
+            )
+            with self._lock:
+                if not self._live(revision):
+                    raise AsyncSessionError("Episode changed during startup calibration")
+                measured["measured_delay_steps"] = measured["delay_steps"]
+                measured["delay_steps"] = self.delay_steps
+                self._calibration = measured
+                for seconds in measured["sample_seconds"]:
+                    self._latency_samples.append((history_seconds, seconds))
+        except Exception as exc:
+            raise self._fail(exc, revision) from exc
+
+    def _update_pacing(self, revision):
+        if self.execution_policy is None:
+            return
+        # 与reset/close使用同一锁序；执行端回调期间不持session锁。
+        with self._callback_lock:
+            with self._lock:
+                self._check()
+                if not self._live(revision):
+                    raise AsyncSessionError("Episode changed while updating execution pacing")
+                offset = self._tick - self._origin
+                if offset >= self.handoff_steps:
+                    return  # 最后兜底仍在相同R等待，不关闭RTC或重放命令。
+                candidate = self._pending
+                if candidate is not None and candidate.actions is not None:
+                    return
+                elapsed, remaining = 0.0, None
+                if candidate is not None:
+                    elapsed = self._clock() - candidate.submitted_at
+                    if not math.isfinite(elapsed) or elapsed < 0:
+                        raise AsyncSessionError("Execution clock must advance monotonically")
+                    remaining = candidate.handoff_tick - self._tick
+                advice = self.execution_policy.recommend_handoff(
+                    self._history_seconds() if candidate is None else candidate.history_seconds,
+                    overlap_steps=self.delay_steps,
+                    current_hz=self.execution_hz,
+                    samples=tuple(self._latency_samples),
+                    elapsed_seconds=elapsed,
+                    remaining_steps=remaining,
+                )
+                self._execution_advice = asdict(advice)
+                if not advice.feasible:
+                    if candidate is not None and advice.reason == "latency_estimate_exhausted":
+                        return  # 无法推断剩余时长；明确记录预算失效，保留R处等待。
+                    error = AsyncSessionError(f"Adaptive async execution budget is infeasible: {advice.reason}")
+                    self._error = error
+                    raise error
+                rate = advice.recommended_hz
+                if rate >= self.execution_hz:
+                    return
+                self._rate_callback_thread = get_ident()
+            try:
+                acknowledged = self._execution_rate_callback(rate)
+                if acknowledged is not True:
+                    raise AsyncSessionError("Execution-rate slowdown was not acknowledged by the client")
+            except Exception as exc:
+                error = self._fail(exc, revision)
+                raise error from exc
+            finally:
+                with self._lock:
+                    self._rate_callback_thread = None
+            with self._lock:
+                self._check()
+                if not self._live(revision):
+                    raise AsyncSessionError("Episode changed during execution-rate acknowledgement")
+                self.execution_hz = rate
+                self._execution_rate_changes += 1
 
     def _submit(self, state, sm, image, am):
+        prefix = self._actions[self._tick - self._origin :].clone()
         inputs = dict(
             state=state,
             state_mask=sm,
@@ -206,12 +400,27 @@ class AsyncRemoteSession:
             history=tuple(self._history),
             tick=self._tick,
             revision=self._revision,
-            rtc=None,
+            rtc=self._rtc_prefix(prefix),
         )
-        candidate = _Candidate(self._revision, self._tick, self._origin + self.handoff_steps, inputs)
+        candidate = _Candidate(
+            self._revision,
+            self._tick,
+            self._origin + self.handoff_steps,
+            inputs,
+            history_seconds=self._history_seconds(),
+            submitted_at=self._clock(),
+            prefix=prefix if self.enable_rtc else None,
+        )
         self._pending = candidate
         self._requests += 1
-        self._last_request = dict(tick=candidate.anchor, handoff_tick=candidate.handoff_tick, accepted=False)
+        self._last_request = dict(
+            tick=candidate.anchor,
+            observation_tick=candidate.anchor,
+            handoff_tick=candidate.handoff_tick,
+            estimated_delay_steps=self.delay_steps,
+            history_seconds=candidate.history_seconds,
+            accepted=False,
+        )
         candidate.future = self._future = self._executor.submit(self._run_candidate, candidate)
 
     def _run_candidate(self, candidate):
@@ -226,12 +435,22 @@ class AsyncRemoteSession:
             mask = candidate.inputs["action_mask"]
             self.template.sanitize(actions, mask)
             actions = actions.masked_fill(~mask, 0)
+            if candidate.prefix is not None:
+                # 与实际执行相同的硬保留前缀；soft区仍使用新推理结果。
+                actions[: self.delay_steps] = candidate.prefix[: self.delay_steps]
             # 推理一结束就提示下个anchor；提前量来自旧动作仍在执行，不必等R交接。
             if not self._notify("prepare_window", candidate.revision, anchor_tick=candidate.anchor + self.steps):
                 return
             with self._lock:
                 if self._live(candidate.revision) and self._pending is candidate:
+                    # Count queue/RPC/validation and next-window hint waits up
+                    # to the point where the controller can use this result.
+                    elapsed = self._clock() - candidate.submitted_at
+                    if not math.isfinite(elapsed) or elapsed < 0:
+                        raise ValueError("Execution clock must advance monotonically")
                     candidate.actions = actions
+                    self._latency_samples.append((candidate.history_seconds, elapsed))
+                    self._last_request.update(elapsed_seconds=elapsed, actual_delay_steps=self._tick - candidate.anchor)
         except Exception as exc:
             error = self._fail(exc, candidate.revision)
             if error is exc:
@@ -239,12 +458,25 @@ class AsyncRemoteSession:
             raise error from exc
 
     def get_action(self, *, state, state_mask, image, action_mask):
-        self.prepare()
+        # Reset may run while observations are being copied or preparation is
+        # waiting. An old caller must never consume the new episode's tick 0.
+        with self._lock:
+            self._check()
+            expected_revision = self._revision
+        self.prepare(
+            _expected_revision=expected_revision,
+            state=state,
+            state_mask=state_mask,
+            image=image,
+            action_mask=action_mask,
+        )
         values = self._measurement(state=state, state_mask=state_mask, image=image, action_mask=action_mask)
         state, sm, image, am = values
         consumer = object()
         with self._lock:
             self._check()
+            if expected_revision != self._revision:
+                raise AsyncSessionError("Episode changed while preparing the async command")
             if self._consumer is not None:
                 raise AsyncSessionError("Concurrent command requests are not supported")
             self._accept_masks(sm, am)
@@ -253,6 +485,7 @@ class AsyncRemoteSession:
         try:
             self._notify("observe", revision, tick=tick, image=image)
             while True:
+                self._update_pacing(revision)
                 with self._lock:
                     self._check()
                     if revision != self._revision or tick != self._tick:
@@ -267,6 +500,7 @@ class AsyncRemoteSession:
                             self._pending = None
                             self._published += 1
                             self._last_request["accepted"] = True
+                            self._last_request["publish_tick"] = tick
                             self._waiting = False
                             # R=2S时，新buffer的offset正好为S；必须继续循环再提交。
                             continue
@@ -304,8 +538,8 @@ class AsyncRemoteSession:
                 controller_hz=self.controller_hz,
                 execution_hz=self.execution_hz,
                 playback_speed=self.execution_hz / self.controller_hz,
-                rtc_enabled=False,
-                execution_mode="async_non_rtc",
+                rtc_enabled=self.enable_rtc,
+                execution_mode="async_rtc" if self.enable_rtc else "async_non_rtc",
                 prepared=self._prepared,
                 closed=self._closed,
                 resetting=self._resetting,
@@ -317,15 +551,25 @@ class AsyncRemoteSession:
                 waiting_for_handoff=self._waiting,
                 late_handoffs=self._late_handoffs,
                 revision=self._revision,
-                adaptive_execution=False,
+                adaptive_execution=self.execution_policy is not None,
+                estimated_delay_steps=self.delay_steps,
+                execution_rate_changes=self._execution_rate_changes,
+                execution_advice=None if self._execution_advice is None else dict(self._execution_advice),
+                calibration=None if self._calibration is None else dict(self._calibration),
+                latency_buffer_capacity=self._latency_samples.maxlen,
+                latency_history_basis="encoded_window_model_seconds",
+                latency_fit=fit_latency(self._history_seconds(), samples=tuple(self._latency_samples)),
+                latency_samples=[
+                    dict(history_seconds=history, elapsed_seconds=seconds) for history, seconds in self._latency_samples
+                ],
                 last_request=None if self._last_request is None else dict(self._last_request),
             )
 
     def join(self, timeout=None):
         """Wait for the current worker without publishing before its fixed R tick."""
         with self._lock:
-            if get_ident() == self._worker_thread:
-                raise AsyncSessionError("Cannot join from the planning worker")
+            if get_ident() in (self._worker_thread, self._rate_callback_thread):
+                raise AsyncSessionError("Cannot join from the planning worker or execution-rate callback")
             future = self._future
         if future is not None:
             future.result(timeout=timeout)
@@ -336,6 +580,8 @@ class AsyncRemoteSession:
     wait_for_inference = join
 
     def reset(self, initial_actions):
+        if get_ident() == self._rate_callback_thread:
+            raise AsyncSessionError("Cannot reset during execution-rate acknowledgement")
         actions = self._validate_actions(initial_actions)
         if len(actions) != self.horizon:
             raise ValueError("Reset must preserve the prediction horizon")
@@ -357,12 +603,17 @@ class AsyncRemoteSession:
                 self._tick = self._origin = self._requests = self._published = self._late_handoffs = 0
                 self._error = self._action_mask = self._state_mask = self._last_hint = self._last_request = None
                 self._prepared = self._waiting = False
+                self._latency_samples.clear()
+                self._calibration = self._execution_advice = None
+                self._execution_rate_changes = 0
                 self._history.clear()
         finally:
             with self._lock:
                 self._resetting = False
 
     def close(self, *, wait=True):
+        if get_ident() == self._rate_callback_thread:
+            raise AsyncSessionError("Cannot close during execution-rate acknowledgement")
         with self._callback_lock:
             with self._lock:
                 if get_ident() == self._worker_thread:

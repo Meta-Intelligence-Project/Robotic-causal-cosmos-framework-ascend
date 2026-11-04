@@ -65,21 +65,14 @@ def current_block_plan(layout, plan, block_index):
                 ke.append(len(ks))
             q0, k0 = q1, k1
         if qs:
-            chunks.append(
-                TNDChunk(
-                    torch.tensor(qs, device=device, dtype=torch.long),
-                    torch.tensor(ks, device=device, dtype=torch.long),
-                    tuple(qe),
-                    tuple(ke),
-                )
-            )
+            chunks.append(TNDChunk.from_lists(qs, ks, qe, ke, device=device))
     target = torch.tensor(selected, device=device, dtype=torch.long)
     packed = layout.gen_query_indexes[target]
     return target, packed, TNDPlan(tuple(chunks), len(selected), plan.num_keys)
 
 
 @contextmanager
-def action_prefix_cache(net):
+def action_prefix_cache(net, *, npu_replay_graph=False):
     """Temporarily install compact inference on one model, isolated by block/CFG key.
 
     The model must not be used concurrently during this context, like the legacy
@@ -96,6 +89,14 @@ def action_prefix_cache(net):
     if getattr(language_model.model.config, "num_experts", 0):
         raise ValueError("Prefix caching currently supports dense language models only")
     layers = language_model.model.layers
+    replay_graph = None
+    if npu_replay_graph:
+        from .npu_replay_graph import NPUReplayGraphCache
+
+        replay_graph = getattr(net, "_causal_action_npu_replay_graph", None)
+        if replay_graph is None:
+            replay_graph = NPUReplayGraphCache(net)
+            net._causal_action_npu_replay_graph = replay_graph
     controller = {"key": None, "entries": {}, "stats": {"prefill_calls": 0, "replay_calls": 0, "active_tokens": {}}}
     original_forward = language_model.forward
     original_dispatch = [(layer.self_attn, layer.self_attn.dispatch_attention_fn) for layer in layers]
@@ -167,9 +168,12 @@ def action_prefix_cache(net):
         active = get_gen_seq(pack).index_select(0, entry.gen_indexes)
         compact = from_mode_splits(active.new_empty((0, active.shape[-1])), active, entry.compact_metadata)
         positions = position_ids.index_select(-1, entry.packed_indexes)
-        output, _ = original_forward(
-            compact, attention_mask=attention_mask, position_ids=positions, natten_metadata_list=None, memory=None
-        )
+        if replay_graph is None:
+            output, _ = original_forward(
+                compact, attention_mask=attention_mask, position_ids=positions, natten_metadata_list=None, memory=None
+            )
+        else:
+            output, _ = replay_graph.run(original_forward, compact, attention_mask, positions, entry, cache_key)
         # Restore the full head layout. Inactive predictions are discarded by the
         # sampler; only fixed streams and current noisy predictions are reused.
         full_output, metadata = entry.output
@@ -183,6 +187,8 @@ def action_prefix_cache(net):
             attention.dispatch_attention_fn = wrap_dispatch(original, index)
         yield controller
     finally:
+        if replay_graph is not None:
+            controller["stats"]["npu_replay_graph_stats"] = dict(replay_graph.stats)
         language_model.forward = original_forward
         for attention, original in original_dispatch:
             attention.dispatch_attention_fn = original

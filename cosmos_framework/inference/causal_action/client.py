@@ -413,81 +413,71 @@ class CausalPolicyClient:
         execution_hz=None,
         execution_policy=None,
         execution_rate_callback=None,
-        adaptive_execution=True,
+        adaptive_execution=None,
         **session_options,
     ):
         """Return a bootstrapped local session; prepare before enabling motion."""
-        from cosmos_framework.data.generator.action.action_state_template import ActionStateTemplate55
         from cosmos_framework.inference.causal_action.rtc_pacing import RTCExecutionPolicy
-        from cosmos_framework.inference.causal_action.rtc_session import RTCSession
 
         if execution_mode not in ("auto", "blocking", "async"):
             raise ValueError("execution_mode must be auto, blocking or async")
         simulation_sync = self.metadata.get("simulation_sync", False)
         if simulation_sync and (enable_rtc or execution_mode == "async"):
             raise ValueError("Synchronous simulation requires blocking execution without RTC")
-        if enable_rtc and execution_mode != "auto":
-            raise ValueError("Explicit blocking/async execution_mode conflicts with enable_rtc")
+        if enable_rtc and execution_mode == "blocking":
+            raise ValueError("Blocking execution_mode conflicts with enable_rtc")
         if enable_rtc and not self.metadata.get("rtc_enabled", False):
             raise ValueError("Enable RTC on the server before creating an RTC client session")
-        if enable_rtc and not adaptive_execution and execution_policy is not None:
+        if adaptive_execution is not None and type(adaptive_execution) is not bool:
+            raise ValueError("adaptive_execution must be a boolean or None")
+        if adaptive_execution is False and execution_policy is not None:
             raise ValueError("execution_policy conflicts with adaptive_execution=False")
-        if enable_rtc and adaptive_execution and execution_policy is None:
-            execution_policy = RTCExecutionPolicy()
-        if enable_rtc and execution_policy is not None and not callable(execution_rate_callback):
-            raise ValueError("Adaptive RTC needs a client execution_rate_callback")
-        # RTC优先；无RTC时streaming默认走异步执行，旧服务仍保留blocking基线。
+        adaptive = (
+            callable(execution_rate_callback) or execution_policy is not None
+            if adaptive_execution is None
+            else adaptive_execution
+        )
+        if adaptive and not callable(execution_rate_callback):
+            raise ValueError("Adaptive async execution needs a client execution_rate_callback")
+        # RTC仅添加引导；两种模式共用S/R调度，旧服务保留显式blocking基线。
         selected_mode = execution_mode
         if selected_mode == "auto":
             selected_mode = (
                 "async"
-                if not simulation_sync and not enable_rtc and self.metadata.get("streaming_vae", False)
+                if not simulation_sync and (enable_rtc or self.metadata.get("streaming_vae", False))
                 else "blocking"
             )
-        if not enable_rtc and session_options:
-            raise ValueError("RTC session options require enable_rtc")
-        if not enable_rtc and selected_mode == "async":
+        if selected_mode == "async":
             from cosmos_framework.inference.causal_action.async_session import (
                 AsyncRemoteSession,
                 resolve_async_schedule,
             )
 
-            # 只在选择异步执行时要求S<R<=H；direct RPC和RTC允许S=H。
+            # 只有实际选择异步调度时才校验S/R；direct RPC仍允许S=H。
             resolve_async_schedule(
                 self.metadata.get("action_horizon", self.metadata["actions_per_block"]),
                 self.metadata["execute_steps"],
                 self.metadata.get("handoff_steps"),
             )
+            if adaptive and execution_policy is None:
+                execution_policy = RTCExecutionPolicy()
+        elif session_options:
+            raise ValueError("Async session options require asynchronous execution")
         initial = self._actions(self.reset(prompt=prompt, measurement=first_measurement))
         frequency = self.metadata["controller_hz"]
         rate = frequency if execution_hz is None else execution_hz
-        if not enable_rtc:
-            session_type = AsyncRemoteSession if selected_mode == "async" else BlockingRemoteSession
-            session = session_type(self, initial, execution_hz=rate)
-        else:
-            session = RTCSession(
-                self.plan,
+        if selected_mode == "async":
+            session = AsyncRemoteSession(
+                self,
                 initial,
-                template=ActionStateTemplate55(),
-                controller_hz=frequency,
                 execution_hz=rate,
-                min_execution_steps=self.metadata["execute_steps"],
-                initial_delay_steps=None,
-                history_steps=max(1, self.metadata.get("history_steps", self.metadata["history_blocks"] * 32)),
-                ordinary_planner=self.plan,
-                execution_policy=execution_policy,
+                enable_rtc=enable_rtc,
+                execution_policy=execution_policy if adaptive else None,
                 execution_rate_callback=execution_rate_callback,
-                on_observation=self.observe if self._transport_active else None,
-                on_prepare_window=self.prepare_window if self._transport_active else None,
-                fixed_history_blocks=self.metadata["history_blocks"]
-                if self.metadata.get("history_padding") == "repeat_first"
-                and self.metadata.get("layout_mode") != "decision_window"
-                else None,
-                fixed_history_steps=self.metadata["history_steps"]
-                if self.metadata.get("layout_mode") == "decision_window"
-                else None,
                 **session_options,
             )
+        else:
+            session = BlockingRemoteSession(self, initial, execution_hz=rate)
         self._session = session
         return session
 

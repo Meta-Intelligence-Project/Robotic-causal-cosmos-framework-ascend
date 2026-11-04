@@ -94,11 +94,12 @@ def command(tick):
 
 
 class FakeSession:
-    def __init__(self, env, options, *, change_at=None, slow_to=None, prepare_seconds=0.0):
+    def __init__(self, env, options, *, change_at=None, slow_to=None, prepare_seconds=0.0, prepare_rate=None):
         self.env, self.options = env, options
         self.controller_hz = 30.0
         self.execution_hz = options["execution_hz"]
         self.change_at, self.slow_to, self.prepare_seconds = change_at, slow_to, prepare_seconds
+        self.prepare_rate = prepare_rate
         self.tick, self.closed, self.prepared = 0, False, False
         self.observations = []
 
@@ -106,15 +107,20 @@ class FakeSession:
         assert not self.env.executed
         assert "image_size" not in measurement
         self.env.clock.now += self.prepare_seconds
+        if self.prepare_rate is not None:
+            assert self.options["execution_rate_callback"](self.prepare_rate) is True
+            self.execution_hz = self.prepare_rate
         self.prepared = True
         return self.status()
 
     def status(self):
         enabled = self.options["enable_rtc"]
+        asynchronous = self.options["execution_mode"] != "blocking"
         return dict(
             tick=self.tick,
             rtc_enabled=enabled,
-            execution_mode="rtc" if enabled else "blocking_non_rtc",
+            execution_mode=("async_rtc" if enabled else "async_non_rtc") if asynchronous else "blocking_non_rtc",
+            adaptive_execution=bool(asynchronous and self.options["adaptive_execution"]),
             inference_pending=False,
             error=None,
             published_requests=0,
@@ -183,6 +189,88 @@ def test_bootstrap_and_calibration_keep_environment_stationary_then_interpolate_
     assert np.load(tmp_path / "waypoints_unified.npy").shape == (3, 55)
 
 
+@pytest.mark.parametrize("enable_rtc", [False, True])
+def test_changing_live_camera_reuses_bootstrap_tick_zero_then_streams_fresh_measurements(enable_rtc):
+    from cosmos_framework.inference.causal_action.serving_model_test import policy
+
+    class ChangingCameraEnv(FakeEnv):
+        def __init__(self, clock):
+            super().__init__(clock)
+            self.captures = 0
+
+        def get_obs(self):
+            observation = super().get_obs()
+            self.captures += 1
+            self.buffer.fill(self.captures)
+            return observation
+
+    env = ChangingCameraEnv(FakeClock())
+    service = policy(history_steps=32, enable_rtc=enable_rtc)
+
+    class StreamingClient(FakeClient):
+        def __init__(self):
+            super().__init__(env)
+            self.metadata = service.metadata
+            self.observations = []
+
+        def create_session(self, first_measurement, *, prompt, **options):
+            bootstrap = service.infer(
+                dict(
+                    operation="reset",
+                    state=first_measurement["state"],
+                    image=first_measurement["image"],
+                    image_size=first_measurement["image_size"],
+                    prompt=prompt,
+                    tick=0,
+                    revision=0,
+                )
+            )
+            self.session = AsyncRemoteSession(
+                self,
+                torch.from_numpy(bootstrap["actions"]),
+                execution_hz=options["execution_hz"],
+                enable_rtc=enable_rtc,
+            )
+            return self.session
+
+        def observe(self, **request):
+            service.observe(request)
+            self.observations.append((request["tick"], request["image"].clone()))
+
+        def prepare_window(self, **request):
+            service.prepare_window(request)
+
+        def plan(self, **request):
+            pytest.fail("This three-waypoint regression must not reach the planning trigger")
+
+    client = StreamingClient()
+    try:
+        result = runner.rollout(
+            env,
+            client,
+            enable_rtc=enable_rtc,
+            adaptive_execution=False,
+            execution_hz=2,
+            servo_hz=4,
+            max_waypoints=3,
+            adapter=service.adapter,
+            prepare_image=prepare_image,
+            clock=env.clock,
+            sleep=env.clock.sleep,
+        )
+        assert result["executed_waypoints"] == env.captures == 3
+        assert [tick for tick, _ in client.observations] == [0, 1, 2]
+        assert [int(image[0, 0, 0]) for _, image in client.observations] == [1, 2, 3]
+        assert int(service.first_image[0, 0, 0]) == 1
+        assert client.session.status()["closed"]
+        # The actual serving policy must still reject any conflicting tick-zero
+        # image; the runner fixes capture ownership instead of weakening history.
+        with pytest.raises(ValueError, match="cannot be overwritten"):
+            service.observe(dict(tick=0, image=torch.zeros_like(service.first_image)))
+    finally:
+        service.clear()
+
+
 @pytest.mark.parametrize("execution_mode", ["auto", "async", "blocking"])
 def test_rollout_passes_execution_mode_to_the_session_factory(execution_mode):
     env = FakeEnv(FakeClock())
@@ -190,23 +278,31 @@ def test_rollout_passes_execution_mode_to_the_session_factory(execution_mode):
     result = run(env, client, execution_mode=execution_mode, max_waypoints=1)
     assert client.session.options["execution_mode"] == execution_mode
     assert client.session.options["enable_rtc"] is False
-    assert result["execution_mode"] == result["final_status"]["execution_mode"] == "blocking_non_rtc"
+    expected_mode = "blocking_non_rtc" if execution_mode == "blocking" else "async_non_rtc"
+    assert result["execution_mode"] == result["final_status"]["execution_mode"] == expected_mode
+    assert result["adaptive_execution"] is (execution_mode != "blocking")
 
 
-def test_ordinary_async_planning_keeps_servo_execution_running_without_rtc():
+@pytest.mark.parametrize("enable_rtc", [False, True])
+def test_shared_async_planning_keeps_servo_execution_running_and_hands_off_at_24(enable_rtc):
     env = FakeEnv(FakeClock())
     started, release = Event(), Event()
 
     class AsyncClient(FakeClient):
         def __init__(self, env):
             super().__init__(env)
-            self.metadata.update(action_horizon=32, execute_steps=16, handoff_steps=24, history_steps=1024)
+            self.metadata.update(
+                action_horizon=32, execute_steps=16, handoff_steps=24, history_steps=1024, rtc_enabled=True
+            )
             self.requests, self.hints = [], []
 
         def create_session(self, first_measurement, *, prompt, **options):
-            assert options["execution_mode"] == "async" and not options["enable_rtc"]
+            assert options["execution_mode"] == "async" and options["enable_rtc"] is enable_rtc
             self.session = AsyncRemoteSession(
-                self, torch.stack([command(i) for i in range(32)]), execution_hz=options["execution_hz"]
+                self,
+                torch.stack([command(i) for i in range(32)]),
+                execution_hz=options["execution_hz"],
+                enable_rtc=enable_rtc,
             )
             return self.session
 
@@ -215,7 +311,9 @@ def test_ordinary_async_planning_keeps_servo_execution_running_without_rtc():
             started.set()
             if not release.wait(5):
                 raise TimeoutError("Test did not release ordinary background prediction")
-            return torch.stack([command(request["tick"] + i) for i in range(32)])
+            predicted = torch.stack([command(request["tick"] + i) for i in range(32)])
+            predicted[:, 0] += 100
+            return predicted
 
         def observe(self, **measurement):
             pass
@@ -236,16 +334,26 @@ def test_ordinary_async_planning_keeps_servo_execution_running_without_rtc():
 
     env.after_action = progress
     try:
-        result = run(env, client, execution_mode="async", max_waypoints=27)
-        assert result["execution_mode"] == "async_non_rtc"
-        assert not result["continuous_rtc"] and not result["adaptive_execution"]
+        result = run(env, client, execution_mode="async", enable_rtc=enable_rtc, max_waypoints=27)
+        assert result["execution_mode"] == ("async_rtc" if enable_rtc else "async_non_rtc")
+        assert result["continuous_rtc"] is enable_rtc
+        # This direct session fixture supplies no rate policy, even though the runner requested adaptation.
+        assert not result["adaptive_execution"]
         assert result["executed_waypoints"] == 27 and result["servo_commands"] == 54
         assert pending_commands[:3] == [33, 34, 35]
         assert result["final_status"]["published_requests"] == 1
         assert [request["tick"] for request in client.requests] == [16]
-        assert client.requests[0]["rtc"] is None
+        prefix = client.requests[0]["rtc"]
+        if enable_rtc:
+            assert prefix.delay_steps == 8
+            assert prefix.previous_actions.shape == (16, 55)
+            torch.testing.assert_close(prefix.previous_actions[:, 0], torch.arange(17, 33, dtype=torch.float32))
+        else:
+            assert prefix is None
         assert client.hints == [16, 32]
-        np.testing.assert_allclose([row[1][0] for row in env.executed[1::2]], np.arange(1, 28))
+        np.testing.assert_allclose(
+            [row[1][0] for row in env.executed[1::2]], np.concatenate([np.arange(1, 25), np.arange(125, 128)])
+        )
     finally:
         release.set()
 
@@ -284,16 +392,33 @@ def test_late_async_handoff_starts_a_fresh_servo_interval_without_catching_up():
     np.testing.assert_allclose([row[1][0] for row in env.executed], [0.5, 1, 1.5, 2, 2.5, 3])
 
 
-def test_acknowledged_slowdown_is_applied_to_future_interpolation_intervals():
+@pytest.mark.parametrize("enable_rtc", [False, True])
+def test_acknowledged_slowdown_is_applied_to_future_interpolation_intervals(enable_rtc):
     clock = FakeClock()
     env = FakeEnv(clock)
     client = FakeClient(env, change_at=1, slow_to=1)
-    result = run(env, client, enable_rtc=True)
-    assert result["continuous_rtc"]
+    result = run(env, client, enable_rtc=enable_rtc)
+    assert result["continuous_rtc"] is enable_rtc
+    assert result["adaptive_execution"]
+    assert result["controller_hz"] == 30
     assert [row["execution_hz"] for row in result["action_trace"]] == [2, 1, 1]
     assert result["wall_seconds"] == 2.5
     assert result["servo_commands"] == 10
     np.testing.assert_allclose([row[1][0] for row in env.executed], [0.5, 1, 1.25, 1.5, 1.75, 2, 2.25, 2.5, 2.75, 3])
+
+
+@pytest.mark.parametrize("enable_rtc", [False, True])
+def test_startup_slowdown_is_acknowledged_before_motion_in_both_async_modes(enable_rtc):
+    env = FakeEnv(FakeClock())
+    client = FakeClient(env, prepare_seconds=2, prepare_rate=1)
+    result = run(env, client, enable_rtc=enable_rtc, max_waypoints=1)
+    assert result["requested_execution_hz"] == 2
+    assert result["initial_execution_hz"] == result["final_execution_hz"] == 1
+    assert result["startup_calibration_seconds"] == 2
+    assert result["adaptive_execution"] and result["controller_hz"] == 30
+    assert result["wall_seconds"] == 1 and result["model_seconds"] == 1 / 30
+    assert result["rate_changes"] == [dict(previous_hz=2, execution_hz=1)]
+    np.testing.assert_allclose([row[0] for row in env.executed], [102.25, 102.5, 102.75, 103])
 
 
 def test_eef_execution_uses_world_wxyz_and_stops_on_mid_interval_success():

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: OpenMDW-1.1
-"""Validated ordinary/RTC requests with optional window-scoped observation encoding.
+"""Validated ordinary/RTC requests with window-scoped streaming observation encoding.
 
 Client helpers import CPU preprocessing lazily and never load a checkpoint.
 Real RGB can persist across decisions; Transformer KV remains request-local.
@@ -77,14 +77,21 @@ class ServingModelPolicy:
         num_steps=10,
         guidance=1.0,
         cache_mode="full",
+        npu_replay_graph=False,
         enable_rtc=False,
         history_padding="repeat_first",
-        streaming_vae=False,
+        streaming_vae=True,
         seed=42,
     ):
+        if streaming_vae is not True:
+            raise ValueError("Causal action serving requires streaming_vae=True")
+        if history_padding != "repeat_first":
+            raise ValueError("streaming_vae requires history_padding=repeat_first")
+
         from cosmos_framework.data.generator.action.action_state_template import ActionStateTemplate55
         from cosmos_framework.data.generator.action.causal_block_geometry import CausalBlockGeometry
         from cosmos_framework.inference.causal_action.robotwin import RobotwinAdapter
+        from cosmos_framework.inference.causal_action.window_streaming import ObservationWindowEncoder
 
         self.model, self.statistics = model, statistics
         self.template = template if template is not None else ActionStateTemplate55()
@@ -112,25 +119,13 @@ class ServingModelPolicy:
             self.history_steps < 32 or self.history_steps % 32 or self.action_horizon != 32
         ):
             raise ValueError("Legacy block serving requires history_steps divisible by 32 and action_horizon=32")
-        if self.layout_mode == "decision_window" and history_padding != "repeat_first":
-            raise ValueError("Decision windows require history_padding=repeat_first")
-        if history_padding not in ("available", "repeat_first"):
-            raise ValueError("history_padding must be available or repeat_first")
-        if streaming_vae and history_padding != "repeat_first":
-            raise ValueError(
-                "streaming_vae requires history_padding=repeat_first; available retains its original encoder"
-            )
-        self.history_padding, self.streaming_vae = history_padding, bool(streaming_vae)
-        self.window_encoder = None
-        if self.streaming_vae:
-            from cosmos_framework.inference.causal_action.window_streaming import ObservationWindowEncoder
-
-            self.window_encoder = ObservationWindowEncoder(
-                model,
-                history_steps=self.history_steps,
-                action_horizon=self.action_horizon,
-                history_padding=self.history_padding,
-            )
+        self.history_padding, self.streaming_vae = history_padding, True
+        self.window_encoder = ObservationWindowEncoder(
+            model,
+            history_steps=self.history_steps,
+            action_horizon=self.action_horizon,
+            history_padding=self.history_padding,
+        )
         self.execute_steps = _integer(execute_steps, "execute_steps", 1)
         if not self.execute_steps <= self.action_horizon:
             raise ValueError("execute_steps must not exceed the prediction horizon")
@@ -153,6 +148,7 @@ class ServingModelPolicy:
         if cache_mode not in ("off", "plans", "full"):
             raise ValueError("cache_mode must be off, plans or full")
         self.cache_mode, self.enable_rtc, self.seed = cache_mode, bool(enable_rtc), _integer(seed, "seed")
+        self.npu_replay_graph = bool(npu_replay_graph)
         model.net.eval().requires_grad_(False)
         self.clear()
 
@@ -179,6 +175,7 @@ class ServingModelPolicy:
             video_stride=self.geometry.video_stride,
             resolution=self.resolution,
             rtc_enabled=self.enable_rtc,
+            npu_replay_graph_requested=self.npu_replay_graph,
             state_mask=self.adapter.state_mask.numpy().copy(),
             action_mask=self.adapter.action_mask.numpy().copy(),
             adapter=adapter,
@@ -190,21 +187,18 @@ class ServingModelPolicy:
         )
 
     def clear(self):
-        if self.window_encoder is not None:
-            self.window_encoder.clear()
+        self.window_encoder.clear()
         self.builder = self.planner = self._reference = None
         self.prompt = self.first_image = None
 
     def observe(self, request):
         if self.planner is None:
             raise ValueError("Reset before sending observations")
-        if not self.streaming_vae:
-            raise ValueError("streaming_vae is disabled on this server")
         self.window_encoder.add(_integer(request["tick"], "tick"), request["image"])
         return {}
 
     def prepare_window(self, request):
-        if self.planner is None or not self.streaming_vae:
+        if self.planner is None:
             raise ValueError("Reset a streaming_vae server before preparing a window")
         self.window_encoder.prepare(_integer(request["anchor_tick"], "anchor_tick"))
         return {}
@@ -286,6 +280,7 @@ class ServingModelPolicy:
             domain_id=torch.tensor(0),
             action_processing_record=ActionProcessingRecord(self.template.width, None),
             causal_action_cache_mode=self.cache_mode,
+            causal_action_npu_replay_graph=self.npu_replay_graph,
         )
         # caption时长须与训练完整P+H窗口一致；expand只提供shape，不复制历史RGB。
         if self.layout_mode == "decision_window":
@@ -376,29 +371,28 @@ class ServingModelPolicy:
             revision=revision,
             rtc=rtc,
         )
-        if self.history_padding == "repeat_first":
-            inputs["first_image"] = self.first_image
-        timing = {}
-        if self.window_encoder is not None:
-            prepared = self.window_encoder.count if self.window_encoder.anchor == tick else 0
-            try:
-                # A delayed request owns its frozen real history even when the
-                # observation transport has already advanced the rolling buffer.
-                for record in history:
-                    self.window_encoder.add(record.tick, record.image, prune=False)
-                self.window_encoder.add(tick, image, prune=False)
-                prefix, timing = self.window_encoder.finish(tick)
-            finally:
-                self.window_encoder.prune()
-            timing["sampled_frames_encoded_before_predict"] = prepared
-            inputs["prepared_vision_prefix"] = prefix
+        inputs["first_image"] = self.first_image
+        prepared = self.window_encoder.count if self.window_encoder.anchor == tick else 0
+        try:
+            # A delayed request owns its frozen real history even when the
+            # observation transport has already advanced the rolling buffer.
+            for record in history:
+                self.window_encoder.add(record.tick, record.image, prune=False)
+            self.window_encoder.add(tick, image, prune=False)
+            prefix, timing = self.window_encoder.finish(tick)
+        finally:
+            self.window_encoder.prune()
+        timing["sampled_frames_encoded_before_predict"] = prepared
+        inputs["prepared_vision_prefix"] = prefix
         actions = self.planner(**inputs)
         return dict(actions=actions.numpy(), tick=tick, revision=revision, streaming_timing=timing)
 
 
 def load_policy(args):
     """Load one model rank; no training dataset or recorded observation is needed."""
-    if getattr(args, "streaming_vae", False) and getattr(args, "history_padding", "repeat_first") != "repeat_first":
+    if getattr(args, "streaming_vae", True) is not True:
+        raise ValueError("Causal action serving requires streaming_vae=True")
+    if getattr(args, "history_padding", "repeat_first") != "repeat_first":
         raise ValueError("streaming_vae requires history_padding=repeat_first")
     os.environ.setdefault("COSMOS_DEVICE", "npu")
     os.environ["WAN_VAE_PATH"] = args.vae
@@ -457,8 +451,9 @@ def load_policy(args):
         num_steps=args.steps,
         guidance=args.guidance,
         cache_mode=getattr(args, "cache_mode", "full"),
+        npu_replay_graph=getattr(args, "npu_replay_graph", False),
         enable_rtc=args.enable_rtc,
         history_padding=getattr(args, "history_padding", "repeat_first"),
-        streaming_vae=getattr(args, "streaming_vae", False),
+        streaming_vae=getattr(args, "streaming_vae", True),
         seed=args.seed,
     )

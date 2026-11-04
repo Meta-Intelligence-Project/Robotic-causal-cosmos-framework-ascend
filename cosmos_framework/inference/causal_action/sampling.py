@@ -14,6 +14,20 @@ from .rtc import RTCPrefix, guided_velocity, prepare_prefix
 from .rtc_prefix_cache import action_rtc_prefix_cache
 
 
+def _npu_graph_fallback_reason(*, requested, rtc, full_cache, guidance, device):
+    if not requested:
+        return None
+    if rtc is not None:
+        return "rtc_input_vjp"
+    if not full_cache:
+        return "requires_full_prefix_cache"
+    if device.type != "npu":
+        return "requires_npu"
+    if guidance != 1.0:
+        return "requires_cfg_one"
+    return None
+
+
 @torch.no_grad()
 def sample_prepared(
     model,
@@ -102,6 +116,13 @@ def sample_prepared(
     full_cache = cache_mode == "full" and value_cache and not preview and sampler is None
     target_net = net or model.net
     full_cache = full_cache and not target_net.training
+    graph_requested = options_batch.get("causal_action_npu_replay_graph", False)
+    if not isinstance(graph_requested, bool):
+        raise TypeError("causal_action_npu_replay_graph must be a bool")
+    graph_fallback = _npu_graph_fallback_reason(
+        requested=graph_requested, rtc=rtc_prefix, full_cache=full_cache, guidance=guidance, device=state.device
+    )
+    graph_enabled = graph_requested and graph_fallback is None
     rtc_full_cache = False
     rtc_cache_fallback = None
     if rtc_prefix is not None and cache_mode == "full" and causal_use_kv_cache:
@@ -201,7 +222,7 @@ def sample_prepared(
     cache_context = (
         action_rtc_prefix_cache(target_net)
         if rtc_full_cache
-        else action_prefix_cache(target_net)
+        else action_prefix_cache(target_net, **({"npu_replay_graph": True} if graph_enabled else {}))
         if full_cache
         else action_attention_cache(target_net, value_cache)
     )
@@ -327,6 +348,11 @@ def sample_prepared(
         "inference_cache": {
             "requested_mode": cache_mode,
             "full_cache": full_cache or rtc_full_cache,
+            "npu_replay_graph": {
+                "requested": graph_requested,
+                "enabled": graph_enabled,
+                "fallback_reason": graph_fallback,
+            },
             **cache.get("stats", {}),
             **({"gradient_safe_prefix": rtc_full_cache} if rtc is not None else {}),
         },

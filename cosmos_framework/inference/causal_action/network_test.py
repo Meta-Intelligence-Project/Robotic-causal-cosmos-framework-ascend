@@ -149,7 +149,8 @@ def test_ordinary_remote_session_preserves_predict32_execute16_baseline():
         assert len(client.request_timings) == 3
 
 
-def test_startup_measures_rpc_latency_and_client_keeps_executing_during_request(monkeypatch):
+@pytest.mark.parametrize("enable_rtc", [False, True])
+def test_startup_measures_rpc_latency_and_client_keeps_executing_during_request(monkeypatch, enable_rtc):
     policy = FakePolicy(delay=0.025)
     acknowledged = []
 
@@ -169,20 +170,21 @@ def test_startup_measures_rpc_latency_and_client_keeps_executing_during_request(
         session = client.create_session(
             measurement(image_size=True),
             prompt="pick",
-            enable_rtc=True,
+            enable_rtc=enable_rtc,
+            execution_mode="async",
             execution_hz=1000,
             execution_rate_callback=accept,
         )
         status = session.prepare(**measurement())
         assert status["tick"] == status["published_requests"] == 0
-        assert len(policy.requests) == 4  # Ordinary bootstrap, warmup, two RTC measurements.
+        assert len(policy.requests) == 4  # Ordinary bootstrap, warmup, two matching planner measurements.
         assert policy.requests[0]["rtc"] is None
-        assert all(request["rtc"] is not None for request in policy.requests[1:])
+        assert all((request["rtc"] is not None) == enable_rtc for request in policy.requests[1:])
         assert len(status["latency_samples"]) == 2
         assert all(row["elapsed_seconds"] >= policy.delay + upload_delay for row in status["latency_samples"])
         assert client.last_timing["round_trip_seconds"] >= client.last_timing["infer_seconds"] + upload_delay
         assert acknowledged and status["execution_hz"] < 1000
-        assert status["estimated_delay_steps"] == 16
+        assert status["estimated_delay_steps"] == 8
 
         policy.gate = threading.Event()
         policy.started.clear()
@@ -193,17 +195,23 @@ def test_startup_measures_rpc_latency_and_client_keeps_executing_during_request(
         for tick in range(17, 21):
             assert session.get_action(**measurement(tick))[0].item() == tick
         assert session.status()["inference_pending"]
-        assert session.execution_hz == rate
+        assert session.execution_hz <= rate
         request = policy.requests[-1]
-        assert request["tick"] == 16 and request["rtc"]["delay_steps"] == 16
-        np.testing.assert_array_equal(request["rtc"]["previous_actions"][:, 0], np.arange(16, 32))
+        assert request["tick"] == 16
+        if enable_rtc:
+            assert request["rtc"]["delay_steps"] == 8
+            np.testing.assert_array_equal(request["rtc"]["previous_actions"][:, 0], np.arange(16, 32))
+        else:
+            assert request["rtc"] is None
         policy.gate.set()
         session.join(3)
         status = session.status()
-        assert status["last_request"]["accepted"]
-        assert status["last_request"]["actual_delay_steps"] == 5
+        assert not status["last_request"]["accepted"]
+        assert status["published_requests"] == 0 and status["inference_ready"]
         assert status["latency_samples"][-1]["elapsed_seconds"] >= policy.delay
-        assert session.get_action(**measurement(21))[0].item() == 21
+        assert [session.get_action(**measurement(t))[0].item() for t in range(21, 25)] == list(range(21, 25))
+        assert session.status()["last_request"]["accepted"]
+        assert session.status()["published_requests"] == 1
 
 
 def test_reset_drains_old_work_and_new_episode_cannot_receive_old_outputs():
@@ -410,7 +418,8 @@ def test_failed_model_request_does_not_commit_staged_history():
     assert lifecycle.needs_reset and not lifecycle.history_images
 
 
-def test_adaptive_false_cannot_silently_enable_an_explicit_policy():
+@pytest.mark.parametrize("enable_rtc", [False, True])
+def test_adaptive_false_cannot_silently_enable_an_explicit_policy(enable_rtc):
     from cosmos_framework.inference.causal_action.rtc_pacing import RTCExecutionPolicy
 
     policy = FakePolicy()
@@ -419,11 +428,24 @@ def test_adaptive_false_cannot_silently_enable_an_explicit_policy():
             client.create_session(
                 measurement(image_size=True),
                 prompt="pick",
-                enable_rtc=True,
+                enable_rtc=enable_rtc,
                 adaptive_execution=False,
                 execution_policy=RTCExecutionPolicy(),
             )
         assert not policy.requests
+
+
+@pytest.mark.parametrize("enable_rtc", [False, True])
+def test_explicit_adaptive_execution_requires_a_real_client_pacing_callback_before_bootstrap(enable_rtc):
+    with live_server(FakePolicy()) as uri, CausalPolicyClient(uri) as client:
+        with pytest.raises(ValueError, match="callback|acknowledg"):
+            client.create_session(
+                measurement(image_size=True),
+                prompt="pick",
+                enable_rtc=enable_rtc,
+                execution_mode="async",
+                adaptive_execution=True,
+            )
 
 
 class StreamingPolicy(FakePolicy):
@@ -518,7 +540,9 @@ def test_streaming_callbacks_share_the_rtc_clock_and_preserve_guided_requests():
         client.infer(dict(tick=17))
         assert [event[1] for event in policy.events if event[0] == "observe"] == list(range(17))
         guided = [request for request in policy.requests if request.get("rtc") is not None]
-        assert guided[-1]["tick"] == 16 and guided[-1]["rtc"]["delay_steps"] >= 1
+        assert guided[-1]["tick"] == 16 and guided[-1]["rtc"]["delay_steps"] == 8
+        assert session.status()["published_requests"] == 0
+        assert [session.get_action(**measurement(t))[0].item() for t in range(17, 25)] == list(range(17, 25))
         assert session.status()["published_requests"] == 1
 
 
@@ -534,24 +558,32 @@ class AsyncPolicy(StreamingPolicy):
 
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("ready_before_handoff", [False, True])
-def test_non_rtc_async_rpc_keeps_old_actions_until_fixed_handoff_and_skips_expired_rows(
-    streaming, ready_before_handoff
+@pytest.mark.parametrize("enable_rtc", [False, True])
+def test_async_rpc_keeps_old_actions_until_fixed_handoff_and_skips_expired_rows(
+    streaming, ready_before_handoff, enable_rtc
 ):
     policy = AsyncPolicy()
     policy.metadata["streaming_vae"] = streaming
-    policy.metadata["rtc_enabled"] = False
+    policy.metadata["rtc_enabled"] = enable_rtc
     policy.metadata["handoff_steps"] = 24
     with live_server(policy) as uri, CausalPolicyClient(uri) as client:
         # streaming默认走async；无streaming也可显式选择同一执行器。
         mode = "auto" if streaming else "async"
-        session = client.create_session(measurement(image_size=True), prompt="pick", execution_mode=mode)
-        assert session.status()["execution_mode"] == "async_non_rtc"
+        session = client.create_session(
+            measurement(image_size=True), prompt="pick", execution_mode=mode, enable_rtc=enable_rtc
+        )
+        assert session.status()["execution_mode"] == ("async_rtc" if enable_rtc else "async_non_rtc")
         policy.gate = threading.Event()
         policy.started.clear()
         assert [session.get_action(**measurement(t))[0].item() for t in range(17)] == list(range(17))
         assert policy.started.wait(2)
         assert session.status()["inference_pending"]
-        assert policy.requests[-1]["tick"] == 16 and policy.requests[-1]["rtc"] is None
+        assert policy.requests[-1]["tick"] == 16
+        if enable_rtc:
+            assert policy.requests[-1]["rtc"]["delay_steps"] == 8
+            np.testing.assert_array_equal(policy.requests[-1]["rtc"]["previous_actions"][:, 0], np.arange(16, 32))
+        else:
+            assert policy.requests[-1]["rtc"] is None
         if ready_before_handoff:
             policy.gate.set()
             session.join(3)
@@ -579,7 +611,7 @@ def test_non_rtc_async_rpc_keeps_old_actions_until_fixed_handoff_and_skips_expir
             assert session.get_action(**measurement(24))[0].item() == 1024
         assert session.status()["chunk_start_tick"] == 16
         assert session.status()["published_requests"] == 1
-        assert all(request.get("rtc") is None for request in policy.requests)
+        assert all((request.get("rtc") is not None) == enable_rtc for request in policy.requests[1:])
 
 
 @pytest.mark.parametrize("operation", ["reset", "close"])
@@ -618,7 +650,7 @@ def test_async_rpc_reset_and_close_drain_the_old_inflight_request(operation):
             assert fresh.get_action(**measurement())[0].item() == 0
 
 
-@pytest.mark.parametrize("mode", ["blocking", "async", "invalid"])
+@pytest.mark.parametrize("mode", ["blocking", "invalid"])
 def test_execution_mode_conflicts_are_rejected_before_bootstrap(mode):
     policy = FakePolicy()
     with live_server(policy) as uri, CausalPolicyClient(uri) as client:
@@ -637,22 +669,16 @@ def test_async_only_validates_schedule_when_the_client_selects_it():
 
 
 @pytest.mark.parametrize("past,horizon", [(48, 32), (1024, 32), (48, 48), (0, 16)])
-@pytest.mark.parametrize("streaming", [False, True])
-def test_compact_serving_loopback_has_only_real_prediction_actions_and_one_state(past, horizon, streaming):
+def test_compact_serving_loopback_has_only_real_prediction_actions_and_one_state(past, horizon):
     from cosmos_framework.inference.causal_action.serving_model_test import Model, policy
-    from cosmos_framework.inference.causal_action.window_streaming_test import Tokenizer
 
     model = Model()
-    if streaming:
-        model.tokenizer_vision_gen = Tokenizer()
-        model.tensor_kwargs_fp32 = dict(device="cpu", dtype=torch.float32)
     service = policy(
         model=model,
         enable_rtc=False,
         history_steps=past,
         action_horizon=horizon,
         history_padding="repeat_first",
-        streaming_vae=streaming,
     )
     # live_server's cleanup hooks are shared with the older FakePolicy fixture.
     service.gate = None
@@ -676,3 +702,19 @@ def test_compact_serving_loopback_has_only_real_prediction_actions_and_one_state
             assert batch["action"][0].shape == (horizon, 55)
             assert metadata.states.shape == metadata.anchors.shape == (1, 55)
             assert metadata.current_group_id == 1 + past // 16
+
+
+def test_default_serving_uses_streaming_and_selects_async_without_rtc():
+    from cosmos_framework.inference.causal_action.serving_model_test import policy
+
+    service = policy(enable_rtc=False)
+    service.gate = None
+    observed = measurement(image_size=True)
+    observed["state_mask"] = service.adapter.state_mask.clone()
+    observed["action_mask"] = service.adapter.action_mask.clone()
+    with live_server(service) as uri, CausalPolicyClient(uri) as client:
+        session = client.create_session(observed, prompt="pick", enable_rtc=False)
+        assert client.metadata["streaming_vae"] is True
+        assert session.status()["execution_mode"] == "async_non_rtc"
+        assert "causal_action_precomputed_vision_prefix" in service.model.calls[0][0]
+        session.close()
