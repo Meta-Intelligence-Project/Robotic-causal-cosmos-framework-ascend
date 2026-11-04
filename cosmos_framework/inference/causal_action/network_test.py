@@ -424,3 +424,255 @@ def test_adaptive_false_cannot_silently_enable_an_explicit_policy():
                 execution_policy=RTCExecutionPolicy(),
             )
         assert not policy.requests
+
+
+class StreamingPolicy(FakePolicy):
+    def __init__(self):
+        super().__init__()
+        self.metadata["streaming_vae"] = True
+        self.metadata["history_padding"] = "repeat_first"
+        self.events = []
+
+    def infer(self, request):
+        self.events.append(("infer", request["tick"], threading.get_ident()))
+        return super().infer(request)
+
+    def observe(self, request):
+        self.events.append(("observe", request["tick"], threading.get_ident()))
+        return {}
+
+    def prepare_window(self, request):
+        self.events.append(("prepare", request["anchor_tick"], threading.get_ident()))
+        return {}
+
+
+def test_streaming_observations_are_sent_during_inflight_inference_without_gpu_races(monkeypatch):
+    policy = StreamingPolicy()
+    with live_server(policy) as uri, CausalPolicyClient(uri) as client:
+        client.reset(prompt="pick", measurement=measurement(image_size=True))
+        policy.gate = threading.Event()
+        policy.started.clear()
+        sent = threading.Event()
+        original_send = client.connection.send
+
+        def send(payload):
+            if unpackb(payload).get("operation") == "observe":
+                sent.set()
+            return original_send(payload)
+
+        monkeypatch.setattr(client.connection, "send", send)
+        result, errors = [], []
+
+        def predict():
+            try:
+                result.append(client.infer(dict(tick=16)))
+            except BaseException as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=predict)
+        thread.start()
+        assert policy.started.wait(2)
+        for tick in range(21):
+            client.observe(tick=tick, image=measurement(tick)["image"])
+        client.prepare_window(anchor_tick=32)
+        assert sent.wait(2), "A prediction waiting for its result must not lock the observation sender"
+        assert thread.is_alive() and not any(event[0] == "observe" for event in policy.events)
+        policy.gate.set()
+        thread.join(3)
+        assert not errors and result[0]["tick"] == 16
+        client.infer(dict(tick=32))  # FIFO barrier after all observe/prepare jobs.
+        assert [event[1] for event in policy.events if event[0] == "observe"] == list(range(21))
+        assert ("prepare", 32) in [event[:2] for event in policy.events]
+        assert len({event[2] for event in policy.events}) == 1
+
+
+def test_streaming_ordinary_execution_remains_independent_of_rtc():
+    policy = StreamingPolicy()
+    policy.metadata["rtc_enabled"] = False
+    with live_server(policy) as uri, CausalPolicyClient(uri) as client:
+        session = client.create_session(
+            measurement(image_size=True), prompt="pick", enable_rtc=False, execution_mode="blocking"
+        )
+        assert [session.get_action(**measurement(t))[0].item() for t in range(34)] == list(range(34))
+        client.infer(dict(tick=34))
+        assert [event[1] for event in policy.events if event[0] == "observe"] == list(range(34))
+        assert [event[1] for event in policy.events if event[0] == "prepare"] == [16, 32, 48]
+        assert not any(request.get("rtc") for request in policy.requests)
+
+
+def test_streaming_callbacks_share_the_rtc_clock_and_preserve_guided_requests():
+    policy = StreamingPolicy()
+    with live_server(policy) as uri, CausalPolicyClient(uri) as client:
+        session = client.create_session(
+            measurement(image_size=True),
+            prompt="pick",
+            enable_rtc=True,
+            adaptive_execution=False,
+            calibration_warmups=0,
+            calibration_samples=1,
+        )
+        assert session.prepare(**measurement())["rtc_enabled"]
+        for tick in range(17):
+            assert session.get_action(**measurement(tick))[0].item() == tick
+        session.join(3)
+        client.infer(dict(tick=17))
+        assert [event[1] for event in policy.events if event[0] == "observe"] == list(range(17))
+        guided = [request for request in policy.requests if request.get("rtc") is not None]
+        assert guided[-1]["tick"] == 16 and guided[-1]["rtc"]["delay_steps"] >= 1
+        assert session.status()["published_requests"] == 1
+
+
+class AsyncPolicy(StreamingPolicy):
+    """Distinct future values expose premature handoff or expired-row replay."""
+
+    def infer(self, request):
+        result = super().infer(request)
+        if request["operation"] == "predict":
+            result["actions"][:, 0] += 1000
+        return result
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("ready_before_handoff", [False, True])
+def test_non_rtc_async_rpc_keeps_old_actions_until_fixed_handoff_and_skips_expired_rows(
+    streaming, ready_before_handoff
+):
+    policy = AsyncPolicy()
+    policy.metadata["streaming_vae"] = streaming
+    policy.metadata["rtc_enabled"] = False
+    policy.metadata["handoff_steps"] = 24
+    with live_server(policy) as uri, CausalPolicyClient(uri) as client:
+        # streaming默认走async；无streaming也可显式选择同一执行器。
+        mode = "auto" if streaming else "async"
+        session = client.create_session(measurement(image_size=True), prompt="pick", execution_mode=mode)
+        assert session.status()["execution_mode"] == "async_non_rtc"
+        policy.gate = threading.Event()
+        policy.started.clear()
+        assert [session.get_action(**measurement(t))[0].item() for t in range(17)] == list(range(17))
+        assert policy.started.wait(2)
+        assert session.status()["inference_pending"]
+        assert policy.requests[-1]["tick"] == 16 and policy.requests[-1]["rtc"] is None
+        if ready_before_handoff:
+            policy.gate.set()
+            session.join(3)
+            assert session.status()["inference_ready"]
+        assert [session.get_action(**measurement(t))[0].item() for t in range(17, 24)] == list(range(17, 24))
+        assert session.status()["published_requests"] == 0
+        if not ready_before_handoff:
+            returned, errors = [], []
+
+            def consume_handoff():
+                try:
+                    returned.append(session.get_action(**measurement(24))[0].item())
+                except BaseException as error:
+                    errors.append(error)
+
+            thread = threading.Thread(target=consume_handoff)
+            thread.start()
+            thread.join(0.05)
+            assert thread.is_alive(), "A late candidate must wait at R, not extend the old chunk"
+            policy.gate.set()
+            thread.join(3)
+            assert not thread.is_alive() and not errors
+            assert returned == [1024]  # candidate tick16 + expired8 + marker1000.
+        else:
+            assert session.get_action(**measurement(24))[0].item() == 1024
+        assert session.status()["chunk_start_tick"] == 16
+        assert session.status()["published_requests"] == 1
+        assert all(request.get("rtc") is None for request in policy.requests)
+
+
+@pytest.mark.parametrize("operation", ["reset", "close"])
+def test_async_rpc_reset_and_close_drain_the_old_inflight_request(operation):
+    policy = AsyncPolicy()
+    with live_server(policy) as uri, CausalPolicyClient(uri) as client:
+        old = client.create_session(measurement(image_size=True), prompt="old")
+        policy.gate = threading.Event()
+        policy.started.clear()
+        for tick in range(17):
+            old.get_action(**measurement(tick))
+        assert policy.started.wait(2)
+        returned, errors = [], []
+
+        def drain():
+            try:
+                returned.append(
+                    client.create_session(measurement(image_size=True), prompt="new")
+                    if operation == "reset"
+                    else old.close()
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=drain)
+        thread.start()
+        thread.join(0.05)
+        assert thread.is_alive(), "Reset/close must drain the previous model request"
+        policy.gate.set()
+        thread.join(3)
+        assert not thread.is_alive() and not errors
+        assert old.status()["closed"] and old.status()["published_requests"] == 0
+        if operation == "reset":
+            fresh = returned[0]
+            assert fresh.status()["tick"] == 0
+            assert fresh.get_action(**measurement())[0].item() == 0
+
+
+@pytest.mark.parametrize("mode", ["blocking", "async", "invalid"])
+def test_execution_mode_conflicts_are_rejected_before_bootstrap(mode):
+    policy = FakePolicy()
+    with live_server(policy) as uri, CausalPolicyClient(uri) as client:
+        with pytest.raises(ValueError, match="execution_mode"):
+            client.create_session(measurement(image_size=True), prompt="pick", enable_rtc=True, execution_mode=mode)
+        assert not policy.requests
+
+
+def test_async_only_validates_schedule_when_the_client_selects_it():
+    policy = StreamingPolicy()
+    policy.metadata.update(actions_per_block=16, action_horizon=16, execute_steps=16, handoff_steps=None)
+    with live_server(policy) as uri, CausalPolicyClient(uri) as client:
+        with pytest.raises(ValueError, match="S|trigger|execute|horizon"):
+            client.create_session(measurement(image_size=True), prompt="pick")
+        assert not policy.requests
+
+
+@pytest.mark.parametrize("past,horizon", [(48, 32), (1024, 32), (48, 48), (0, 16)])
+@pytest.mark.parametrize("streaming", [False, True])
+def test_compact_serving_loopback_has_only_real_prediction_actions_and_one_state(past, horizon, streaming):
+    from cosmos_framework.inference.causal_action.serving_model_test import Model, policy
+    from cosmos_framework.inference.causal_action.window_streaming_test import Tokenizer
+
+    model = Model()
+    if streaming:
+        model.tokenizer_vision_gen = Tokenizer()
+        model.tensor_kwargs_fp32 = dict(device="cpu", dtype=torch.float32)
+    service = policy(
+        model=model,
+        enable_rtc=False,
+        history_steps=past,
+        action_horizon=horizon,
+        history_padding="repeat_first",
+        streaming_vae=streaming,
+    )
+    # live_server's cleanup hooks are shared with the older FakePolicy fixture.
+    service.gate = None
+
+    def observed(tick):
+        result = measurement(tick, image_size=True)
+        result["state_mask"] = service.adapter.state_mask.clone()
+        result["action_mask"] = service.adapter.action_mask.clone()
+        return result
+
+    with live_server(service) as uri, CausalPolicyClient(uri) as client:
+        session = client.create_session(observed(0), prompt="pick", enable_rtc=False, execution_mode="blocking")
+        for tick in range(34):
+            value = observed(tick)
+            value.pop("image_size")
+            assert session.get_action(**value).shape == (55,)
+        assert client.metadata["history_steps"] == past
+        assert client.metadata["action_horizon"] == horizon
+        for batch, _ in model.calls:
+            metadata = batch["sequence_plan"][0].causal_action_metadata
+            assert batch["action"][0].shape == (horizon, 55)
+            assert metadata.states.shape == metadata.anchors.shape == (1, 55)
+            assert metadata.current_group_id == 1 + past // 16

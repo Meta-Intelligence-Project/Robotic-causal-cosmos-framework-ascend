@@ -530,3 +530,19 @@ out from the fitted statistics population, and the exact checkpoint training
 statistics remain unconfirmed. Holding the current state can outperform both
 models on low-motion windows. Recorded observations do not respond to predictions,
 so neither these errors nor the continuity changes establish task success.
+
+## Observed-window VAE validation
+
+A real Wan2.2/0930 experiment on 2026-10-31 checked request-local observed-window
+encoding, including the additional temporal phase reached by eight-step replanning.
+Same-shape future-pixel interventions preserved conditioned past latents bitwise
+on all three recorded episodes. Changing the window's left boundary nevertheless
+changed historical representations and downstream action predictions, including
+controls that retained the local singleton prime.
+
+The phase-aligned earlier-context crop is a representation-sensitivity reference,
+not ground truth or a proven training-equivalent replacement. The experiment does
+not establish task accuracy loss, a matched eight-versus-sixteen-step policy
+comparison, or closed-loop success. See the
+[Chinese validation report](causal_action_vae_window_validation_20261031_zh.md)
+for numeric results, RTC repeat variability and independent audit evidence.

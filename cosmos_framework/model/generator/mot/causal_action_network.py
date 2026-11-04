@@ -23,6 +23,10 @@ class CausalActionNetwork(Cosmos3VFMNetwork):
         self.llm2action = SharedActionLinear(self.hidden_size, self.action_dim)
         self.state2llm = nn.Linear(self.action_dim, self.hidden_size)
         self.state_modality_embed = nn.Parameter(torch.zeros(self.hidden_size))
+        self.add_action_flag = self.config.add_action_flag
+        if self.add_action_flag:
+            self.action_mask_embed = nn.Linear(self.action_dim, self.hidden_size, bias=False)
+            self.state_mask_embed = nn.Linear(self.action_dim, self.hidden_size, bias=False)
 
     def _init_action_interfaces(self):
         for module in (self.action2llm, self.llm2action, self.state2llm):
@@ -30,14 +34,19 @@ class CausalActionNetwork(Cosmos3VFMNetwork):
             nn.init.trunc_normal_(module.weight, std=std, a=-3 * std, b=3 * std)
             nn.init.zeros_(module.bias)
         nn.init.normal_(self.state_modality_embed, std=1.0 / math.sqrt(self.hidden_size))
+        if self.add_action_flag:
+            nn.init.zeros_(self.action_mask_embed.weight)
+            nn.init.zeros_(self.state_mask_embed.weight)
 
     def _encode_vision(self, packed_seq, packed_sequence, target_dtype):
         original_shapes = super()._encode_vision(packed_seq, packed_sequence, target_dtype)
         vision = packed_seq.vision
-        cond = torch.cat([
-            mask.reshape(-1).bool().repeat_interleave(h * w)
-            for mask, (_, h, w) in zip(vision.condition_mask, vision.token_shapes, strict=True)
-        ])
+        cond = torch.cat(
+            [
+                mask.reshape(-1).bool().repeat_interleave(h * w)
+                for mask, (_, h, w) in zip(vision.condition_mask, vision.token_shapes, strict=True)
+            ]
+        )
         indexes = vision.sequence_indexes[cond]
         zeros = torch.zeros(indexes.numel(), device=packed_sequence.device, dtype=torch.float32)
         packed_sequence[indexes] += self._embed_packed_timesteps(zeros, packed_seq).to(target_dtype)
@@ -47,7 +56,12 @@ class CausalActionNetwork(Cosmos3VFMNetwork):
         super()._encode_action(packed_seq, packed_sequence, target_dtype)
         action = packed_seq.action
         if action is None:
-            raise ValueError("Causal action network requires action data")
+            return
+        if self.add_action_flag:
+            masks = torch.cat([m.action_mask for m in packed_seq.causal_action_metadata])
+            packed_sequence[action.sequence_indexes] += self.action_mask_embed(
+                masks.to(device=packed_sequence.device, dtype=target_dtype)
+            )
         cond = torch.cat([mask.reshape(-1).bool() for mask in action.condition_mask])
         indexes = action.sequence_indexes[cond]
         zeros = torch.zeros(indexes.numel(), device=packed_sequence.device, dtype=torch.float32)
@@ -61,6 +75,8 @@ class CausalActionNetwork(Cosmos3VFMNetwork):
                 masks = torch.cat([m.state_mask for m in packed_seq.causal_action_metadata]).to(states.device)
                 states = states.masked_fill(~masks, 0)
                 encoded = self.state2llm(states) + self.state_modality_embed.view(1, -1)
+                if self.add_action_flag:
+                    encoded = encoded + self.state_mask_embed(masks.to(dtype=target_dtype))
                 zeros = torch.zeros(len(states), device=states.device, dtype=torch.float32)
                 packed_sequence[tf.layout.state_indexes] = encoded + self._embed_packed_timesteps(zeros, packed_seq).to(
                     target_dtype
@@ -68,6 +84,14 @@ class CausalActionNetwork(Cosmos3VFMNetwork):
 
     def _decode_action(self, packed_seq, last_hidden_state, output_dict):
         super()._decode_action(packed_seq, last_hidden_state, output_dict)
+        if packed_seq.action is None:
+            # Keep all action/state interfaces in the distributed backward graph on video-only steps.
+            zeros = last_hidden_state.new_zeros(1, self.action_dim)
+            dummy = self.state2llm(zeros).sum() + self.state_modality_embed.sum()
+            if self.add_action_flag:
+                dummy = dummy + self.action_mask_embed(zeros).sum() + self.state_mask_embed(zeros).sum()
+            output_dict["preds_action"] = [p + 0.0 * dummy for p in output_dict["preds_action"]]
+            return
         output_dict["preds_action"] = [
             x.masked_fill(~m.action_mask.to(x.device), 0)
             for x, m in zip(output_dict["preds_action"], packed_seq.causal_action_metadata, strict=True)

@@ -55,7 +55,13 @@ def sample_prepared(
     ashape = data.x0_tokens_action[0].shape
     t = vshape[2]
     nv = data.x0_tokens_vision[0].numel()
-    if causal_num_blocks is not None and causal_num_blocks != (t - 1 + causal_block_size - 1) // causal_block_size:
+    metadata = sequence_plans[0].causal_action_metadata
+    decision_window = metadata is not None and getattr(metadata, "layout_mode", "block") == "decision_window"
+    if (
+        not decision_window
+        and causal_num_blocks is not None
+        and causal_num_blocks != (t - 1 + causal_block_size - 1) // causal_block_size
+    ):
         raise ValueError("causal_num_blocks must cover the prepared latent window")
     selected = sampler or model.sampler
     if (
@@ -114,9 +120,16 @@ def sample_prepared(
             rtc_cache_fallback = "gradient_prefix_cache_requires_dense_model"
         else:
             rtc_full_cache = not target_net.training
-    current_block = int(options_batch.get("causal_action_current_block", 0))
-    if not 0 <= current_block < len(metadata.states):
+    current_block = int(
+        options_batch.get("causal_action_current_block", metadata.current_group_id if decision_window else 0)
+    )
+    state_index = metadata.current_state_index if decision_window else current_block
+    if decision_window and current_block != metadata.current_group_id:
+        raise ValueError("Decision window attention group must equal observed_latents")
+    if not 0 <= state_index < len(metadata.states):
         raise ValueError("Requested block has no measured state")
+    if decision_window and preview:
+        raise ValueError("Decision windows solve one future horizon; multi-block preview is unsupported")
     rtc = None if rtc_prefix is None else prepare_prefix(rtc_prefix, metadata, current_block, device=state.device)
     if rtc is not None and target_net.training:
         raise ValueError("RTC requires an eval-mode network")
@@ -146,7 +159,12 @@ def sample_prepared(
             "cache_fallback_reason": rtc_cache_fallback,
             "solver": type(selected).__name__,
         }
-    geometry = CausalActionGeometry((causal_block_size,), (causal_history_blocks,))
+    geometry = CausalActionGeometry(
+        (causal_block_size,),
+        (metadata.observed_latents if decision_window else causal_history_blocks,),
+        (getattr(metadata, "include_visual_prefix", False),),
+        (decision_window,),
+    )
     valid_action = metadata.action_mask.to(state.device)
     if has_noisy_actions:
         state[nv:] = state[nv:].reshape(ashape).masked_fill(~valid_action, 0).flatten()
@@ -158,10 +176,14 @@ def sample_prepared(
     for name, text, skip in branches:
         packed = model._pack_input_sequence(sequence_plans, text, data, torch.zeros(1, 1), skip_text_tokens=skip)
         if not preview:
-            if not metadata.state_mask[current_block].any():
+            if not metadata.state_mask[state_index].any():
                 raise ValueError("The current block needs its measured state")
             vmask = packed.vision.condition_mask[0].reshape(t, -1).all(-1)
-            start, _ = prediction_block_span(current_block, causal_block_size)
+            start, _ = (
+                metadata.target_vision_span
+                if decision_window
+                else prediction_block_span(current_block, causal_block_size)
+            )
             past_v = torch.arange(t, device=vmask.device) < start
             if not vmask[past_v].all():
                 raise ValueError("History must be explicitly supplied as observed video")
@@ -184,12 +206,20 @@ def sample_prepared(
         else action_attention_cache(target_net, value_cache)
     )
     with cache_context as cache:
-        for b, start in enumerate(range(1, t, causal_block_size)):
+        # 新布局只求解一次[M,M+K)未来，不把历史按32步重新生成。
+        spans = (
+            [(metadata.current_group_id, *metadata.target_vision_span)]
+            if decision_window
+            else [
+                (b, start, min(t, start + causal_block_size)) for b, start in enumerate(range(1, t, causal_block_size))
+            ]
+        )
+        for b, start, end in spans:
             if not preview and b != current_block:
                 continue
-            if not metadata.state_mask[b].any():
+            group_state = metadata.current_state_index if decision_window else b
+            if not metadata.state_mask[group_state].any():
                 raise ValueError(f"Missing measured state at block {b}; stopped at the block boundary")
-            end = min(t, start + causal_block_size)
             vm = torch.zeros(vshape, device=state.device, dtype=torch.bool)
             vm[:, :, start:end] = True
             am = ((af >= start) & (af < end))[:, None].expand(ashape)
@@ -221,6 +251,7 @@ def sample_prepared(
                 def branch(name):
                     template = templates[name]
                     model._update_inference_pack_template(template, [vision], [action], None, timestep)
+                    # TND缓存按attention group M分流；state_index仍为0。
                     cache["key"] = (b, name)
                     out = model.denoise(net=net, data_batch_packed=template)
                     pred = [out["preds_vision"][0].reshape(-1)]
@@ -280,7 +311,16 @@ def sample_prepared(
         "vision": [
             history_v
             if preview
-            else history_v[:, :, : min(t, prediction_block_span(current_block, causal_block_size)[1])]
+            else history_v[
+                :,
+                :,
+                : min(
+                    t,
+                    metadata.target_vision_span[1]
+                    if decision_window
+                    else prediction_block_span(current_block, causal_block_size)[1],
+                ),
+            ]
         ],
         "action": [history_a.masked_fill(~valid_action, 0)],
         "generated_action_mask": [generated_action_mask],

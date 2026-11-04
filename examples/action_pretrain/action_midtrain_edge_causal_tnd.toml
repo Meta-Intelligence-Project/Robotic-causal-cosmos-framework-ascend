@@ -24,9 +24,17 @@ sources_file = "${oc.env:ACTION_SOURCES_FILE}"
 table_backend = "parquet"
 # 在读取时抽取视频帧；false 恢复拼接后抽帧，便于内存对照。
 early_video_sampling = true
-actions_per_block = 32
+# 开局缺少的过去画面重复episode首帧；缺失的真实中间观测仍报错。
+history_padding = "repeat_first"
+# P：下采样前的历史控制步数。30Hz时1024步约34.1秒；stride4后
+# 有257张观测RGB，经VAE时间压缩4倍成为65个latent（均含当前观测）。
+history_steps = 1024
+# H：当前时刻之后的动作预测长度；仅H行action和1行当前state，无历史占位。
+# P和H独立，只需分别对齐stride4×VAE4=16，不要求P能被H整除。
+action_horizon = 32
+# 每4个控制步采样1张RGB，动作仍保持原始控制频率。
 video_stride = 4
-# 最多 896 action / 897 observation，抽帧后 225 个视频帧。
+# IO segment 最多896步；repeat_first从真实episode读取1024步历史及32步目标。
 max_action_steps = 896
 overlap_action_steps = 161
 resolution = "480"
@@ -35,14 +43,16 @@ seed = 42
 allow_mock_statistics = false
 
 [model]
+# Embed action/state validity masks; false disables input mask embeddings only.
+add_action_flag = false
 # 开启后单独记录 rank 0 的 Policy / ID / FD loss；关闭时跳过新增统计。
 causal_action_log_loss_by_mode      = false
 precision                           = "bfloat16"
 max_num_tokens_after_packing        = -1
+# 复用原teacher-forcing/TND接口名：机器人走decision_window，每样本只采一个σ；
+# 不再将历史按32步动作块训练。视频-only混训可独立使用原AR teacher forcing。
 joint_attn_implementation           = "teacher_forcing"
 causal_training_strategy            = "teacher_forcing"
-teacher_forcing_history_blocks_min  = 1
-teacher_forcing_history_blocks_max  = 32
 teacher_forcing_dense_mode          = "grouped_tnd"
 teacher_forcing_tnd_max_kv_tokens   = 131072
 teacher_forcing_visualize_sdpa_mask = false
@@ -84,9 +94,11 @@ keys_to_select = [
     "llm2vae",
     "state2llm",
     "state_modality_embed",
+    "state_mask_embed",
     "action2llm",
     "llm2action",
     "action_modality_embed",
+    "action_mask_embed",
     "k_norm_und_for_gen",
 ]
 lr               = 5.0e-5
@@ -126,14 +138,16 @@ keys_to_skip_loading = [
     "net_ema.",
     "state2llm",
     "state_modality_embed",
+    "state_mask_embed",
     "action2llm",
     "llm2action",
     "action_modality_embed",
+    "action_mask_embed",
     "action_pos_embed",
 ]
 load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
 save_iter = 5000
 
 [dataloader_train]
-max_sequence_length = 54000
+max_sequence_length = 65536
 num_workers          = 4

@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: OpenMDW-1.1
-"""Action teacher forcing with visual-only history and current block state.
+"""Causal action packing for decision windows and legacy block teacher forcing.
 
 Stream 0 is clean visual history, 1 current targets, 2 current conditions.
-Stream 3 contains one immutable measured state per block.
+Stream 3 is the immutable measured state. A decision window has exactly one
+state and one copy of the visuals; its history contains no action/state slots.
+Window time groups identify latent frames, not chunks of 32 robot actions.
 """
 
 from dataclasses import dataclass, fields, replace
@@ -16,17 +18,25 @@ from .teacher_forcing import TeacherForcingData, TeacherForcingGeometry, Teacher
 
 @dataclass(frozen=True)
 class CausalActionGeometry(TeacherForcingGeometry):
+    include_visual_prefix: tuple[bool, ...] = ()
+    decision_windows: tuple[bool, ...] = ()
+
     def __post_init__(self):
         if not self.block_sizes or len(self.block_sizes) != len(self.history_blocks):
             raise ValueError("One block size and history window required per sample")
         if any(b < 1 for b in self.block_sizes) or any(h < 1 for h in self.history_blocks):
             raise ValueError("Block sizes must be positive and history windows positive")
+        if self.include_visual_prefix and len(self.include_visual_prefix) != len(self.block_sizes):
+            raise ValueError("One visual-prefix visibility flag required per sample")
+        if self.decision_windows and len(self.decision_windows) != len(self.block_sizes):
+            raise ValueError("One decision-window flag required per sample")
 
 
 @dataclass(frozen=True)
 class CausalActionLayout(TeacherForcingLayout):
     includes_action: bool = True
     state_indexes: torch.Tensor | None = None
+    decision_window: bool = False
 
     def to(self, device):
         return replace(
@@ -63,6 +73,7 @@ def build_action_layout(
     old_lens, lens, splits, modes = [], [], [], []
     old = 0
     state_indexes = []
+    decision_windows = geometry.decision_windows or (False,) * len(geometry.block_sizes)
     for i, (u, shape, na, vc, ac, b) in enumerate(
         zip(
             und_counts,
@@ -76,16 +87,35 @@ def build_action_layout(
     ):
         t, h, w = shape
         nv = t * h * w
+        window = decision_windows[i]
         if u < 1:
             raise ValueError("Action teacher forcing requires UND text")
-        vb = prediction_block_ids(torch.arange(t), b).repeat_interleave(h * w).tolist()
+        if window:
+            m = metadata[i]
+            observed, future = m.observed_latents, m.future_latents
+            if (
+                m.layout_mode != "decision_window"
+                or t != observed + future
+                or na != m.action_horizon
+                or b != future
+                or geometry.history_blocks[i] != observed
+            ):
+                raise ValueError("Decision-window payload and pre-packing geometry differ")
+            # 时间组0..M-1各含一个历史latent；组M容纳整个未来决策窗口。
+            # 这些是attention时间坐标，不是32-action训练block，也不产生历史action/state。
+            vb = list(range(observed)) + [observed] * future
+            vb = [group for group in vb for _ in range(h * w)]
+        else:
+            vb = prediction_block_ids(torch.arange(t), b).repeat_interleave(h * w).tolist()
         af = metadata[i].action_frame_ids.cpu()
         if len(af) != na or (af < 0).any():
             raise ValueError("Explicit action frame IDs must match action payload")
-        ab = prediction_block_ids(af, b).tolist()
+        ab = [observed] * na if window else prediction_block_ids(af, b).tolist()
         vcond = torch.as_tensor(vc).bool().reshape(t, -1).all(1).repeat_interleave(h * w).tolist()
-        if not all(vcond[:h * w]):
+        if not all(vcond[: h * w]):
             raise ValueError("The independent first frame must be an observed visual condition")
+        if window and not all(vcond[: observed * h * w]):
+            raise ValueError("Decision-window history must contain only observed visual conditions")
         acond = torch.as_tensor(ac).bool().reshape(na, -1).all(1).tolist()
         if (af < 1).any():
             raise ValueError("Actions must belong to real intervals after the independent first frame")
@@ -94,7 +124,7 @@ def build_action_layout(
         samples.extend([i] * u)
         streams.extend([-1] * u)
         blocks.extend([-1] * u)
-        for history in (True, False):
+        for history in (False,) if window else (True, False):
             for count, offset, bs, cs in ((nv, u, vb, vcond), (na, u + nv, ab, acond)):
                 if history and offset == u + nv:
                     continue
@@ -106,12 +136,15 @@ def build_action_layout(
                     outputs.extend(indexes)
                 source.extend(range(old + offset, old + offset + count))
                 samples.extend([i] * count)
-                streams.extend([0] * count if history else [2 if c else 1 for c in cs])
+                if window and offset == u:
+                    streams.extend([0] * (observed * h * w) + [2 if c else 1 for c in cs[observed * h * w :]])
+                else:
+                    streams.extend([0] * count if history else [2 if c else 1 for c in cs])
                 blocks.extend(bs)
         if metadata is not None:
             m = metadata[i]
-            ns = (t - 1 + b - 1) // b
-            if m.block_size != b or len(m.states) != ns:
+            ns = 1 if window else (t - 1 + b - 1) // b
+            if len(m.states) != ns or (not window and m.block_size != b):
                 raise ValueError("State geometry differs from the pre-packing geometry")
             indexes = list(range(len(source), len(source) + ns))
             state_indexes.extend(indexes)
@@ -120,7 +153,7 @@ def build_action_layout(
             source.extend(old + u + nv + int(j) for j in m.state_action_indexes)
             samples.extend([i] * ns)
             streams.extend([3] * ns)
-            blocks.extend(range(ns))
+            blocks.extend([observed] if window else range(ns))
         n = len(source) - start
         old_lens.append(u + nv + na)
         lens.append(n)
@@ -145,6 +178,7 @@ def build_action_layout(
         tensor(cv),
         tensor(outputs),
         state_indexes=tensor(state_indexes),
+        decision_window=any(decision_windows),
     )
 
 
@@ -156,6 +190,9 @@ def dense_action_mask(layout):
     qs, ks = layout.sample_ids[qi], layout.sample_ids[None, :]
     hist = torch.tensor(layout.geometry.history_blocks, device=qb.device)[qs]
     past = (kr == 0) & (kb < qb) & (kb >= qb - hist)
+    if layout.geometry.include_visual_prefix:
+        include_prefix = torch.tensor(layout.geometry.include_visual_prefix, device=qb.device)[qs]
+        past |= include_prefix & (kr == 0) & (kb == -1) & (qb >= 0)
     same = (kb == qb) & torch.where(qr == 0, kr == 0, torch.where(qr == 2, kr == 2, (kr == 1) | (kr == 2)))
     visible = (kr == -1) | past | same | ((qr != 0) & (kr == 3) & (kb == qb))
     # Clean visual history never absorbs state/action, including through earlier layers.

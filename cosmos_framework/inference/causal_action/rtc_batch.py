@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: OpenMDW-1.1
-"""Build raw online policy batches exclusively from measured RTC observations."""
+"""Build measured decision windows, with an explicit legacy block compatibility path."""
 
 import copy
 import math
@@ -10,6 +10,7 @@ import torch
 
 from cosmos_framework.data.generator.action.block_state import BlockStateMetadata
 from cosmos_framework.data.generator.action.causal_block_geometry import CausalBlockGeometry
+from cosmos_framework.data.generator.action.history_window import build_history_window
 
 
 def _integer(value, name, minimum=0):
@@ -47,12 +48,17 @@ class RTCObservedBatchBuilder:
     define the model interface. Images must already have the same concatenated
     camera layout and resized/padded ``[C,H,W]`` shape as that reference.
 
-    A planning request at tick t ends its observed window exactly at t. It uses
+    决策窗口的history_steps=P与action_horizon=H均以真实action步为单位，互不取整。
+    它仅含H个action和1个当前state；attention group M不是state数组索引0。
+    A legacy planning request at tick t ends its observed window exactly at t. It uses
     h=min(t//32, history_blocks) complete preceding blocks, sampling real images
     at t-32h, t-32h+4, ..., t, then appends eight zero future placeholders. This
     also handles requests between old block boundaries, e.g. t=48 starts at16.
-    Missing measurements are errors; no frame is interpolated or copied from
-    the reference. The session attaches ``rtc`` separately after construction.
+    ``history_padding="repeat_first"`` instead uses the fixed configured window,
+    repeating the actual episode's tick-zero image at negative logical ticks.
+    A supplied ``first_image`` must come from that reset, never the reference.
+    Missing nonnegative measurements are errors. The session attaches ``rtc``
+    separately after construction.
     """
 
     def __init__(
@@ -64,6 +70,10 @@ class RTCObservedBatchBuilder:
         video_stride=4,
         temporal_compression_factor=4,
         history_blocks=8,
+        history_padding="available",
+        history_steps=None,
+        action_horizon=32,
+        layout_mode=None,
         video_key="video",
         caption_key="ai_caption",
     ):
@@ -71,6 +81,32 @@ class RTCObservedBatchBuilder:
             raise ValueError("reference_batch must be a raw single-sample dictionary")
         self.controller_hz = _scalar(controller_hz, "controller_hz")
         self.history_blocks = _integer(history_blocks, "history_blocks", 1)
+        self.layout_mode = layout_mode or ("decision_window" if history_steps is not None else "block")
+        if self.layout_mode not in ("block", "decision_window"):
+            raise ValueError("layout_mode must be block or decision_window")
+        if self.layout_mode == "block" and history_steps is not None:
+            raise ValueError("Explicit history_steps requires layout_mode=decision_window")
+        self.history_steps = (
+            _integer(history_steps, "history_steps") if history_steps is not None else self.history_blocks * 32
+        )
+        self.action_horizon = _integer(action_horizon, "action_horizon", 1)
+        if self.layout_mode == "block" and self.action_horizon != 32:
+            raise ValueError("Legacy block batches require action_horizon=32")
+        if self.layout_mode == "decision_window":
+            if history_padding != "repeat_first" or self.history_steps % 16 or self.action_horizon % 16:
+                raise ValueError(
+                    "Decision windows require repeat_first and history_steps/action_horizon divisible by 16"
+                )
+        build_history_window(
+            0,
+            **(
+                dict(history_steps=self.history_steps)
+                if self.layout_mode == "decision_window"
+                else dict(history_blocks=self.history_blocks)
+            ),
+            history_padding=history_padding,
+        )
+        self.history_padding = history_padding
         geometry = CausalBlockGeometry(
             actions_per_block=_integer(actions_per_block, "actions_per_block", 1),
             video_stride=_integer(video_stride, "video_stride", 1),
@@ -114,18 +150,24 @@ class RTCObservedBatchBuilder:
             raise ValueError("reference statistics geometry differs from the RTC recipe")
         if provenance.get("template_id", self.template.template_id) != self.template.template_id:
             raise ValueError("reference statistics template differs from its SequencePlan")
-        if metadata.block_size != geometry.latent_frames_per_block:
+        compact_reference = getattr(metadata, "layout_mode", "block") == "decision_window"
+        if not compact_reference and metadata.block_size != geometry.latent_frames_per_block:
             raise ValueError("reference latent block size differs from the RTC recipe")
         ids = metadata.action_frame_ids
         if not isinstance(ids, torch.Tensor) or ids.ndim != 1 or ids.dtype != torch.long or ids.device.type != "cpu":
             raise ValueError("reference action_frame_ids must be a CPU int64 vector")
-        if not len(ids) or len(ids) % geometry.actions_per_block:
+        if not len(ids) or (not compact_reference and len(ids) % geometry.actions_per_block):
             raise ValueError("reference must contain complete 32-action blocks")
         count = len(ids) // geometry.actions_per_block
         expected = torch.arange(1, 1 + count * geometry.latent_frames_per_block).repeat_interleave(
             geometry.actions_per_latent_frame
         )
-        if not torch.equal(ids, expected) or video.shape[1] != 1 + len(ids) // geometry.video_stride:
+        if compact_reference:
+            expected = metadata.observed_latents + torch.arange(len(ids)) // geometry.actions_per_latent_frame
+            expected_video_frames = 1 + (metadata.history_steps + metadata.action_horizon) // geometry.video_stride
+        else:
+            expected_video_frames = 1 + len(ids) // geometry.video_stride
+        if not torch.equal(ids, expected) or video.shape[1] != expected_video_frames:
             raise ValueError("reference action/video geometry does not match its declared statistics")
         for name, expected_fps in (
             ("conditioning_fps", self.controller_hz / geometry.video_stride),
@@ -186,7 +228,9 @@ class RTCObservedBatchBuilder:
         return image.detach()
 
     @torch.no_grad()
-    def __call__(self, *, state, state_mask, image, action_mask, history=(), tick, revision, rtc=None):
+    def __call__(
+        self, *, state, state_mask, image, action_mask, history=(), tick, revision, rtc=None, first_image=None
+    ):
         tick, revision = _integer(tick, "tick"), _integer(revision, "revision")
         if not isinstance(state, torch.Tensor) or state.device.type != "cpu" or state.shape != (self.template.width,):
             raise ValueError("state must be a fresh CPU [template.width] physical measurement")
@@ -208,44 +252,85 @@ class RTCObservedBatchBuilder:
             observed[record_tick] = record.image
             previous_tick = record_tick
         observed[tick] = current_image
+        if first_image is not None:
+            first_image = self._image(first_image, "episode first_image")
+            if 0 in observed and not torch.equal(self._image(observed[0], "history image at tick 0"), first_image):
+                raise ValueError("episode first_image differs from the real tick-zero observation")
+            observed[0] = first_image
         geometry = self.geometry
-        h = min(tick // geometry.actions_per_block, self.history_blocks)
-        first_tick = tick - h * geometry.actions_per_block
-        selected_ticks = list(range(first_tick, tick + 1, geometry.video_stride))
-        missing = [t for t in selected_ticks if t not in observed]
+        window = build_history_window(
+            tick,
+            **(
+                dict(history_steps=self.history_steps)
+                if self.layout_mode == "decision_window"
+                else dict(history_blocks=self.history_blocks)
+            ),
+            actions_per_block=geometry.actions_per_block,
+            video_stride=geometry.video_stride,
+            history_padding=self.history_padding,
+        )
+        h, first_tick = window.history_blocks, window.window_start_tick
+        missing = [t for t in window.required_observation_ticks if t not in observed]
         if missing:
             raise ValueError(f"missing real historical video observations at ticks {missing}")
-        frames = [self._image(observed[t], f"history image at tick {t}") for t in selected_ticks]
-        future_frames = geometry.actions_per_block // geometry.video_stride
+        frames = [self._image(observed[t], f"history image at tick {t}") for t in window.observation_ticks]
+        horizon = self.action_horizon if self.layout_mode == "decision_window" else geometry.actions_per_block
+        future_frames = horizon // geometry.video_stride
         video = torch.zeros(
             (self.image_shape[0], len(frames) + future_frames, *self.image_shape[1:]), dtype=torch.uint8
         )
         video[:, : len(frames)] = torch.stack(frames, dim=1)
 
-        blocks = h + 1
-        action_steps, width = blocks * geometry.actions_per_block, self.template.width
+        compact = self.layout_mode == "decision_window"
+        observed_latents = 1 + window.history_steps // geometry.actions_per_latent_frame
+        blocks = 1 if compact else h + 1
+        current_state = 0 if compact else h
+        current_group = observed_latents if compact else h
+        action_steps, width = horizon if compact else blocks * geometry.actions_per_block, self.template.width
         anchors = torch.zeros((blocks, width), dtype=torch.float32)
-        anchors[h] = state
+        anchors[current_state] = state
         state_masks = torch.zeros((blocks, width), dtype=torch.bool)
-        state_masks[h] = sm
+        state_masks[current_state] = sm
         statistics = copy.deepcopy(self._statistics)
         states, state_clip = statistics.state.normalize(anchors, state_masks)
+        action_masks = am.expand(action_steps, -1).clone()
+        if self.history_padding == "repeat_first" and not compact:
+            action_masks[: h * geometry.actions_per_block] = False
         metadata = BlockStateMetadata(
-            block_size=geometry.latent_frames_per_block,
-            history_blocks=self.history_blocks,
-            action_frame_ids=torch.arange(1, 1 + blocks * geometry.latent_frames_per_block).repeat_interleave(
-                geometry.actions_per_latent_frame
+            block_size=horizon // geometry.actions_per_latent_frame if compact else geometry.latent_frames_per_block,
+            history_blocks=observed_latents if compact else self.history_blocks,
+            action_frame_ids=(
+                observed_latents + torch.arange(horizon) // geometry.actions_per_latent_frame
+                if compact
+                else torch.arange(1, 1 + blocks * geometry.latent_frames_per_block).repeat_interleave(
+                    geometry.actions_per_latent_frame
+                )
             ),
-            action_mask=am.expand(action_steps, -1).clone(),
+            action_mask=action_masks,
             states=states,
             state_mask=state_masks,
             state_action_indexes=torch.arange(blocks) * geometry.actions_per_block,
             anchors=anchors,
-            state_latent_indexes=torch.arange(blocks) * geometry.latent_frames_per_block,
+            state_latent_indexes=torch.tensor([observed_latents - 1])
+            if compact
+            else torch.arange(blocks) * geometry.latent_frames_per_block,
             source=f"rtc:revision={revision}:ticks={first_tick}..{tick}",
             state_clip_fraction=state_clip,
             statistics=statistics,
             template=copy.deepcopy(self.template),
+            include_visual_prefix=self.history_padding == "repeat_first",
+            **(
+                dict(
+                    layout_mode="decision_window",
+                    history_steps=self.history_steps,
+                    action_horizon=horizon,
+                    observed_latents=observed_latents,
+                    future_latents=horizon // geometry.actions_per_latent_frame,
+                    actions_per_latent_frame=geometry.actions_per_latent_frame,
+                )
+                if compact
+                else {}
+            ),
         )
         batch = copy.deepcopy(self._static)
         batch.update(
@@ -256,21 +341,25 @@ class RTCObservedBatchBuilder:
                 "sequence_plan": [
                     replace(
                         self._plan,
-                        condition_frame_indexes_vision=list(range(1 + h * geometry.latent_frames_per_block)),
+                        condition_frame_indexes_vision=list(range(observed_latents)),
+                        action_start_frame_offset=self.history_steps + 1 if compact else 1,
                         causal_action_metadata=metadata,
                     )
                 ],
                 "conditioning_fps": torch.tensor([self.controller_hz / geometry.video_stride], dtype=torch.float32),
                 "conditioning_fps_action": torch.tensor([self.controller_hz], dtype=torch.float32),
                 "raw_action_dim": [None],
-                "causal_action_current_block": h,
+                "causal_action_current_block": current_group,
+                "causal_action_layout": self.layout_mode,
                 "causal_action_mode": ["policy"],
                 "causal_action_cache_mode": self._cache_mode,
                 "causal_action_preview": False,
                 "is_preprocessed": False,
                 "rtc_observation_tick": tick,
                 "rtc_window_start_tick": first_tick,
-                "rtc_observation_ticks": torch.tensor(selected_ticks, dtype=torch.long),
+                "rtc_observation_ticks": torch.tensor(window.logical_ticks, dtype=torch.long),
+                "rtc_observation_source_ticks": torch.tensor(window.observation_ticks, dtype=torch.long),
+                "causal_action_history_padding": self.history_padding,
                 "rtc_episode_revision": revision,
             }
         )

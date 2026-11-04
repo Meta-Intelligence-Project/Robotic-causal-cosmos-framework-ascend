@@ -227,6 +227,94 @@ def test_missing_selected_frame_is_rejected_instead_of_repeating_a_picture():
         RTCObservedBatchBuilder(_reference(), controller_hz=30.0)(**request)
 
 
+@pytest.mark.parametrize("tick", [0, 1, 8, 16, 31, 32, 48, 64, 80])
+def test_repeat_first_keeps_fixed_shape_and_current_state_at_last_block(tick):
+    builder = RTCObservedBatchBuilder(
+        _reference(), controller_hz=30.0, history_blocks=2, history_padding="repeat_first"
+    )
+    request = _request(tick)
+    batch = builder(**request)
+    logical = list(range(tick - 64, tick + 1, 4))
+    sources = [max(0, t) for t in logical]
+    video = batch["video"][0]
+    assert batch["rtc_window_start_tick"] == tick - 64
+    assert batch["rtc_observation_ticks"].tolist() == logical
+    assert batch["rtc_observation_source_ticks"].tolist() == sources
+    assert batch["causal_action_current_block"] == 2
+    assert batch["causal_action_history_padding"] == "repeat_first"
+    assert video.shape == (3, 25, 16, 16)
+    assert torch.equal(video[:, :17], torch.stack([_image(t) for t in sources], dim=1))
+    assert not video[:, 17:].any()
+    assert batch["action"][0].shape == (96, 55)
+    metadata = batch["sequence_plan"][0].causal_action_metadata
+    assert metadata.include_visual_prefix
+    assert not metadata.state_mask[:2].any()
+    assert not metadata.action_mask[:64].any()
+    assert torch.equal(metadata.action_mask[64:], request["action_mask"].expand(32, -1))
+    assert not metadata.anchors[:2].any()
+    assert torch.equal(metadata.anchors[2], builder.template.sanitize(request["state"], request["state_mask"]))
+    assert batch["sequence_plan"][0].condition_frame_indexes_vision == list(range(5))
+
+
+def test_repeat_first_accepts_explicit_reset_image_after_history_buffer_drops_tick_zero():
+    builder = RTCObservedBatchBuilder(
+        _reference(), controller_hz=30.0, history_blocks=2, history_padding="repeat_first"
+    )
+    request = _request(16)
+    request["history"] = tuple(r for r in request["history"] if r.tick)
+    with pytest.raises(ValueError, match="missing.*0"):
+        builder(**request)
+    result = builder(**request, first_image=_image(0))
+    assert torch.equal(result["video"][0][:, 0], _image(0))
+    assert result["rtc_observation_source_ticks"].tolist() == [0] * 13 + [4, 8, 12, 16]
+
+
+def test_repeat_first_does_not_fill_missing_nonnegative_observation():
+    builder = RTCObservedBatchBuilder(
+        _reference(), controller_hz=30.0, history_blocks=2, history_padding="repeat_first"
+    )
+    request = _request(48)
+    request["history"] = tuple(r for r in request["history"] if r.tick != 20)
+    with pytest.raises(ValueError, match="missing.*20"):
+        builder(**request, first_image=_image(0))
+
+
+def test_repeat_first_rejects_conflicting_reset_image():
+    builder = RTCObservedBatchBuilder(
+        _reference(), controller_hz=30.0, history_blocks=2, history_padding="repeat_first"
+    )
+    with pytest.raises(ValueError, match="first_image differs"):
+        builder(**_request(16), first_image=_image(1))
+
+
+def test_repeat_first_full_1024_step_bootstrap_uses_measured_image_not_zeros_or_reference():
+    builder = RTCObservedBatchBuilder(
+        _reference(), controller_hz=30.0, history_blocks=32, history_padding="repeat_first"
+    )
+    request = _request(0)
+    request["image"] = torch.full_like(request["image"], 71)
+    batch = builder(**request)
+    assert batch["video"][0].shape == (3, 265, 16, 16)
+    assert (batch["video"][0][:, :257] == 71).all()
+    assert not batch["video"][0][:, 257:].any()
+    assert batch["causal_action_current_block"] == 32
+    assert batch["rtc_observation_ticks"][0] == -1024
+    metadata = batch["sequence_plan"][0].causal_action_metadata
+    assert metadata.states.shape == (33, 55)
+    assert not metadata.action_mask[:1024].any()
+    assert metadata.action_mask[1024:].any()
+
+
+def test_full_fixed_window_does_not_require_an_old_reset_image():
+    builder = RTCObservedBatchBuilder(
+        _reference(), controller_hz=30.0, history_blocks=2, history_padding="repeat_first"
+    )
+    request = _request(80)
+    request["history"] = tuple(r for r in request["history"] if r.tick >= 16)
+    batch = builder(**request)
+    assert batch["rtc_observation_source_ticks"].tolist() == list(range(16, 81, 4))
+
+
 @pytest.mark.parametrize("bad", ["future", "duplicate", "unsorted"])
 def test_invalid_history_timestamps_are_rejected(bad):
     request = _request(48)

@@ -20,6 +20,7 @@ from cosmos_framework.data.generator.action.segment_planner import SegmentPlanne
 def make_reader(
     monkeypatch, *, lengths=(100, 50), offset=0, from_state=False, root="synthetic", use_subtask=False, split="full"
 ):
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     template = ActionStateTemplate55()
     size = sum(lengths)
     state = torch.arange(size, dtype=torch.float32)[:, None].expand(-1, template.width).clone()
@@ -72,6 +73,87 @@ def make_reader(
         split=split,
     )
     return reader, queries
+
+
+@pytest.mark.parametrize("early", [False, True])
+@pytest.mark.parametrize("backend", ["hf", "parquet"])
+@pytest.mark.parametrize("idx,offset", [(0, 0), (0, 16), (1, 8), (2, 0)])
+def test_prediction_history_uses_episode_origin_not_segment_start(monkeypatch, early, backend, idx, offset):
+    reader, _ = make_reader(monkeypatch)
+    if backend == "parquet":
+        ds = reader._get_dataset(0)
+        reader.table_backend = "parquet"
+        reader._direct_meta, reader._file_starts = ds.meta, {}
+
+        def read_rows(meta, episode_id, begin, end, columns, *, file_starts):
+            episode = meta.episodes[episode_id]
+            assert episode["dataset_from_index"] <= begin < end <= episode["dataset_to_index"]
+            return {
+                key: value.tolist()
+                for key, value in ds._query_hf_dataset({key: list(range(begin, end)) for key in columns}).items()
+            }
+
+        monkeypatch.setattr(module, "read_window", read_rows)
+    reader.early_video_sampling = early
+    reader._pyav_resize = True
+
+    def images(meta, episode_id, timestamps, *, viewpoint):
+        ticks = torch.tensor([round(t * 30) + episode_id * 100 for t in timestamps], dtype=torch.uint8)
+        return ticks.view(1, -1, 1, 1).expand(3, -1, 2, 2).clone()
+
+    monkeypatch.setattr(reader, "_read_video", images)
+    sample = reader.read_prediction_window(idx, history_blocks=2, anchor_offset=offset)
+    _, episode, segment_start, _ = reader._segments[idx]
+    episode_start = (0, 100)[episode]
+    anchor = segment_start + offset
+    tick = anchor - episode_start
+    window = sample["history_window"]
+    expected = [max(0, t) + episode * 100 for t in range(tick - 64, tick + 1, 4)]
+    expected += [t + episode * 100 for t in range(tick + 4, tick + 33, 4)]
+    assert sample["video"][0, :, 0, 0].tolist() == expected
+    assert sample["history_episode_id"] == episode
+    assert window.window_start_tick == tick - 64
+    assert sample["action_target"].shape == (32, 55)
+    torch.testing.assert_close(sample["state_trajectory"][:, 0], torch.arange(anchor, anchor + 33).float())
+    torch.testing.assert_close(sample["action_target"][:, 0], torch.arange(anchor, anchor + 32).float() + 1000)
+    assert "video_observation_indexes" not in sample
+
+
+@pytest.mark.parametrize("anchor_offset", [-1, 33, 1.5, True])
+def test_prediction_window_rejects_padding_future_targets(monkeypatch, anchor_offset):
+    reader, _ = make_reader(monkeypatch)
+    with pytest.raises(ValueError, match="real prediction block"):
+        reader.read_prediction_window(0, history_blocks=2, anchor_offset=anchor_offset)
+
+
+def test_prediction_window_rejects_gaps_in_real_history_timestamps(monkeypatch):
+    reader, _ = make_reader(monkeypatch)
+    ds = reader._get_dataset(0)
+    times = list(ds.hf_dataset.with_format(None)["timestamp"])
+    times[4] += 0.01
+    ds.hf_dataset = Dataset.from_dict({"timestamp": times})
+    with pytest.raises(ValueError, match="historical timestamps"):
+        reader.read_prediction_window(1, history_blocks=2, anchor_offset=0)
+
+
+@pytest.mark.parametrize("history,horizon", [(48, 32), (64, 48), (1024, 16)])
+def test_prediction_window_reads_independent_history_and_real_future_lengths(monkeypatch, history, horizon):
+    reader, _ = make_reader(monkeypatch)
+    reader._pyav_resize = True
+
+    def images(meta, episode_id, timestamps, *, viewpoint):
+        ticks = torch.tensor([round(t * 30) for t in timestamps], dtype=torch.uint8)
+        return ticks.view(1, -1, 1, 1).expand(3, -1, 2, 2).clone()
+
+    monkeypatch.setattr(reader, "_read_video", images)
+    raw = reader.read_prediction_window(0, history_steps=history, action_horizon=horizon, anchor_offset=0)
+    assert raw["video"].shape == (3, 1 + (history + horizon) // 4, 2, 2)
+    assert raw["history_window"].history_steps == history
+    assert raw["action_horizon"] == horizon
+    assert raw["state_trajectory"].shape == (horizon + 1, 55)
+    assert raw["action_target"].shape == (horizon, 55)
+    assert not raw["video"][:, : 1 + history // 4].any()
+    assert raw["video"][0, -1, 0, 0] == horizon
 
 
 @pytest.mark.parametrize("offset", [-2, 0, 1, 3])

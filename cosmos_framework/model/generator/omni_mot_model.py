@@ -229,6 +229,7 @@ class OmniMoTModel(ImaginaireModel):
                 joint_attn_implementation=self.config.joint_attn_implementation,
                 timestep_scale=1.0 / float(num_train_timesteps) * self.config.diffusion_expert_config.timestep_range,
                 action_dim=self.config.max_action_dim,
+                add_action_flag=self.config.add_action_flag,
                 num_embodiment_domains=self.config.num_embodiment_domains,
                 temporal_compression_factor_vision=self.tokenizer_vision_gen.temporal_compression_factor,
                 natten_parameter_list=self.config.natten_parameter_list,
@@ -541,8 +542,7 @@ class OmniMoTModel(ImaginaireModel):
     def _derive_include_end_of_generation_token(self) -> bool:
         impl = self.config.joint_attn_implementation
         assert impl in ("two_way", "three_way", "teacher_forcing"), (
-            f"Invalid joint_attn_implementation: {impl}. "
-            "Must be 'two_way', 'three_way', or 'teacher_forcing'."
+            f"Invalid joint_attn_implementation: {impl}. Must be 'two_way', 'three_way', or 'teacher_forcing'."
         )
         return False
 
@@ -1473,7 +1473,9 @@ class OmniMoTModel(ImaginaireModel):
                     shifts_list.append(shift_dict[resolution])
                 shifts = torch.tensor(shifts_list, dtype=torch.float32)
 
-        # Teacher forcing samples one independent noise time per causal block and
+        # A robot decision window samples one noise time for its current targets;
+        # its clean observed prefix is excluded by conditioning masks. Legacy video
+        # teacher forcing samples one independent noise time per causal block and
         # expands it across that sample's block frames. Diffusion forcing keeps
         # one independent time per VAE latent frame. Other strategies use one
         # shared noise time per sample.
@@ -1486,11 +1488,13 @@ class OmniMoTModel(ImaginaireModel):
                     f"got {len(teacher_forcing_geometry.block_sizes)} and {batch_size}"
                 )
             # 上取整，计算有多少个block，计算后续sigma采样数量
+            window_flags = getattr(teacher_forcing_geometry, "decision_windows", ()) or (False,) * batch_size
             block_counts = [
-                1 + math.ceil((num_frames - 1) / block_size)
-                for num_frames, block_size in zip(
+                1 if window else 1 + math.ceil((num_frames - 1) / block_size)
+                for num_frames, block_size, window in zip(
                     num_vision_latent_frames,
                     teacher_forcing_geometry.block_sizes,
+                    window_flags,
                     strict=True,
                 )
             ]
@@ -1512,8 +1516,12 @@ class OmniMoTModel(ImaginaireModel):
                 )
             ):
                 sample_block_sigmas = block_sigmas[block_offset : block_offset + block_count]
-                frame_block_ids = build_teacher_forcing_frame_block_ids(num_frames, block_size).to(
-                    device=sample_block_sigmas.device
+                frame_block_ids = (
+                    torch.zeros(num_frames, dtype=torch.long, device=sample_block_sigmas.device)
+                    if window_flags[sample_id]
+                    else build_teacher_forcing_frame_block_ids(num_frames, block_size).to(
+                        device=sample_block_sigmas.device
+                    )
                 )
                 sigmas[sample_id, :num_frames] = sample_block_sigmas.index_select(0, frame_block_ids)
                 block_offset += block_count
@@ -3610,6 +3618,99 @@ class OmniMoTModel(ImaginaireModel):
 
         return x0_tokens_vision
 
+    @torch.no_grad()
+    def _encode_fixed_window_vision(self, raw_state_vision, plans, vision_condition_indexes):
+        """Canonical 1+4 VAE grouping for independently reset action windows.
+
+        Training encodes the target video too. Inference encodes only observed
+        frames, matching the ahead-of-trigger streaming session exactly.
+        """
+        tokenizer = self.tokenizer_vision_gen
+        required = ("stream_encode_start", "stream_encode_step", "stream_encode_finish", "stream_encode_abort")
+        if not all(callable(getattr(tokenizer, name, None)) for name in required):
+            raise ValueError("Fixed action windows require a streaming-capable causal tokenizer")
+        outputs = []
+        for i, (raw, plan) in enumerate(zip(raw_state_vision, plans, strict=True)):
+            metadata = getattr(plan, "causal_action_metadata", None)
+            indexes = vision_condition_indexes[i] if vision_condition_indexes is not None else None
+            if not (
+                getattr(metadata, "layout_mode", "block") == "decision_window"
+                or getattr(metadata, "include_visual_prefix", False)
+            ):
+                outputs.extend(self._encode_vision_x0_tokens([raw], None, [indexes] if indexes is not None else None))
+                continue
+            if raw.ndim not in (4, 5) or (raw.ndim == 5 and raw.shape[0] != 1):
+                raise ValueError("Fixed action windows require one video per vision item")
+            frames = raw.unsqueeze(0) if raw.ndim == 4 else raw
+            total = tokenizer.get_latent_num_frames(frames.shape[2])
+            needed = frames.shape[2]
+            if indexes is not None:
+                if not indexes or list(indexes) != list(range(len(indexes))) or len(indexes) > total:
+                    raise ValueError("Fixed-window inference requires contiguous observed prefix indexes")
+                needed = tokenizer.get_pixel_num_frames(len(indexes))
+            session = tokenizer.stream_encode_start(frames[:, :, :1])
+            try:
+                for start in range(1, needed, tokenizer.temporal_compression_factor):
+                    tokenizer.stream_encode_step(
+                        session, frames[:, :, start : start + tokenizer.temporal_compression_factor]
+                    )
+                latent = tokenizer.stream_encode_finish(session)
+            finally:
+                tokenizer.stream_encode_abort(session)
+            if indexes is not None and latent.shape[2] < total:
+                latent = torch.cat(
+                    [latent, latent.new_zeros((*latent.shape[:2], total - latent.shape[2], *latent.shape[3:]))], dim=2
+                )
+            outputs.append(latent.squeeze(0) if raw.ndim == 4 else latent)
+        return outputs
+
+    def _scatter_precomputed_vision_prefixes(
+        self,
+        raw_state_vision,
+        prefixes,
+        vision_condition_indexes,
+        num_vision_items_per_sample=None,
+        num_views_per_vision_item=None,
+    ):
+        """Use window-scoped inference latents before the ordinary padding crop.
+
+        Prefixes have already passed through the tokenizer's normalization. Only
+        generated positions are zero-filled; no tokenizer work is repeated here.
+        """
+        tokenizer = self.tokenizer_vision_gen
+        if torch.is_grad_enabled() or vision_condition_indexes is None:
+            raise ValueError("Precomputed visual prefixes require no-grad inference conditioning")
+        if (
+            tokenizer is None
+            or not tokenizer.is_causal
+            or num_vision_items_per_sample is not None
+            or (num_views_per_vision_item is not None and any(n != 1 for n in num_views_per_vision_item))
+        ):
+            raise ValueError("Precomputed prefixes require single-view causal vision items")
+        if not isinstance(prefixes, (list, tuple)) or not (
+            len(prefixes) == len(raw_state_vision) == len(vision_condition_indexes)
+        ):
+            raise ValueError("One precomputed visual prefix required per sample")
+        outputs = []
+        for raw, prefix, indexes in zip(raw_state_vision, prefixes, vision_condition_indexes, strict=True):
+            if raw.ndim not in (4, 5) or (raw.ndim == 5 and raw.shape[0] != 1):
+                raise ValueError("Precomputed prefixes require one video per item")
+            if not indexes or list(indexes) != list(range(len(indexes))):
+                raise ValueError("Precomputed prefix conditioning must be contiguous from frame zero")
+            if not isinstance(prefix, torch.Tensor) or prefix.ndim != 4 or not prefix.is_floating_point():
+                raise ValueError("Precomputed prefix must be a floating [C,T,H,W] tensor")
+            frames = tokenizer.get_latent_num_frames(raw.shape[-3])
+            factor = tokenizer.spatial_compression_factor
+            expected = (tokenizer.latent_ch, len(indexes), raw.shape[-2] // factor, raw.shape[-1] // factor)
+            if tuple(prefix.shape) != expected or len(indexes) > frames:
+                raise ValueError(f"Precomputed visual prefix shape must be {expected}, got {tuple(prefix.shape)}")
+            if prefix.device != raw.device or not torch.isfinite(prefix).all():
+                raise ValueError("Precomputed visual prefix must be finite and on the video device")
+            full = prefix.new_zeros((expected[0], frames, *expected[2:]), dtype=raw.dtype)
+            full[:, : len(indexes)] = prefix.detach().to(dtype=raw.dtype)
+            outputs.append(full.unsqueeze(0) if raw.ndim == 5 else full)
+        return outputs
+
     def get_data_and_condition(
         self,
         data_batch: dict[str, torch.Tensor],
@@ -3688,13 +3789,33 @@ class OmniMoTModel(ImaginaireModel):
             num_vision_items_per_sample,
             batch_size,
         )
-        x0_tokens_vision = self._encode_vision_x0_tokens(
-            raw_state_vision,
-            num_vision_items_per_sample,
-            vision_condition_indexes,
-            num_views_per_vision_item,
-            frames_per_vision_item,
+        precomputed_prefixes = data_batch.get("causal_action_precomputed_vision_prefix")
+        plans = data_batch.get("sequence_plan", [])
+        fixed_windows = any(
+            getattr(getattr(plan, "causal_action_metadata", None), "layout_mode", "block") == "decision_window"
+            or getattr(getattr(plan, "causal_action_metadata", None), "include_visual_prefix", False)
+            for plan in plans
         )
+        if precomputed_prefixes is not None:
+            x0_tokens_vision = self._scatter_precomputed_vision_prefixes(
+                raw_state_vision,
+                precomputed_prefixes,
+                vision_condition_indexes,
+                num_vision_items_per_sample,
+                num_views_per_vision_item,
+            )
+        elif fixed_windows:
+            if num_vision_items_per_sample is not None or any(v != 1 for v in num_views_per_vision_item or []):
+                raise ValueError("Fixed action windows require single-view vision items")
+            x0_tokens_vision = self._encode_fixed_window_vision(raw_state_vision, plans, vision_condition_indexes)
+        else:
+            x0_tokens_vision = self._encode_vision_x0_tokens(
+                raw_state_vision,
+                num_vision_items_per_sample,
+                vision_condition_indexes,
+                num_views_per_vision_item,
+                frames_per_vision_item,
+            )
 
         frame_size = data_batch.get("image_size", None)
         if frame_size is not None:

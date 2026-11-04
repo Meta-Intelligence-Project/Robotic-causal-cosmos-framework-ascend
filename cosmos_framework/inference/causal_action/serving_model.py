@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: OpenMDW-1.1
-"""Stateless model requests using the validated local ordinary/RTC planner.
+"""Validated ordinary/RTC requests with optional window-scoped observation encoding.
 
 Client helpers import CPU preprocessing lazily and never load a checkpoint.
-Only the live episode's prompt/schema are retained; video/KV values are local
-to each request, including repeated startup calibration requests.
+Real RGB can persist across decisions; Transformer KV remains request-local.
 """
 
 import json
@@ -67,14 +66,20 @@ class ServingModelPolicy:
         statistics,
         template=None,
         adapter=None,
-        history_blocks=32,
+        history_blocks=None,
+        history_steps=None,
+        action_horizon=32,
+        layout_mode=None,
         execute_steps=16,
+        handoff_steps=None,
         controller_hz=30.0,
         resolution="480",
         num_steps=10,
         guidance=1.0,
         cache_mode="full",
         enable_rtc=False,
+        history_padding="repeat_first",
+        streaming_vae=False,
         seed=42,
     ):
         from cosmos_framework.data.generator.action.action_state_template import ActionStateTemplate55
@@ -88,10 +93,57 @@ class ServingModelPolicy:
         self.geometry = CausalBlockGeometry(temporal_compression_factor=4)
         if statistics.provenance.get("geometry") != asdict(self.geometry):
             raise ValueError("Serving statistics must declare the same 32-action/stride4/VAE4 geometry")
-        self.history_blocks = _integer(history_blocks, "history_blocks", 1)
+        if history_steps is not None and history_blocks is not None:
+            raise ValueError("Use history_steps (action steps) or legacy history_blocks, not both")
+        if history_blocks is not None:
+            history_blocks = _integer(history_blocks, "history_blocks", 1)
+        self.history_steps = _integer(
+            history_steps if history_steps is not None else 1024 if history_blocks is None else history_blocks * 32,
+            "history_steps",
+        )
+        self.action_horizon = _integer(action_horizon, "action_horizon", 1)
+        if self.history_steps % 16 or self.action_horizon % 16:
+            raise ValueError("history_steps and action_horizon must be divisible by 16")
+        self.history_blocks = max(1, (self.history_steps + 31) // 32)  # 仅旧接口别名：1 block=32个action步。
+        self.layout_mode = layout_mode or ("decision_window" if history_padding == "repeat_first" else "block")
+        if self.layout_mode not in ("block", "decision_window"):
+            raise ValueError("layout_mode must be block or decision_window")
+        if self.layout_mode == "block" and (
+            self.history_steps < 32 or self.history_steps % 32 or self.action_horizon != 32
+        ):
+            raise ValueError("Legacy block serving requires history_steps divisible by 32 and action_horizon=32")
+        if self.layout_mode == "decision_window" and history_padding != "repeat_first":
+            raise ValueError("Decision windows require history_padding=repeat_first")
+        if history_padding not in ("available", "repeat_first"):
+            raise ValueError("history_padding must be available or repeat_first")
+        if streaming_vae and history_padding != "repeat_first":
+            raise ValueError(
+                "streaming_vae requires history_padding=repeat_first; available retains its original encoder"
+            )
+        self.history_padding, self.streaming_vae = history_padding, bool(streaming_vae)
+        self.window_encoder = None
+        if self.streaming_vae:
+            from cosmos_framework.inference.causal_action.window_streaming import ObservationWindowEncoder
+
+            self.window_encoder = ObservationWindowEncoder(
+                model,
+                history_steps=self.history_steps,
+                action_horizon=self.action_horizon,
+                history_padding=self.history_padding,
+            )
         self.execute_steps = _integer(execute_steps, "execute_steps", 1)
-        if not self.execute_steps < self.geometry.actions_per_block:
-            raise ValueError("execute_steps must be smaller than the prediction horizon")
+        if not self.execute_steps <= self.action_horizon:
+            raise ValueError("execute_steps must not exceed the prediction horizon")
+        # S为开始推理的步数，R为固定交接点；S=H仍可用于direct RPC/RTC。
+        self.handoff_steps = (
+            min(self.action_horizon, self.execute_steps + max(1, self.execute_steps // 2))
+            if handoff_steps is None and self.execute_steps < self.action_horizon
+            else handoff_steps
+        )
+        if self.handoff_steps is not None:
+            self.handoff_steps = _integer(self.handoff_steps, "handoff_steps", 1)
+            if self.handoff_steps > self.action_horizon:
+                raise ValueError("handoff_steps must not exceed the prediction horizon")
         if isinstance(controller_hz, bool) or not math.isfinite(controller_hz) or controller_hz <= 0:
             raise ValueError("controller_hz must be positive and finite")
         self.controller_hz = float(controller_hz)
@@ -113,11 +165,17 @@ class ServingModelPolicy:
             T_world_base=self.adapter.T_world_base,
         )
         return dict(
-            actions_per_block=self.geometry.actions_per_block,
+            actions_per_block=self.action_horizon,  # legacy wire字段，仅表示预测H，不再用于历史长度换算。
+            action_horizon=self.action_horizon,
+            history_steps=self.history_steps,
+            layout_mode=self.layout_mode,
             execute_steps=self.execute_steps,
+            handoff_steps=self.handoff_steps,
             controller_hz=self.controller_hz,
             fps=self.controller_hz,
             history_blocks=self.history_blocks,
+            history_padding=self.history_padding,
+            streaming_vae=self.streaming_vae,
             video_stride=self.geometry.video_stride,
             resolution=self.resolution,
             rtc_enabled=self.enable_rtc,
@@ -132,8 +190,24 @@ class ServingModelPolicy:
         )
 
     def clear(self):
+        if self.window_encoder is not None:
+            self.window_encoder.clear()
         self.builder = self.planner = self._reference = None
-        self.prompt = None
+        self.prompt = self.first_image = None
+
+    def observe(self, request):
+        if self.planner is None:
+            raise ValueError("Reset before sending observations")
+        if not self.streaming_vae:
+            raise ValueError("streaming_vae is disabled on this server")
+        self.window_encoder.add(_integer(request["tick"], "tick"), request["image"])
+        return {}
+
+    def prepare_window(self, request):
+        if self.planner is None or not self.streaming_vae:
+            raise ValueError("Reset a streaming_vae server before preparing a window")
+        self.window_encoder.prepare(_integer(request["anchor_tick"], "anchor_tick"))
+        return {}
 
     def _measurement(self, request):
         import torch
@@ -172,10 +246,8 @@ class ServingModelPolicy:
         metadata = BlockStateMetadata(
             block_size=g.latent_frames_per_block,
             history_blocks=self.history_blocks,
-            action_frame_ids=torch.arange(1, 1 + g.latent_frames_per_block).repeat_interleave(
-                g.actions_per_latent_frame
-            ),
-            action_mask=am.expand(g.actions_per_block, -1).clone(),
+            action_frame_ids=1 + torch.arange(self.action_horizon) // g.actions_per_latent_frame,
+            action_mask=am.expand(self.action_horizon, -1).clone(),
             states=normalized,
             state_mask=sm[None].clone(),
             state_action_indexes=torch.zeros(1, dtype=torch.long),
@@ -185,13 +257,25 @@ class ServingModelPolicy:
             template=self.template,
             state_clip_fraction=clip,
             source="live-policy-bootstrap-schema",
+            **(
+                dict(
+                    layout_mode="decision_window",
+                    history_steps=0,
+                    action_horizon=self.action_horizon,
+                    observed_latents=1,
+                    future_latents=self.action_horizon // g.actions_per_latent_frame,
+                    actions_per_latent_frame=g.actions_per_latent_frame,
+                )
+                if self.layout_mode == "decision_window"
+                else {}
+            ),
         )
-        video = torch.zeros((3, 1 + g.actions_per_block // g.video_stride, *image.shape[1:]), dtype=torch.uint8)
+        video = torch.zeros((3, 1 + self.action_horizon // g.video_stride, *image.shape[1:]), dtype=torch.uint8)
         video[:, 0] = image
         sample = dict(
             video=video,
-            action=torch.zeros(g.actions_per_block, self.template.width),
-            action_raw=torch.zeros(g.actions_per_block, self.template.width),
+            action=torch.zeros(self.action_horizon, self.template.width),
+            action_raw=torch.zeros(self.action_horizon, self.template.width),
             ai_caption=prompt,
             mode="policy",
             viewpoint="concat_view",
@@ -203,13 +287,19 @@ class ServingModelPolicy:
             action_processing_record=ActionProcessingRecord(self.template.width, None),
             causal_action_cache_mode=self.cache_mode,
         )
+        # caption时长须与训练完整P+H窗口一致；expand只提供shape，不复制历史RGB。
+        if self.layout_mode == "decision_window":
+            sample["video"] = image[:, None].expand(
+                -1, 1 + (self.history_steps + self.action_horizon) // g.video_stride, -1, -1
+            )
         sample = ActionPromptJsonFormatter()(sample)
+        sample["video"] = video
         # Training's TextTokenizerTransform serializes this structure before
         # passing it to the chat template. Serving tokenizes inside the model.
         sample["ai_caption"] = json.dumps(sample["ai_caption"])
         sample["sequence_plan"] = replace(
             build_sequence_plan_from_mode(
-                "policy", video_length=video.shape[1], action_length=g.actions_per_block, video_temporal_downsample=4
+                "policy", video_length=video.shape[1], action_length=self.action_horizon, video_temporal_downsample=4
             ),
             causal_action_metadata=metadata,
         )
@@ -233,15 +323,22 @@ class ServingModelPolicy:
             if tick or revision or not isinstance(prompt, str) or not prompt.strip():
                 raise ValueError("Reset requires tick/revision zero and a nonempty task prompt")
             state, image = self._measurement(request)
+            self.first_image = image.clone()
             self._reference = self._build_reference(state, image, request["image_size"], prompt)
             self.builder = RTCObservedBatchBuilder(
-                self._reference, controller_hz=self.controller_hz, history_blocks=self.history_blocks
+                self._reference,
+                controller_hz=self.controller_hz,
+                history_blocks=self.history_blocks,
+                history_padding=self.history_padding,
+                history_steps=self.history_steps if self.layout_mode == "decision_window" else None,
+                action_horizon=self.action_horizon,
+                layout_mode=self.layout_mode,
             )
             self.planner = make_model_planner(
                 self.model,
                 self.builder,
                 template=self.template,
-                horizon=self.geometry.actions_per_block,
+                horizon=self.action_horizon,
                 controller_hz=self.controller_hz,
                 history_blocks=self.history_blocks,
                 num_steps=self.num_steps,
@@ -279,12 +376,30 @@ class ServingModelPolicy:
             revision=revision,
             rtc=rtc,
         )
+        if self.history_padding == "repeat_first":
+            inputs["first_image"] = self.first_image
+        timing = {}
+        if self.window_encoder is not None:
+            prepared = self.window_encoder.count if self.window_encoder.anchor == tick else 0
+            try:
+                # A delayed request owns its frozen real history even when the
+                # observation transport has already advanced the rolling buffer.
+                for record in history:
+                    self.window_encoder.add(record.tick, record.image, prune=False)
+                self.window_encoder.add(tick, image, prune=False)
+                prefix, timing = self.window_encoder.finish(tick)
+            finally:
+                self.window_encoder.prune()
+            timing["sampled_frames_encoded_before_predict"] = prepared
+            inputs["prepared_vision_prefix"] = prefix
         actions = self.planner(**inputs)
-        return dict(actions=actions.numpy(), tick=tick, revision=revision)
+        return dict(actions=actions.numpy(), tick=tick, revision=revision, streaming_timing=timing)
 
 
 def load_policy(args):
     """Load one model rank; no training dataset or recorded observation is needed."""
+    if getattr(args, "streaming_vae", False) and getattr(args, "history_padding", "repeat_first") != "repeat_first":
+        raise ValueError("streaming_vae requires history_padding=repeat_first")
     os.environ.setdefault("COSMOS_DEVICE", "npu")
     os.environ["WAN_VAE_PATH"] = args.vae
     if int(os.environ.get("WORLD_SIZE", "1")) != 1:
@@ -332,13 +447,18 @@ def load_policy(args):
         statistics=statistics,
         template=template,
         adapter=adapter,
-        history_blocks=args.history,
+        history_blocks=getattr(args, "history", None),
+        history_steps=getattr(args, "history_steps", None),
+        action_horizon=getattr(args, "action_horizon", 32),
         execute_steps=args.execute_steps,
+        handoff_steps=getattr(args, "handoff_steps", None),
         controller_hz=args.fps,
         resolution=args.resolution,
         num_steps=args.steps,
         guidance=args.guidance,
         cache_mode=getattr(args, "cache_mode", "full"),
         enable_rtc=args.enable_rtc,
+        history_padding=getattr(args, "history_padding", "repeat_first"),
+        streaming_vae=getattr(args, "streaming_vae", False),
         seed=args.seed,
     )

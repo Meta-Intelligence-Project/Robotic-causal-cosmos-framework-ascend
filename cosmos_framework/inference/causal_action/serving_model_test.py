@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from cosmos_framework.data.generator.action.action_state_template import ActionStateTemplate55
-from cosmos_framework.data.generator.action.block_state import BlockStatistics, Quantiles, prediction_block_ids
+from cosmos_framework.data.generator.action.block_state import BlockStatistics, Quantiles
 from cosmos_framework.data.generator.action.causal_block_geometry import CausalBlockGeometry
 from cosmos_framework.data.generator.action.transforms import VideoResize
 from cosmos_framework.data.generator.action.video_view import VideoViewConfig
@@ -37,7 +37,8 @@ class Model:
         self.calls.append((batch, options))
         metadata = batch["sequence_plan"][0].causal_action_metadata
         current = batch["causal_action_current_block"]
-        generated = prediction_block_ids(metadata.action_frame_ids, metadata.block_size) == current
+        generated = torch.zeros(len(metadata.action_frame_ids), dtype=torch.bool)
+        generated[metadata.action_indexes_for_group(current)] = True
         result = dict(
             action=[torch.zeros_like(metadata.action_mask, dtype=torch.float32)], generated_action_mask=[generated]
         )
@@ -47,7 +48,7 @@ class Model:
         return result
 
 
-def policy(*, enable_rtc=True, **kwargs):
+def policy(*, enable_rtc=True, model=None, **kwargs):
     template = ActionStateTemplate55()
     mask = torch.zeros(55, dtype=torch.bool)
     mask[:6] = mask[7:13] = mask[28:30] = True
@@ -61,7 +62,10 @@ def policy(*, enable_rtc=True, **kwargs):
             template_id=template.template_id,
         ),
     )
-    return ServingModelPolicy(Model(), statistics=stats, adapter=adapter, enable_rtc=enable_rtc, **kwargs)
+    kwargs.setdefault("history_padding", "available")
+    return ServingModelPolicy(
+        Model() if model is None else model, statistics=stats, adapter=adapter, enable_rtc=enable_rtc, **kwargs
+    )
 
 
 def image(tick):
@@ -220,3 +224,93 @@ def test_rtc_requires_a_bootstrap_and_server_opt_in_and_complete_actual_history(
         service.infer(predict_request(history=[]))
     service.clear()
     assert service.builder is service.planner is None
+
+
+def test_repeat_first_has_full_history_at_reset_and_keeps_the_true_initial_image():
+    service = policy(history_blocks=1, history_padding="repeat_first")
+    service.infer(reset_request())
+    batch, _ = service.model.calls[-1]
+    assert batch["causal_action_current_block"] == 3
+    assert batch["action"][0].shape == (32, 55)
+    assert batch["sequence_plan"][0].causal_action_metadata.states.shape == (1, 55)
+    assert batch["rtc_observation_ticks"].tolist() == list(range(-32, 1, 4))
+    assert batch["rtc_observation_source_ticks"].tolist() == [0] * 9
+    request = predict_request(16, history=[dict(tick=t, image=image(t)) for t in range(0, 16, 4)])
+    service.infer(request)
+    batch, _ = service.model.calls[-1]
+    assert batch["rtc_observation_ticks"].tolist() == list(range(-16, 17, 4))
+    assert batch["rtc_observation_source_ticks"].tolist() == [0, 0, 0, 0, 0, 4, 8, 12, 16]
+    np.testing.assert_array_equal(service.first_image.numpy(), image(0))
+
+
+def test_streaming_rejects_legacy_available_padding_before_loading_a_tokenizer():
+    with pytest.raises(ValueError, match="streaming_vae requires history_padding=repeat_first"):
+        policy(history_padding="available", streaming_vae=True)
+
+
+@pytest.mark.parametrize("past,horizon,duration", [(48, 32, "2s"), (1024, 32, "35s"), (48, 48, "3s")])
+def test_compact_caption_matches_the_full_training_video_window(past, horizon, duration):
+    service = policy(history_steps=past, action_horizon=horizon, history_padding="repeat_first")
+    service.infer(reset_request())
+    batch, _ = service.model.calls[-1]
+    assert json.loads(batch["ai_caption"][0])["duration"] == duration
+    assert batch["action"][0].shape == (horizon, 55)
+    assert batch["sequence_plan"][0].causal_action_metadata.states.shape == (1, 55)
+
+
+def test_cli_history_units_remain_independent_of_action_horizon_and_legacy_alias():
+    from cosmos_framework.inference.causal_action.server import parser
+
+    required = ["--checkpoint", "weights", "--processor", "processor", "--vae", "vae", "--statistics", "stats"]
+    args = parser().parse_args(required + ["--history_steps", "48", "--action-horizon", "48"])
+    assert args.history_steps == 48 and args.action_horizon == 48 and args.history is None
+    legacy = parser().parse_args(required + ["--history", "32", "--action_horizon", "48"])
+    service = policy(
+        history_blocks=legacy.history, action_horizon=legacy.action_horizon, history_padding="repeat_first"
+    )
+    assert service.metadata["history_steps"] == 1024
+    assert service.metadata["action_horizon"] == 48
+    with pytest.raises(ValueError, match="not both"):
+        policy(history_blocks=32, history_steps=1024)
+
+
+def test_async_schedule_metadata_and_cli_do_not_restrict_direct_rpc_horizon():
+    from cosmos_framework.inference.causal_action.server import parser
+
+    required = ["--checkpoint", "weights", "--processor", "processor", "--vae", "vae", "--statistics", "stats"]
+    args = parser().parse_args(required + ["--execute-steps", "16", "--handoff-steps", "26"])
+    assert args.execute_steps == 16 and args.handoff_steps == 26
+    assert policy().metadata["handoff_steps"] == 24
+    assert policy(handoff_steps=26).metadata["handoff_steps"] == 26
+    # S=H可直接调用模型；只有客户端选择async时才需要S<R<=H。
+    short = policy(history_steps=0, action_horizon=16, execute_steps=16, history_padding="repeat_first")
+    assert short.metadata["handoff_steps"] is None
+    assert short.infer(reset_request())["actions"].shape == (16, 55)
+    with pytest.raises(ValueError, match="handoff_steps"):
+        policy(handoff_steps=33)
+
+
+def test_streaming_prefix_is_prepared_during_observation_delivery_and_passed_to_the_model():
+    from cosmos_framework.inference.causal_action.window_streaming_test import Tokenizer
+
+    service = policy(history_blocks=1, history_padding="repeat_first")
+    service.model.tokenizer_vision_gen = Tokenizer()
+    service.model.tensor_kwargs_fp32 = dict(device="cpu", dtype=torch.float32)
+    from cosmos_framework.inference.causal_action.window_streaming import ObservationWindowEncoder
+
+    service.streaming_vae = True
+    service.window_encoder = ObservationWindowEncoder(service.model, history_blocks=1, history_padding="repeat_first")
+    service.infer(reset_request())
+    service.prepare_window(dict(anchor_tick=16))
+    assert service.window_encoder.count == 5
+    for tick in range(1, 17):
+        service.observe(dict(tick=tick, image=image(tick)))
+    assert len(service.model.calls) == 1
+    request = predict_request(16, history=[dict(tick=t, image=image(t)) for t in range(0, 16, 4)])
+    result = service.infer(request)
+    batch, _ = service.model.calls[-1]
+    prefix = batch["causal_action_precomputed_vision_prefix"][0]
+    assert prefix.shape == (1, 3, 1, 1)
+    assert result["streaming_timing"]["sampled_frames_encoded_before_predict"] == 9
+    assert not result["streaming_timing"]["streaming_window_rebuilt"]
+    assert "causal_action_rtc" not in batch

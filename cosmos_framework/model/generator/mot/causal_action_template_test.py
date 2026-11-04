@@ -22,8 +22,9 @@ from cosmos_framework.model.generator.mot.causal_action_network import CausalAct
 class SmallActionNetwork(CausalActionNetwork):
     """Use production interfaces without allocating a pretrained language backbone."""
 
-    def __init__(self, width):
+    def __init__(self, width, add_action_flag=False):
         nn.Module.__init__(self)
+        self.config = SimpleNamespace(add_action_flag=add_action_flag)
         self.action_dim, self.hidden_size = width, 16
         self.timestep_scale = 1.0
         self._create_action_interfaces()
@@ -106,11 +107,12 @@ def packed_batch(width, mode):
     )
 
 
+@pytest.mark.parametrize("add_action_flag", [False, True])
 @pytest.mark.parametrize("width", [7, 55])
 @pytest.mark.parametrize("mode", ["policy", "inverse_dynamics", "forward_dynamics"])
-def test_interfaces_packing_loss_and_backward(width, mode):
+def test_interfaces_packing_loss_and_backward(width, mode, add_action_flag):
     torch.manual_seed(7)
-    net = SmallActionNetwork(width)
+    net = SmallActionNetwork(width, add_action_flag=add_action_flag)
     original = packed_batch(width, mode)
     packed = expand_action_sequence(original, original.vision.tokens, CausalActionGeometry((2, 2), (1, 1)))
     layout = packed.teacher_forcing.layout
@@ -158,6 +160,66 @@ def test_interfaces_packing_loss_and_backward(width, mode):
         assert net.state2llm.weight.grad.abs().sum() > 0
         assert not net.state2llm.weight.grad[:, -1].any()
         assert not net.llm2action.weight.grad[-1].any()
+        if add_action_flag:
+            assert net.action_mask_embed.weight.grad.abs().sum() > 0
+            assert net.state_mask_embed.weight.grad.abs().sum() > 0
+
+
+def test_mask_conditioning_is_zero_initialized_and_can_distinguish_valid_zero_channels():
+    torch.manual_seed(17)
+    legacy = SmallActionNetwork(55, add_action_flag=False)
+    net = SmallActionNetwork(55, add_action_flag=True)
+    missing, unexpected = net.load_state_dict(legacy.state_dict(), strict=False)
+    assert set(missing) == {"action_mask_embed.weight", "state_mask_embed.weight"}
+    assert not unexpected
+    packed = packed_batch(55, "policy")
+    packed = expand_action_sequence(packed, packed.vision.tokens, CausalActionGeometry((2, 2), (1, 1)))
+    reference = torch.zeros(packed.sequence_length, net.hidden_size)
+    encoded = torch.zeros_like(reference)
+    legacy._encode_action(packed, reference, torch.float32)
+    net._encode_action(packed, encoded, torch.float32)
+    torch.testing.assert_close(encoded, reference)
+    assert not net.action_mask_embed.weight.any()
+    assert not net.state_mask_embed.weight.any()
+
+    # Change only validity, keeping the channel's action/state values at zero.
+    with torch.no_grad():
+        net.action_mask_embed.weight[:, -1] = 2
+        net.state_mask_embed.weight[:, -1] = 3
+    net._encode_action(packed, encoded, torch.float32)
+    before = encoded.clone()
+    for metadata, state in zip(packed.causal_action_metadata, packed.teacher_forcing.state_tokens, strict=True):
+        metadata.action_mask[:, -1] = True
+        metadata.state_mask[:, -1] = True
+        state[:, -1] = 0
+    net._encode_action(packed, encoded, torch.float32)
+    torch.testing.assert_close(
+        encoded[packed.action.sequence_indexes] - before[packed.action.sequence_indexes],
+        torch.full((128, net.hidden_size), 2.0),
+    )
+    indexes = packed.teacher_forcing.layout.state_indexes
+    torch.testing.assert_close(encoded[indexes] - before[indexes], torch.full((4, net.hidden_size), 3.0))
+
+
+@pytest.mark.parametrize("add_action_flag", [False, True])
+def test_video_only_step_keeps_action_interfaces_in_zero_gradient_graph(add_action_flag):
+    net = SmallActionNetwork(55, add_action_flag=add_action_flag)
+    packed = SimpleNamespace(action=None)
+    hidden = torch.randn(3, net.hidden_size, requires_grad=True)
+    encoded = hidden.clone()
+    net._encode_action(packed, encoded, torch.float32)
+    torch.testing.assert_close(encoded, hidden)
+    output = {}
+    net._decode_action(packed, hidden, output)
+    video_loss = hidden.square().mean()
+    loss = video_loss + 0 * sum(x.sum() for x in output["preds_action"])
+    loss.backward()
+    assert hidden.grad.abs().sum() > 0
+    for name, parameter in net.named_parameters():
+        if name.startswith("time_embedder"):
+            continue
+        assert parameter.grad is not None, name
+        assert not parameter.grad.any(), name
 
 
 def test_checkpoint_dimensions_are_not_silently_converted():
@@ -183,7 +245,7 @@ def test_dcp_warm_start_requires_explicit_projection_skip(tmp_path):
     planner.set_up_planner({"net": new.state_dict()}, reader.read_metadata())
     with pytest.raises(ValueError, match="[Ss]ize mismatch"):
         planner.create_local_plan()
-    skipped = ["action2llm", "llm2action", "state2llm", "state_modality_embed"]
+    skipped = ["action2llm", "llm2action", "state2llm", "state_modality_embed", "action_mask_embed", "state_mask_embed"]
     dcp.load(
         {"net": new.state_dict()},
         checkpoint_id=checkpoint,

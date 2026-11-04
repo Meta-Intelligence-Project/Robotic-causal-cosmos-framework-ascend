@@ -58,6 +58,7 @@ class Cosmos3VFMNetworkConfig(PretrainedConfig):
         predict_text_tokens=False,
         joint_attn_implementation="two_way",
         action_dim=32,
+        add_action_flag=False,
         num_embodiment_domains=32,
         temporal_compression_factor_vision=4,
         temporal_compression_factor_action=1,
@@ -101,10 +102,7 @@ class Cosmos3VFMNetworkConfig(PretrainedConfig):
             )
         self.teacher_forcing_dense_mode = teacher_forcing_dense_mode
         if not 1 <= teacher_forcing_tnd_max_kv_tokens <= NPU_FUSION_ATTENTION_TND_MAX_TOKENS:
-            raise ValueError(
-                "teacher_forcing_tnd_max_kv_tokens must be in "
-                f"[1, {NPU_FUSION_ATTENTION_TND_MAX_TOKENS}]"
-            )
+            raise ValueError(f"teacher_forcing_tnd_max_kv_tokens must be in [1, {NPU_FUSION_ATTENTION_TND_MAX_TOKENS}]")
         self.teacher_forcing_tnd_max_kv_tokens = teacher_forcing_tnd_max_kv_tokens
         self.teacher_forcing_visualize_sdpa_mask = teacher_forcing_visualize_sdpa_mask
         self.enable_input_bias = enable_input_bias
@@ -112,6 +110,7 @@ class Cosmos3VFMNetworkConfig(PretrainedConfig):
         # action related parameters
         self.action_gen = action_gen  # whether to generate action tokens
         self.action_dim = action_dim
+        self.add_action_flag = add_action_flag
         self.num_embodiment_domains = num_embodiment_domains
         self.temporal_compression_factor_action = temporal_compression_factor_action
         if self.action_gen:
@@ -640,30 +639,37 @@ class Cosmos3VFMNetwork(PreTrainedModel):
 
         if packed_seq.teacher_forcing is not None:
             teacher_forcing = packed_seq.teacher_forcing
-            packed_clean_tokens, clean_original_latent_shapes = self.patchify_and_pack_latents(
-                teacher_forcing.clean_vision_tokens,
-                vision.token_shapes,
-            )
-            if clean_original_latent_shapes != original_latent_shapes:
-                raise ValueError(
-                    "teacher-forcing clean/noisy payloads must produce identical latent shapes, "
-                    f"got {clean_original_latent_shapes} and {original_latent_shapes}"
+            windows = getattr(teacher_forcing.layout.geometry, "decision_windows", ())
+            clean_samples = [i for i in range(len(vision.token_shapes)) if not windows or not windows[i]]
+            # 决策窗口的历史已经在主视觉流中；只为旧block样本投影额外clean流。
+            if clean_samples:
+                packed_clean_tokens, clean_original_latent_shapes = self.patchify_and_pack_latents(
+                    [teacher_forcing.clean_vision_tokens[i] for i in clean_samples],
+                    [vision.token_shapes[i] for i in clean_samples],
                 )
-            packed_clean_tokens = self.vae2llm(packed_clean_tokens.to(target_dtype))
-            clean_timesteps = torch.zeros(
-                packed_clean_tokens.shape[0],
-                device=packed_clean_tokens.device,
-                dtype=torch.float32,
-            )
-            packed_clean_timestep_embeds = self._embed_packed_timesteps(clean_timesteps, packed_seq).to(target_dtype)
-            packed_clean_tokens = packed_clean_tokens + packed_clean_timestep_embeds
-            clean_sequence_indexes = teacher_forcing.layout.clean_token_indexes
-            if clean_sequence_indexes.numel() != packed_clean_tokens.shape[0]:
-                raise ValueError(
-                    "teacher-forcing clean sequence indexes must match patchified clean tokens, "
-                    f"got {clean_sequence_indexes.numel()} and {packed_clean_tokens.shape[0]}"
+                expected_clean_shapes = [original_latent_shapes[i] for i in clean_samples]
+                if clean_original_latent_shapes != expected_clean_shapes:
+                    raise ValueError(
+                        "teacher-forcing clean/noisy payloads must produce identical latent shapes, "
+                        f"got {clean_original_latent_shapes} and {expected_clean_shapes}"
+                    )
+                packed_clean_tokens = self.vae2llm(packed_clean_tokens.to(target_dtype))
+                clean_timesteps = torch.zeros(
+                    packed_clean_tokens.shape[0],
+                    device=packed_clean_tokens.device,
+                    dtype=torch.float32,
                 )
-            packed_sequence[clean_sequence_indexes] = packed_clean_tokens
+                packed_clean_timestep_embeds = self._embed_packed_timesteps(clean_timesteps, packed_seq).to(
+                    target_dtype
+                )
+                packed_clean_tokens = packed_clean_tokens + packed_clean_timestep_embeds
+                clean_sequence_indexes = teacher_forcing.layout.clean_token_indexes
+                if clean_sequence_indexes.numel() != packed_clean_tokens.shape[0]:
+                    raise ValueError(
+                        "teacher-forcing clean sequence indexes must match patchified clean tokens, "
+                        f"got {clean_sequence_indexes.numel()} and {packed_clean_tokens.shape[0]}"
+                    )
+                packed_sequence[clean_sequence_indexes] = packed_clean_tokens
 
         has_noisy_vision = vision.mse_loss_indexes.numel() > 0
 

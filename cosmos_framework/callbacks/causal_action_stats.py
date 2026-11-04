@@ -35,7 +35,7 @@ class CausalActionStats(Callback):
 
     def on_before_optimizer_step(self, model, optimizer, scheduler, grad_scaler, iteration=0):
         norms = {}
-        for group in ("state2llm", "action2llm", "llm2action"):
+        for group in ("state2llm", "action2llm", "llm2action", "state_mask_embed", "action_mask_embed"):
             total = None
             for name, parameter in model.net.named_parameters():
                 if group in name and parameter.grad is not None:
@@ -56,7 +56,7 @@ class CausalActionStats(Callback):
             mode_losses = self._flush_mode_metrics()
         record = dict(
             iteration=iteration,
-            modes=list(data_batch["causal_action_mode"]),
+            modes=list(data_batch.get("causal_action_mode", ["video_only"] * len(data_batch["sequence_plan"]))),
             vision_loss=float(output_batch["flow_matching_loss_vision"].detach()),
             action_loss=float(output_batch["flow_matching_loss_action"].detach()),
             peak_gib=torch.cuda.max_memory_allocated() / 2**30,
@@ -65,6 +65,8 @@ class CausalActionStats(Callback):
         clipping = []
         for plan in data_batch["sequence_plan"]:
             m = plan.causal_action_metadata
+            if m is None:
+                continue
             clipping.append(
                 dict(
                     source=m.source,

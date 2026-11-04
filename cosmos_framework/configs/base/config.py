@@ -18,6 +18,10 @@ class ActionDataSetting:
     sources_file: str = "examples/action_pretrain/sources/mixed.json"
     table_backend: str = "parquet"
     early_video_sampling: bool = True
+    history_padding: str = "available"
+    # 新决策窗口按action时间步独立配置P与H；None保留旧分块adapter。
+    history_steps: int | None = None
+    action_horizon: int | None = None
     actions_per_block: int = 32
     max_action_steps: int = 96
     overlap_action_steps: int = 16
@@ -27,6 +31,15 @@ class ActionDataSetting:
     allow_mock_statistics: bool = False
     mock_state_stats_path: str = ""
     mock_delta_stats_path: str = ""
+
+
+@attrs.define(slots=False)
+class HumanVideoDataSetting:
+    """Video-only sources and task sampling weights for causal co-training."""
+
+    dataset_path: str = ""
+    robot_ratio: int = 1
+    video_ratio: int = 1
 
 
 @attrs.define(slots=False)
@@ -41,6 +54,7 @@ class DataSetting:
 
     qwen_max_video_token_length: int = 8192
     action: ActionDataSetting = attrs.field(factory=ActionDataSetting)
+    human_video: HumanVideoDataSetting = attrs.field(factory=HumanVideoDataSetting)
 
 
 @attrs.define(slots=False)
@@ -97,8 +111,8 @@ def make_config() -> Config:
     # from cosmos_framework.configs.base.defaults.data import register_data
     from cosmos_framework.configs.base.defaults.model import register_model
     from cosmos_framework.configs.base.defaults.optimizer import register_optimizer, register_scheduler
-    from cosmos_framework.configs.base.defaults.tokenizer import register_sound_tokenizer, register_tokenizer
     from cosmos_framework.configs.base.defaults.reasoner import register_vlm
+    from cosmos_framework.configs.base.defaults.tokenizer import register_sound_tokenizer, register_tokenizer
 
     # Call this function to register config groups for advanced overriding. the order follows the default config groups
     # register_data()
@@ -116,13 +130,14 @@ def make_config() -> Config:
     # Register shipped experiments explicitly. (vision_sft_nano also defines
     # vision_sft_nano_mapstyle_dataloader — the CosmosDataLoader variant — in the same module.)
     import cosmos_framework.configs.base.experiment.action.posttrain_config.action_causal_midtrain_edge  # noqa: F401
+    import cosmos_framework.configs.base.experiment.action.posttrain_config.action_fd_droid_posttrain  # noqa: F401
     import cosmos_framework.configs.base.experiment.action.posttrain_config.action_policy_droid_nano  # noqa: F401
     import cosmos_framework.configs.base.experiment.action.posttrain_config.action_policy_libero_all_nano  # noqa: F401
     import cosmos_framework.configs.base.experiment.action.posttrain_config.action_policy_libero_nano  # noqa: F401
-    import cosmos_framework.configs.base.experiment.action.posttrain_config.action_fd_droid_posttrain  # noqa: F401
-    import cosmos_framework.configs.base.experiment.sft.vision_sft_nano  # noqa: F401
-    import cosmos_framework.configs.base.experiment.sft.vision_sft_super  # noqa: F401
+    import cosmos_framework.configs.base.experiment.action.posttrain_config.action_video_midtrain_edge  # noqa: F401
     import cosmos_framework.configs.base.experiment.sft.vision_sft_edge  # noqa: F401
     import cosmos_framework.configs.base.experiment.sft.vision_sft_edge_lerobot3  # noqa: F401
+    import cosmos_framework.configs.base.experiment.sft.vision_sft_nano  # noqa: F401
+    import cosmos_framework.configs.base.experiment.sft.vision_sft_super  # noqa: F401
 
     return c

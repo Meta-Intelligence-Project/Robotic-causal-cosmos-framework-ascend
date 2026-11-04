@@ -108,7 +108,12 @@ def prepare_prefix(prefix, metadata, current_block, *, device):
         or (frame_ids[1:] < frame_ids[:-1]).any()
     ):
         raise ValueError("action_frame_ids must be a nonempty ordered positive integer vector")
-    action_indexes = torch.where((frame_ids.to(device=device, dtype=torch.long) - 1) // block_size == current_block)[0]
+    decision_window = getattr(metadata, "layout_mode", "block") == "decision_window"
+    action_indexes = (
+        metadata.action_indexes_for_group(current_block).to(device=device)
+        if decision_window
+        else torch.where((frame_ids.to(device=device, dtype=torch.long) - 1) // block_size == current_block)[0]
+    )
     horizon = len(action_indexes)
     if not horizon or (action_indexes[1:] - action_indexes[:-1] != 1).any():
         raise ValueError("RTC requires a contiguous, nonempty current action block")
@@ -124,21 +129,22 @@ def prepare_prefix(prefix, metadata, current_block, *, device):
     if not mask.any() or not torch.equal(current_masks, mask.expand_as(current_masks)):
         raise ValueError("RTC current actions must share a nonempty dataset-level valid mask")
     anchors, state_masks = metadata.anchors, metadata.state_mask
+    state_index = metadata.current_state_index if decision_window else current_block
     if (
         not isinstance(anchors, torch.Tensor)
         or not anchors.is_floating_point()
         or anchors.ndim != 2
         or anchors.shape[1] != width
-        or current_block >= len(anchors)
+        or state_index >= len(anchors)
         or not isinstance(state_masks, torch.Tensor)
         or state_masks.dtype != torch.bool
         or state_masks.shape != anchors.shape
     ):
         raise ValueError("RTC needs floating-point [blocks,D] anchors and boolean state masks")
-    state_mask = template.validate_valid_mask(state_masks[current_block]).to(device=device)
+    state_mask = template.validate_valid_mask(state_masks[state_index]).to(device=device)
     if not state_mask.any() or (template.required_anchor_mask(mask).to(device=device) & ~state_mask).any():
         raise ValueError("RTC prefix lacks a valid measured anchor for relative action fields")
-    anchor = template.sanitize(anchors[current_block].detach().to(device=device, dtype=torch.float32), state_mask)
+    anchor = template.sanitize(anchors[state_index].detach().to(device=device, dtype=torch.float32), state_mask)
     # Encoding canonicalizes rotations, but physical export must preserve the
     # previous plan's valid-channel bytes, including tiny quaternion roundoff.
     absolute_prefix = (

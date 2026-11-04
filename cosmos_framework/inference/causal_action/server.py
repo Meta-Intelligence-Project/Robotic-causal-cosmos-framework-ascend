@@ -25,6 +25,8 @@ class PolicyConnection:
         self.last_revision = 0
         self.needs_reset = False
         self.history_images = {}
+        self.last_observe_tick = -1
+        self.last_window_generation = -1
 
     def _expand_history(self, request, tick, *, reset):
         """Stage immutable measured history only; current images are never cached."""
@@ -53,7 +55,7 @@ class PolicyConnection:
             elif index not in images:
                 raise ValueError("Unknown historical image reference; reset is required")
             expanded.append(dict(tick=index, image=images[index]))
-        capacity = self.policy.metadata["history_blocks"] * self.policy.metadata["actions_per_block"]
+        capacity = self.policy.metadata.get("history_steps", self.policy.metadata["history_blocks"] * 32)
         images = {index: image for index, image in images.items() if index >= tick - capacity}
         return {**request, "history": expanded}, images
 
@@ -67,8 +69,8 @@ class PolicyConnection:
             raise ValueError("episode_id must be a nonempty bounded string")
         self.last_request_id = request_id
         operation = request.get("operation")
-        if operation not in ("reset", "predict"):
-            raise ValueError("operation must be reset or predict")
+        if operation not in ("reset", "predict", "observe", "prepare_window"):
+            raise ValueError("operation must be reset, predict, observe or prepare_window")
         tick, revision = request.get("tick", 0), request.get("revision", 0)
         if type(tick) is not int or tick < 0 or type(revision) is not int or revision < 0:
             raise ValueError("tick and revision must be nonnegative integers")
@@ -82,12 +84,34 @@ class PolicyConnection:
                 raise ValueError("Reset is required before inference")
             if episode_id != self.episode_id:
                 raise ValueError("Request belongs to a different episode")
-            if tick < self.last_tick or revision < self.last_revision:
+            if (operation == "predict" and tick < self.last_tick) or revision < self.last_revision:
                 raise ValueError("Observation tick/revision cannot go backwards")
             if request.get("rtc") is not None and not self.policy.metadata.get("rtc_enabled", False):
                 raise ValueError("RTC is disabled on this server")
         started = time.perf_counter()
         try:
+            if operation in ("observe", "prepare_window"):
+                if not self.policy.metadata.get("streaming_vae", False):
+                    raise ValueError("streaming_vae is disabled on this server")
+                if operation == "observe":
+                    if tick < self.last_observe_tick or tick > self.last_observe_tick + 1:
+                        raise ValueError("Observed ticks must be consecutive and cannot go backwards")
+                    result = self.policy.observe(request)
+                    self.last_observe_tick = tick
+                else:
+                    generation = request.get("window_generation")
+                    if type(generation) is not int or generation <= self.last_window_generation:
+                        raise ValueError("window_generation must increase within the episode")
+                    result = self.policy.prepare_window(request)
+                    self.last_window_generation = generation
+                return dict(
+                    **result,
+                    request_id=request_id,
+                    episode_id=episode_id,
+                    tick=tick,
+                    revision=revision,
+                    cached_history_ticks=sorted(self.history_images),
+                )
             expanded, history_images = self._expand_history(request, tick, reset=operation == "reset")
             result = self.policy.infer(expanded)
             if not isinstance(result, dict):
@@ -99,6 +123,9 @@ class PolicyConnection:
         self.last_tick, self.last_revision = tick, revision
         self.needs_reset = False
         self.history_images = history_images
+        if operation == "reset":
+            self.last_observe_tick = 0
+            self.last_window_generation = -1
         result = dict(result)
         result.update(request_id=request_id, episode_id=episode_id, tick=tick, revision=revision)
         result["server_timing"] = {"infer_seconds": time.perf_counter() - started}
@@ -129,20 +156,42 @@ async def serve(policy, *, host="0.0.0.0", port=8000, ready=None, stop=None):
             await connection.send(
                 packb({**policy.metadata, "protocol": PROTOCOL, "history_transport": HISTORY_TRANSPORT})
             )
-            async for payload in connection:
-                request = None
-                try:
-                    request = unpackb(payload)
-                    result = await asyncio.get_running_loop().run_in_executor(executor, lifecycle.infer, request)
-                except Exception as error:
-                    logger.exception("Causal policy request failed")
-                    result = dict(error=str(error), reset_required=True)
-                    if isinstance(request, dict):
-                        result.update(
-                            {key: request.get(key) for key in ("request_id", "episode_id", "tick", "revision")}
-                        )
-                    lifecycle.needs_reset = True
-                await connection.send(packb(result))
+            jobs = asyncio.Queue(maxsize=128)
+
+            async def process_jobs():
+                while True:
+                    payload = await jobs.get()
+                    if payload is None:
+                        jobs.task_done()
+                        return
+                    request = None
+                    try:
+                        request = unpackb(payload)
+                        result = await asyncio.get_running_loop().run_in_executor(executor, lifecycle.infer, request)
+                    except Exception as error:
+                        logger.exception("Causal policy request failed")
+                        result = dict(error=str(error), reset_required=True)
+                        if isinstance(request, dict):
+                            result.update(
+                                {key: request.get(key) for key in ("request_id", "episode_id", "tick", "revision")}
+                            )
+                        lifecycle.needs_reset = True
+                    try:
+                        await connection.send(packb(result))
+                    except ConnectionClosed:
+                        pass
+                    finally:
+                        jobs.task_done()
+
+            consumer = asyncio.create_task(process_jobs())
+            try:
+                async for payload in connection:
+                    await jobs.put(payload)
+            finally:
+                # The reader never waits for an individual prediction. The GPU
+                # owner nevertheless completes all accepted work before reset.
+                await jobs.put(None)
+                await consumer
         except ConnectionClosed:
             pass
         finally:
@@ -182,10 +231,37 @@ def parser():
     p.add_argument("--robot-config")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8000)
-    p.add_argument("--history", type=int, default=32)
+    p.add_argument("--history", type=int, default=None, help="Legacy alias: number of 32-action history blocks")
+    p.add_argument(
+        "--history-steps",
+        "--history_steps",
+        type=int,
+        default=None,
+        help="Observed history in action steps (default 1024)",
+    )
+    p.add_argument(
+        "--action-horizon", "--action_horizon", type=int, default=32, help="Number of real predicted action steps"
+    )
+    p.add_argument(
+        "--history-padding", "--history_padding", choices=("available", "repeat_first"), default="repeat_first"
+    )
+    p.add_argument("--streaming-vae", "--streaming_vae", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--steps", type=int, default=10)
     p.add_argument("--guidance", type=float, default=1.0)
-    p.add_argument("--execute-steps", type=int, default=16)
+    p.add_argument(
+        "--execute-steps",
+        type=int,
+        default=16,
+        help="S: async trigger interval, blocking execution prefix, or RTC minimum execution steps",
+    )
+    # R是相对当前chunk起点的固定交接步数；默认H32/S16时为R24。
+    p.add_argument(
+        "--handoff-steps",
+        "--handoff_steps",
+        type=int,
+        default=None,
+        help="Pure-async handoff R: S < R <= min(H, 2*S); default H32/S16 gives R24",
+    )
     p.add_argument("--fps", type=float, default=30.0)
     p.add_argument("--resolution", default="480")
     p.add_argument("--seed", type=int, default=42)

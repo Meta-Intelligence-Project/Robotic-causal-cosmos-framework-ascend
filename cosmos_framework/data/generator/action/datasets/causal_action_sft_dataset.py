@@ -37,6 +37,9 @@ class CausalActionSFTDataset(ActionSFTDataset):
         allow_mock_statistics=False,
         history_blocks_min=1,
         history_blocks_max=8,
+        history_padding="available",
+        history_steps=None,
+        action_horizon=None,
         joint_mode_weights=None,
         use_state=True,
     ):
@@ -53,6 +56,31 @@ class CausalActionSFTDataset(ActionSFTDataset):
         self.planner = self._dataset.planner
         self.mode = mode
         self.history_range = (history_blocks_min, history_blocks_max)
+        if history_padding not in ("available", "repeat_first"):
+            raise ValueError("history_padding must be available or repeat_first")
+        if history_padding == "repeat_first" and not callable(getattr(self._dataset, "read_prediction_window", None)):
+            raise ValueError("repeat_first training requires a reader with true episode-relative prediction windows")
+        self.history_padding = history_padding
+        if (history_steps is None) != (action_horizon is None):
+            raise ValueError("history_steps and action_horizon must be supplied together")
+        if history_steps is not None and history_padding != "repeat_first":
+            raise ValueError("Decision windows require repeat_first history padding")
+        self.history_steps = (
+            history_steps if history_steps is not None else history_blocks_max * self.planner.geometry.actions_per_block
+        )
+        self.action_horizon = action_horizon if action_horizon is not None else self.planner.geometry.actions_per_block
+        per_latent = self.planner.geometry.actions_per_latent_frame
+        if history_padding == "repeat_first" and (
+            type(self.history_steps) is not int
+            or self.history_steps < 0
+            or type(self.action_horizon) is not int
+            or self.action_horizon < 1
+            or self.history_steps % per_latent
+            or self.action_horizon % per_latent
+        ):
+            raise ValueError(
+                "history_steps and action_horizon must be nonnegative/positive multiples of actions per latent"
+            )
         self.statistics_path = statistics_path
         self.statistics = statistics
         self._statistics_validated = False
@@ -68,7 +96,13 @@ class CausalActionSFTDataset(ActionSFTDataset):
         try:
             if self.debug_fixed_index is not None:
                 random.seed(42)
-            raw = self._dataset[idx]
+            raw = (
+                self._dataset.read_prediction_window(
+                    idx, history_steps=self.history_steps, action_horizon=self.action_horizon
+                )
+                if self.history_padding == "repeat_first"
+                else self._dataset[idx]
+            )
         except (MemoryError, torch.OutOfMemoryError):
             raise
         except Exception as error:
@@ -88,13 +122,20 @@ class CausalActionSFTDataset(ActionSFTDataset):
             )
             self._statistics_validated = True
         mode = random.choices(MODES, weights=self.weights, k=1)[0] if self.mode == "joint" else self.mode
-        raw, metadata = build_block_sample(
-            raw,
-            template=self.template,
-            planner=self.planner,
-            history_blocks=random.randint(*self.history_range),
-            statistics=self.statistics,
-        )
+        if self.history_padding == "repeat_first":
+            from cosmos_framework.data.generator.action.fixed_history_sample import build_fixed_history_sample
+
+            raw, metadata = build_fixed_history_sample(
+                raw, template=self.template, planner=self.planner, statistics=self.statistics
+            )
+        else:
+            raw, metadata = build_block_sample(
+                raw,
+                template=self.template,
+                planner=self.planner,
+                history_blocks=random.randint(*self.history_range),
+                statistics=self.statistics,
+            )
         for key in (
             "state_trajectory",
             "action_target",
@@ -107,6 +148,8 @@ class CausalActionSFTDataset(ActionSFTDataset):
             "source",
             "split",
             "read_options",
+            "history_window",
+            "history_episode_id",
         ):
             raw.pop(key, None)
         raw["mode"] = mode
@@ -114,10 +157,17 @@ class CausalActionSFTDataset(ActionSFTDataset):
         length = result["action"].shape[0]
         if result["action"].shape[-1] != self.template.width:
             raise ValueError("The shared action transform must use template.width without extra padding")
+        action_conditions = length if mode == "forward_dynamics" else 0
+        plan = result["sequence_plan"]
+        vision_conditions = plan.condition_frame_indexes_vision
+        if self.history_padding == "repeat_first":
+            vision_conditions = sorted(set(vision_conditions) | set(range(metadata.observed_latents)))
         result["sequence_plan"] = replace(
-            result["sequence_plan"],
-            condition_frame_indexes_action=list(range(length if mode == "forward_dynamics" else 0)),
-            action_start_frame_offset=1,
+            plan,
+            condition_frame_indexes_action=list(range(action_conditions)),
+            condition_frame_indexes_vision=vision_conditions,
+            # offset以action源时间步计；FPS位置与当前视频latent对齐。
+            action_start_frame_offset=self.history_steps + 1 if metadata.layout_mode == "decision_window" else 1,
             causal_action_metadata=metadata,
         )
         result["raw_action_dim"] = None

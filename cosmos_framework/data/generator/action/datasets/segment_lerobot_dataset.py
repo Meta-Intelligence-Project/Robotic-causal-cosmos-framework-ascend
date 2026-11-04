@@ -4,6 +4,7 @@
 import json
 import logging
 import math
+import random
 import warnings
 from bisect import bisect_right
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ from cosmos_framework.data.generator.action.datasets.cosmos3_action_lerobot impo
     split_episode_ids,
 )
 from cosmos_framework.data.generator.action.datasets.direct_parquet import build_file_starts, read_window
+from cosmos_framework.data.generator.action.history_window import build_history_window
 from cosmos_framework.data.generator.action.sample_contract import ActionReadOptions
 from cosmos_framework.data.generator.action.segment_planner import SegmentPlanner
 from cosmos_framework.data.generator.action.video_view import VideoViewConfig
@@ -334,7 +336,13 @@ class SegmentLeRobotDataset(BaseActionLeRobotDataset):
 
     def __getitem__(self, idx):
         """按实际长度批量读取，目标偏移只在这里执行一次。"""
-        ds_idx, episode_id, start, actions = self._resolve_index(idx)
+        return self._read_segment(idx)
+
+    def _read_segment(self, idx, *, start=None, actions=None):
+        """Read an explicit real subrange without changing the segment index."""
+        ds_idx, episode_id, segment_start, segment_actions = self._resolve_index(idx)
+        start = segment_start if start is None else start
+        actions = segment_actions if actions is None else actions
         # 按当前 episode 获取原始 FPS；只有字段缺失时才回退到 meta.fps。
         source_fps = self._read_source_fps(episode_id)
         options = self.read_options
@@ -399,6 +407,80 @@ class SegmentLeRobotDataset(BaseActionLeRobotDataset):
         )
         if video is not None and video_indexes is not None:
             sample["video_observation_indexes"] = video_indexes
+        return sample
+
+    def read_prediction_window(
+        self, idx, *, history_blocks=None, history_steps=None, action_horizon=None, anchor_offset=None
+    ):
+        """Read fixed history and one real future block at an episode-relative anchor.
+
+        The segment chooses the supervised task/range, but its start is never
+        treated as an episode reset. Only negative episode ticks repeat frame 0.
+        No historical action targets are needed, including with target offsets.
+        """
+        ds_idx, episode_id, segment_start, segment_actions = self._resolve_index(idx)
+        geometry = self.planner.geometry
+        horizon = geometry.actions_per_block if action_horizon is None else action_horizon
+        per_latent = geometry.actions_per_latent_frame
+        if type(horizon) is not int or horizon < 1 or horizon % per_latent:
+            raise ValueError("action_horizon must be a positive multiple of actions per latent")
+        if history_steps is not None and (
+            type(history_steps) is not int or history_steps < 0 or history_steps % per_latent
+        ):
+            raise ValueError("history_steps must be a nonnegative multiple of actions per latent")
+        maximum = segment_actions - horizon
+        if maximum < 0:
+            raise ValueError("segment does not contain one complete real prediction block")
+        if anchor_offset is None:
+            anchor_offset = random.randint(0, maximum)
+        if type(anchor_offset) is not int or not 0 <= anchor_offset <= maximum:
+            raise ValueError("anchor_offset must leave one complete real prediction block in the segment")
+        anchor = segment_start + anchor_offset
+        sample = self._read_segment(idx, start=anchor, actions=horizon)
+        meta = self._direct_meta if self.table_backend == "parquet" else self._get_dataset(ds_idx).meta
+        episode_start = int(meta.episodes[episode_id]["dataset_from_index"])
+        window = build_history_window(
+            anchor - episode_start,
+            history_blocks=history_blocks,
+            history_steps=history_steps,
+            actions_per_block=horizon,
+            video_stride=geometry.video_stride,
+            history_padding="repeat_first",
+        )
+        required = window.required_observation_ticks
+        first_row, last_row = episode_start + required[0], anchor
+        if self.table_backend == "parquet":
+            times = read_window(
+                meta, episode_id, first_row, last_row + 1, ["timestamp"], file_starts=self._file_starts
+            )["timestamp"]
+        else:
+            ds = self._get_dataset(ds_idx)
+            times = ds.hf_dataset.select_columns(["timestamp"]).with_format(None)[list(range(first_row, last_row + 1))][
+                "timestamp"
+            ]
+        history_times = torch.tensor(times, dtype=torch.float64)
+        if not torch.allclose(
+            history_times[1:] - history_times[:-1],
+            torch.full_like(history_times[1:], 1 / self.fps),
+            atol=1e-5,
+            rtol=1e-4,
+        ):
+            raise ValueError(f"Episode {episode_id}: historical timestamps must match meta.fps={self.fps}")
+        selected_times = [times[episode_start + tick - first_row] for tick in required]
+        history_video = self._read_video(meta, episode_id, selected_times, viewpoint=self._viewpoint)
+        if history_video is None or sample.get("video") is None:
+            raise ValueError("Fixed history training requires real episode video observations")
+        history_video = self._convert_video(history_video.permute(1, 0, 2, 3))
+        lookup = {tick: i for i, tick in enumerate(required)}
+        history_video = history_video[:, [lookup[tick] for tick in window.observation_ticks]]
+        future_video = sample["video"]
+        if not self.early_video_sampling:
+            future_video = future_video[:, :: geometry.video_stride]
+        sample["video"] = torch.cat((history_video, future_video[:, 1:]), dim=1)
+        sample.pop("video_observation_indexes", None)
+        sample["history_window"] = window
+        sample["action_horizon"] = horizon
+        sample["history_episode_id"] = episode_id
         return sample
 
     def _read_parquet_segment(self, episode_id, start, actions):

@@ -31,6 +31,34 @@ _CUSTOM_PAYLOAD = {
 # 1. pydantic schema validation                                               #
 # --------------------------------------------------------------------------- #
 class TestSchemaValidation:
+    @pytest.mark.parametrize("history,horizon", [(0, 16), (48, 32), (64, 48), (1024, 32)])
+    def test_decision_window_units_are_action_steps(self, history, horizon):
+        raw = {
+            "job": {"task": "vfm", "experiment": "action_causal_midtrain_edge"},
+            "action": {"history_steps": history, "action_horizon": horizon, "history_padding": "repeat_first"},
+        }
+        config = SFTExperimentConfig.model_validate(raw)
+        assert config.action.history_steps == history and config.action.action_horizon == horizon
+        overrides = build_hydra_overrides(raw)
+        assert f"data_setting.action.history_steps={history}" in overrides
+        assert f"data_setting.action.action_horizon={horizon}" in overrides
+
+    @pytest.mark.parametrize(
+        "fields",
+        [
+            {"history_steps": 48},
+            {"action_horizon": 32},
+            {"history_steps": 15, "action_horizon": 32, "history_padding": "repeat_first"},
+            {"history_steps": 48, "action_horizon": 31, "history_padding": "repeat_first"},
+            {"history_steps": 48, "action_horizon": 32, "history_padding": "available"},
+        ],
+    )
+    def test_invalid_decision_window_contract_is_rejected(self, fields):
+        with pytest.raises(ValidationError):
+            SFTExperimentConfig.model_validate(
+                {"job": {"task": "vfm", "experiment": "action_causal_midtrain_edge"}, "action": fields}
+            )
+
     def test_vfm_fsdp_mixed_precision_fields_validate(self) -> None:
         raw = {
             "job": {"task": "vfm", "experiment": "vision_sft_edge"},
@@ -296,6 +324,38 @@ def _dummy_recipe_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class TestEndToEndLoader:
+    def test_mask_conditioning_defaults_and_toml_routing(self):
+        from cosmos_framework.configs.base.defaults.model_config import OmniMoTModelConfig
+        from cosmos_framework.model.generator.mot.cosmos3_vfm_network import Cosmos3VFMNetworkConfig
+
+        assert SFTExperimentConfig().model.add_action_flag is False
+        assert OmniMoTModelConfig().add_action_flag is False
+        assert Cosmos3VFMNetworkConfig().add_action_flag is False
+        raw = {"job": {"task": "vfm", "experiment": "action_causal_midtrain_edge"}, "model": {"add_action_flag": True}}
+        assert SFTExperimentConfig.model_validate(raw).model.add_action_flag is True
+        assert "model.config.add_action_flag=true" in build_hydra_overrides(raw)
+        raw["job"]["task"] = "vlm"
+        assert not any("add_action_flag" in item for item in build_hydra_overrides(raw))
+
+    @pytest.mark.parametrize("add_action_flag", [True, False])
+    def test_action_video_recipe_mask_flag_and_task_sources(self, _dummy_recipe_env, monkeypatch, add_action_flag):
+        monkeypatch.setenv("ACTION_SOURCES_FILE", "/tmp/robots.json")
+        monkeypatch.setenv("HUMAN_VIDEO_DATASET_PATH", "/tmp/human_videos")
+        path = Path(__file__).parents[3] / "examples/action_pretrain/action_video_midtrain_edge_causal_tnd.toml"
+        config = _load_or_skip(path, extra_overrides=[f"model.config.add_action_flag={str(add_action_flag).lower()}"])
+        assert config.model.config.add_action_flag is add_action_flag
+        assert config.data_setting.human_video.dataset_path == "/tmp/human_videos"
+        sources = config.dataloader_train.dataloader.datasets
+        assert sources.robots.ratio == sources.video.ratio == 1
+        assert sources.robots.dataset.sources_file == "/tmp/robots.json"
+        assert sources.video.dataset.dataset_path == "/tmp/human_videos"
+        assert dict(sources.video.dataset.conditioning_config) == {0: 1.0}
+        selected = list(config.optimizer.keys_to_select)
+        skipped = list(config.checkpoint.keys_to_skip_loading)
+        for key in ("action_mask_embed", "state_mask_embed"):
+            assert key in selected
+            assert key in skipped
+
     @pytest.mark.parametrize(
         "steps,stride,maximum,overlap,block,durations",
         [
@@ -317,12 +377,15 @@ class TestEndToEndLoader:
                 f"data_setting.action.video_stride={stride}",
                 f"data_setting.action.max_action_steps={maximum}",
                 f"data_setting.action.overlap_action_steps={overlap}",
+                "data_setting.action.history_steps=null",
+                "data_setting.action.action_horizon=null",
+                "data_setting.action.history_padding=available",
             ],
         )
         source = config.dataloader_train.dataloader.datasets.robots.dataset
         model = config.model.config
         assert model.max_action_dim == resolve_action_template(config.data_setting.action.template).width
-        assert model.teacher_forcing_block_size_min == model.teacher_forcing_block_size_max == block
+        # 旧robot adapter仍按来源geometry读数据，但不再绑定human视频AR块配置。
         assert list(model.tokenizer.encode_exact_durations) == durations
         assert model.diffusion_expert_config.enable_fps_modulation is True
         assert source.actions_per_block == steps
@@ -330,6 +393,26 @@ class TestEndToEndLoader:
         assert source.max_action_steps == maximum
         assert source.overlap_action_steps == overlap
         assert source.sources_file == "/tmp/sources.json"
+
+    @pytest.mark.parametrize("history,horizon", [(48, 32), (64, 48), (1024, 32)])
+    def test_action_recipe_decision_window_has_independent_history_and_horizon(
+        self, _dummy_recipe_env, monkeypatch, history, horizon
+    ):
+        monkeypatch.setenv("ACTION_SOURCES_FILE", "/tmp/sources.json")
+        path = Path(__file__).parents[3] / "examples/action_pretrain/action_midtrain_edge_causal_tnd.toml"
+        config = _load_or_skip(
+            path,
+            extra_overrides=[
+                f"data_setting.action.history_steps={history}",
+                f"data_setting.action.action_horizon={horizon}",
+            ],
+        )
+        source = config.dataloader_train.dataloader.datasets.robots.dataset
+        assert source.history_steps == history and source.action_horizon == horizon
+        assert config.model.config.add_action_flag is False
+        assert list(config.model.config.tokenizer.encode_exact_durations) == sorted(
+            {1 + history // 4, 1 + (history + horizon) // 4}
+        )
 
     def test_load_lerobot_resolution_tiers(self, _dummy_recipe_env: None) -> None:
         recipe_path = Path(__file__).parents[3] / "examples/toml/sft_config/vision_sft_edge.toml"
@@ -357,7 +440,10 @@ class TestEndToEndLoader:
             ],
         )
 
-        assert config.model._target_ is OmniMoTCausalModel
+        assert config.model._target_ in (
+            OmniMoTCausalModel,
+            f"{OmniMoTCausalModel.__module__}.{OmniMoTCausalModel.__qualname__}",
+        )
         assert config.job.name == "vision_causal_smoke_edge"
         assert config.trainer.distributed_parallelism == "ddp"
         assert config.trainer.max_iter == 3
@@ -414,7 +500,10 @@ load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
 
         config = _load_or_skip(toml_path, extra_overrides=["model=mot_causal_fsdp"])
 
-        assert config.model._target_ is OmniMoTCausalModel
+        assert config.model._target_ in (
+            OmniMoTCausalModel,
+            f"{OmniMoTCausalModel.__module__}.{OmniMoTCausalModel.__qualname__}",
+        )
         assert config.model.config.causal_training_strategy == "teacher_forcing"
         assert config.model.config.joint_attn_implementation == "teacher_forcing"
         assert config.model.config.teacher_forcing_block_size_min == 1

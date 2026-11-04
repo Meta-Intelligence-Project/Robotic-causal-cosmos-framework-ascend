@@ -137,11 +137,20 @@ def make_model_planner(
         device = torch.device(kwargs["device"]) if "device" in kwargs else torch.device("cpu")
         if device.type in ("cuda", "npu"):
             getattr(torch, device.type).set_device(device)
-        batch = batch_builder(**inputs)
+        builder_inputs = {key: value for key, value in inputs.items() if key != "prepared_vision_prefix"}
+        batch = batch_builder(**builder_inputs)
+        if "prepared_vision_prefix" in inputs:
+            batch["causal_action_precomputed_vision_prefix"] = [inputs["prepared_vision_prefix"]]
         metadata = batch["sequence_plan"][0].causal_action_metadata
         _validate_batch_frequency(batch, batch_builder, metadata, controller_hz)
-        current = int(batch.get("causal_action_current_block", len(metadata.states) - 1))
-        if not 0 <= current < len(metadata.states):
+        decision_window = getattr(metadata, "layout_mode", "block") == "decision_window"
+        current = int(
+            batch.get("causal_action_current_block", getattr(metadata, "current_group_id", len(metadata.states) - 1))
+        )
+        state_index = metadata.current_state_index if decision_window else current
+        if decision_window and current != metadata.current_group_id:
+            raise ValueError("Decision window current group must equal observed_latents")
+        if not 0 <= state_index < len(metadata.states):
             raise ValueError("Requested RTC block has no measured state")
         if metadata.template is None or metadata.template.template_id != template.template_id:
             raise ValueError("RTC batch must preserve the action template")
@@ -149,16 +158,20 @@ def make_model_planner(
         # boundary. Tolerate only FP32 normalization roundoff, not an old
         # block's measured state or a predicted anchor.
         if not torch.allclose(
-            metadata.anchors[current].detach().cpu().double(),
+            metadata.anchors[state_index].detach().cpu().double(),
             inputs["state"].double(),
             atol=1e-6,
             rtol=0,
         ):
             raise ValueError("RTC batch must preserve the fresh measured state as current anchor")
-        if not torch.equal(metadata.state_mask[current].cpu(), inputs["state_mask"]):
+        if not torch.equal(metadata.state_mask[state_index].cpu(), inputs["state_mask"]):
             raise ValueError("RTC batch must preserve measured state validity")
-        indexes = prediction_block_ids(metadata.action_frame_ids, metadata.block_size) == current
-        if int(indexes.sum()) != horizon:
+        indexes = (
+            metadata.action_indexes_for_group(current)
+            if decision_window
+            else torch.where(prediction_block_ids(metadata.action_frame_ids, metadata.block_size) == current)[0]
+        )
+        if len(indexes) != horizon:
             raise ValueError("RTC batch must preserve the action prediction horizon")
         if not torch.equal(metadata.action_mask[indexes].cpu(), inputs["action_mask"].expand(horizon, -1)):
             raise ValueError("RTC batch must preserve action validity")
@@ -173,7 +186,7 @@ def make_model_planner(
         generated = model.generate_samples_from_batch(
             batch,
             causal_block_size=metadata.block_size,
-            causal_history_blocks=history_blocks,
+            causal_history_blocks=metadata.observed_latents if decision_window else history_blocks,
             **sampling_options,
         )
         return real_actions(generated, batch)[0].detach().float().cpu()
@@ -230,6 +243,10 @@ class RTCSession:
         calibration_margin_steps=1,
         execution_policy=None,
         execution_rate_callback=None,
+        on_observation=None,
+        on_prepare_window=None,
+        fixed_history_blocks=None,
+        fixed_history_steps=None,
     ):
         if not callable(planner):
             raise ValueError("planner must be callable")
@@ -256,6 +273,16 @@ class RTCSession:
         )
         self.delay_history_size = _positive_int("delay_history_size", delay_history_size)
         self.history_steps = _positive_int("history_steps", history_steps)
+        self.fixed_history_blocks = (
+            None if fixed_history_blocks is None else _positive_int("fixed_history_blocks", fixed_history_blocks)
+        )
+        if fixed_history_steps is not None and (type(fixed_history_steps) is not int or fixed_history_steps < 0):
+            raise ValueError("fixed_history_steps must be a nonnegative integer")
+        self.fixed_history_steps = fixed_history_steps
+        for callback in (on_observation, on_prepare_window):
+            if callback is not None and not callable(callback):
+                raise ValueError("Observation/window callbacks must be callable or None")
+        self._on_observation, self._on_prepare_window = on_observation, on_prepare_window
         if isinstance(controller_hz, bool) or not math.isfinite(controller_hz) or controller_hz <= 0:
             raise ValueError("controller_hz must be positive and finite")
         if isinstance(beta, bool) or not math.isfinite(beta) or beta <= 0:
@@ -321,8 +348,22 @@ class RTCSession:
             raise ValueError(f"RTC requires d <= s <= H-d; got d={delay}, s={execution_steps}, H={self.horizon}")
 
     def _history_seconds(self, tick):
-        blocks = min(tick // self.horizon, self.history_steps // self.horizon)
+        if self.fixed_history_steps is not None:
+            return self.fixed_history_steps / self.controller_hz
+        blocks = self.fixed_history_blocks
+        if blocks is None:
+            blocks = min(tick // self.horizon, self.history_steps // self.horizon)
         return blocks * self.horizon / self.controller_hz
+
+    def _observe(self, image):
+        if self._on_observation is not None:
+            self._on_observation(tick=self._tick, image=image, revision=self._revision)
+
+    def _prepare_observation_window(self, execution_steps=None):
+        if self._on_prepare_window is not None:
+            steps = self.min_execution_steps if execution_steps is None else execution_steps
+            anchor = max(self._tick, self._chunk_start_tick + steps)
+            self._on_prepare_window(anchor_tick=anchor, revision=self._revision)
 
     def _update_execution_budget(self, *, history_tick, execution_steps):
         """Apply an acknowledged slower rate before submitting a new request.
@@ -467,7 +508,7 @@ class RTCSession:
                 if self.execution_policy is not None:
                     for seconds in calibration["sample_seconds"]:
                         self._delay_seconds.append(seconds)
-                        self._latency_samples.append((0.0, seconds))
+                        self._latency_samples.append((self._history_seconds(0), seconds))
                     self._update_execution_budget(history_tick=0, execution_steps=self.min_execution_steps)
                     if self._rtc_enabled:
                         calibration.update(
@@ -542,6 +583,9 @@ class RTCSession:
                 )
             if self._rtc_enabled:
                 state, sm, current_image, am = self._measurement(state, state_mask, image, action_mask)
+                self._observe(current_image)
+                if self._pending is None:
+                    self._prepare_observation_window()
                 if self._pending is None and offset >= self.min_execution_steps:
                     delay = self._adaptive_delay_steps if self.execution_policy is not None else max(self._delays)
                     try:
@@ -584,6 +628,8 @@ class RTCSession:
             if self._blocking:
                 raise RTCError("Concurrent blocking command requests are not supported")
             state, sm, image, am = self._measurement(state, state_mask, image, action_mask)
+            self._observe(image)
+            self._prepare_observation_window(0 if self._ordinary_replan_needed else self.horizon)
             offset = self._tick - self._chunk_start_tick
             if not self._ordinary_replan_needed and offset < self.horizon:
                 action = self._actions[offset].clone()
@@ -612,6 +658,7 @@ class RTCSession:
                 self._chunk_start_tick = tick
                 self._ordinary_replan_needed = False
                 self._ordinary_requests += 1
+                self._prepare_observation_window(self.horizon)
                 self._history.append(RTCObservation(tick, image))
                 self._tick += 1
                 return actions[0].clone()
@@ -675,6 +722,7 @@ class RTCSession:
                 # needs to submit inference for the newly installed chunk.
                 if self._pending is request:
                     self._pending = None
+                self._prepare_observation_window()
         except Exception as exc:
             with self._lock:
                 if not self._closed and request.revision == self._revision and self._error is None:
@@ -877,7 +925,12 @@ class RTCSession:
             min_execution_steps=min_execution_steps,
             initial_delay_steps=initial_delay_steps,
             delay_history_size=delay_history_size,
-            history_steps=history_blocks * horizon,
+            history_steps=max(1, batch_builder.history_steps)
+            if getattr(batch_builder, "layout_mode", "block") == "decision_window"
+            else history_blocks * horizon,
+            fixed_history_steps=batch_builder.history_steps
+            if getattr(batch_builder, "layout_mode", "block") == "decision_window"
+            else None,
             beta=beta,
             ordinary_planner=planner,
             synchronize=synchronize,

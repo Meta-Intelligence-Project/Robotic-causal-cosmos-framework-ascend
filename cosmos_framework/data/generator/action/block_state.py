@@ -124,10 +124,81 @@ class BlockStateMetadata:
     action_clip_fraction: torch.Tensor | None = None
     statistics: BlockStatistics | None = None
     template: ActionStateTemplate | None = None
+    include_visual_prefix: bool = False
+    # 决策窗口不复制历史action/state。P/H按下采样前的控制步计，
+    # observed_latents/future_latents按VAE时间帧计，二者不能混用。
+    layout_mode: str = "block"
+    history_steps: int | None = None
+    action_horizon: int | None = None
+    observed_latents: int | None = None
+    future_latents: int | None = None
+    actions_per_latent_frame: int | None = None
 
     def __post_init__(self):
+        if self.layout_mode not in ("block", "decision_window"):
+            raise ValueError("layout_mode must be block or decision_window")
+        if self.layout_mode == "decision_window":
+            for name, minimum in (("history_steps", 0), ("action_horizon", 1), ("actions_per_latent_frame", 1)):
+                value = getattr(self, name)
+                if type(value) is not int or value < minimum:
+                    raise ValueError(f"decision window {name} must be an integer >= {minimum}")
+            per_latent = self.actions_per_latent_frame
+            if self.history_steps % per_latent or self.action_horizon % per_latent:
+                raise ValueError("history_steps and action_horizon must be divisible by actions_per_latent_frame")
+            if self.observed_latents != 1 + self.history_steps // per_latent:
+                raise ValueError("observed_latents must include the history prefix and current observation")
+            if self.future_latents != self.action_horizon // per_latent:
+                raise ValueError("future_latents must match action_horizon")
+            if (
+                len(self.states) != 1
+                or self.anchors.shape != self.states.shape
+                or self.state_mask.shape != self.states.shape
+            ):
+                raise ValueError("A decision window requires exactly one measured state and anchor")
+            if self.action_mask.shape != (self.action_horizon, self.states.shape[-1]):
+                raise ValueError("Decision action_mask must contain only the predicted horizon")
+            expected = (
+                self.observed_latents
+                + torch.arange(self.action_horizon, device=self.action_frame_ids.device) // per_latent
+            )
+            if not torch.equal(self.action_frame_ids, expected):
+                raise ValueError("Decision actions must map to the future video latents")
+            if self.state_action_indexes.tolist() != [0] or self.state_latent_indexes.tolist() != [
+                self.observed_latents - 1
+            ]:
+                raise ValueError("Decision state must align with the current observed latent")
+            return
         if self.history_blocks < 1:
             raise ValueError("history_blocks must be positive")
+
+    @property
+    def current_group_id(self):
+        """历史逐latent因果组0..M-1，未来统一决策组M；anchor索引另算。"""
+        return self.observed_latents if self.layout_mode == "decision_window" else len(self.states) - 1
+
+    @property
+    def current_state_index(self):
+        """决策组M与唯一实测anchor的数组下标0不同，不能混用。"""
+        return 0 if self.layout_mode == "decision_window" else self.current_group_id
+
+    @property
+    def target_vision_span(self):
+        if self.layout_mode == "decision_window":
+            return self.observed_latents, self.observed_latents + self.future_latents
+        return prediction_block_span(self.current_group_id, self.block_size)
+
+    @property
+    def action_anchor_indexes(self):
+        """每个动作使用哪个物理anchor；与attention group编号独立。"""
+        if self.layout_mode == "decision_window":
+            return torch.zeros_like(self.action_frame_ids)
+        return prediction_block_ids(self.action_frame_ids, self.block_size)
+
+    def action_indexes_for_group(self, group_id):
+        if self.layout_mode == "decision_window":
+            indexes = torch.arange(len(self.action_frame_ids), device=self.action_frame_ids.device)
+            return indexes if group_id == self.current_group_id else indexes[:0]
+        return torch.where(self.action_anchor_indexes == group_id)[0]
 
     def to(self, device):
         from dataclasses import replace

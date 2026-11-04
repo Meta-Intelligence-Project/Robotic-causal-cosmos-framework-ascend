@@ -43,8 +43,13 @@ def latent_block_size(actions_per_block, video_stride):
     ).latent_frames_per_block
 
 
-def video_durations(max_action_steps, actions_per_block, video_stride):
+def video_durations(max_action_steps, actions_per_block, video_stride, history_steps=None, action_horizon=None):
     """列出所有合法片段抽帧后的 VAE 输入长度，包括独立首帧。"""
+    if history_steps is not None:
+        per_latent = video_stride * 4
+        if action_horizon is None or history_steps % per_latent or action_horizon % per_latent:
+            raise ValueError("Decision video duration requires aligned history_steps and action_horizon")
+        return sorted({1 + history_steps // video_stride, 1 + (history_steps + action_horizon) // video_stride})
     geometry = CausalBlockGeometry(
         actions_per_block=actions_per_block, video_stride=video_stride, temporal_compression_factor=4
     )
@@ -65,6 +70,9 @@ def get_causal_action_dataset(
     mode="joint",
     history_blocks_min=1,
     history_blocks_max=8,
+    history_padding="available",
+    history_steps=None,
+    action_horizon=None,
     seed=42,
     resolution="480",
     tokenizer_config=None,
@@ -75,9 +83,26 @@ def get_causal_action_dataset(
 ):
     """来源文件只声明路径/读取规则；模板、geometry 和 transform 共用任务级配置。"""
     template = resolve_action_template(template)
+    if (history_steps is None) != (action_horizon is None):
+        raise ValueError("history_steps and action_horizon must be supplied together")
+    if action_horizon is not None:
+        if type(action_horizon) is not int or action_horizon < 1:
+            raise ValueError("action_horizon must be a positive integer")
+        # IO上限不定义决策窗口；只为旧segment planner向下取完整horizon。
+        actions_per_block = action_horizon
+        max_action_steps = max_action_steps // action_horizon * action_horizon
+        if max_action_steps < action_horizon:
+            raise ValueError("max_action_steps must allow at least one action_horizon")
     geometry = CausalBlockGeometry(
         actions_per_block=actions_per_block, video_stride=video_stride, temporal_compression_factor=4
     )
+    if history_steps is not None and (
+        type(history_steps) is not int
+        or history_steps < 0
+        or history_steps % geometry.actions_per_latent_frame
+        or history_padding != "repeat_first"
+    ):
+        raise ValueError("Decision history_steps must align with video_stride * VAE4 and use repeat_first")
     planner = SegmentPlanner(
         max_action_steps=max_action_steps, overlap_action_steps=overlap_action_steps, geometry=geometry
     )
@@ -146,6 +171,9 @@ def get_causal_action_dataset(
                     allow_mock_statistics=allow_mock_statistics,
                     history_blocks_min=history_blocks_min,
                     history_blocks_max=history_blocks_max,
+                    history_padding=history_padding,
+                    history_steps=history_steps,
+                    action_horizon=action_horizon,
                     joint_mode_weights=source.get("joint_mode_weights"),
                 )
                 children.append(dataset)

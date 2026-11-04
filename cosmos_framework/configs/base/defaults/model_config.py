@@ -268,6 +268,7 @@ class OmniMoTModelConfig:
 
     # action configs
     action_gen: bool = False  # whether to use action related parameters and condition/generate action tokens
+    add_action_flag: bool = False  # Embed valid action/state channels in causal action inputs when enabled.
     max_action_dim: int = 32  # maximum dimension of the action space, we need to pad the data to this dimension.
     num_embodiment_domains: int = 32  # number of domains for the domain-aware linear layer
 

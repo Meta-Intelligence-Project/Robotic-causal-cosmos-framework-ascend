@@ -111,6 +111,9 @@ class ActionConfig(BaseModel):
     sources_file: str = "examples/action_pretrain/sources/mixed.json"
     table_backend: Literal["parquet", "hf"] = "parquet"
     early_video_sampling: bool = True
+    history_padding: Literal["available", "repeat_first"] = "available"
+    history_steps: int | None = Field(default=None, ge=0, description="历史action时间步P，独立于预测长度")
+    action_horizon: int | None = Field(default=None, ge=1, description="每次决策的真实action目标数H")
     actions_per_block: int = Field(default=32, ge=1)
     max_action_steps: int = Field(default=96, ge=1)
     overlap_action_steps: int = Field(default=16, ge=0)
@@ -121,8 +124,32 @@ class ActionConfig(BaseModel):
     mock_state_stats_path: str = ""
     mock_delta_stats_path: str = ""
 
+    @model_validator(mode="after")
+    def validate_decision_window(self):
+        if (self.history_steps is None) != (self.action_horizon is None):
+            raise ValueError("history_steps and action_horizon must be supplied together")
+        if self.history_steps is not None:
+            per_latent = self.video_stride * 4
+            if self.history_padding != "repeat_first":
+                raise ValueError("Decision windows require history_padding='repeat_first'")
+            if self.history_steps % per_latent or self.action_horizon % per_latent:
+                raise ValueError("history_steps and action_horizon must align with video_stride * VAE4")
+            if self.max_action_steps < self.action_horizon:
+                raise ValueError("max_action_steps must allow at least one action_horizon")
+        return self
+
 
 # ---------------------------------------------------------------- model
+class HumanVideoConfig(BaseModel):
+    """Video-only LeRobot source; no robot state/action annotations are required."""
+
+    model_config = _PYDANTIC_MODEL_CONFIG
+
+    dataset_path: str = ""
+    robot_ratio: int = Field(default=1, ge=0)
+    video_ratio: int = Field(default=1, ge=0)
+
+
 class EMAConfig(BaseModel):
     """Exponential Moving Average of the generation-pathway weights.
 
@@ -397,6 +424,10 @@ class ModelConfig(BaseModel):
     causal_action_log_loss_by_mode: bool = Field(
         default=False,
         description="Record separate Policy/ID/FD losses on rank 0 without cross-rank reduction.",
+    )
+    add_action_flag: bool = Field(
+        default=False,
+        description="Add learned action/state validity-mask embeddings to causal action inputs.",
     )
     teacher_forcing_dense_mode: Literal["global", "per_sample", "grouped_tnd"] = Field(
         default="global",
@@ -866,6 +897,7 @@ class SFTExperimentConfig(BaseModel):
 
     job: JobConfig = Field(default_factory=JobConfig)
     action: ActionConfig = Field(default_factory=ActionConfig)
+    human_video: HumanVideoConfig = Field(default_factory=HumanVideoConfig)
     model: ModelConfig = Field(default_factory=ModelConfig)
     optimizer: OptimizerConfig = Field(default_factory=OptimizerConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)

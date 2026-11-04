@@ -5,6 +5,7 @@ import os
 import time
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from typing import Literal
 
 import torch
@@ -14,12 +15,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from cosmos_framework.utils.flags import DEVICE, INTERNAL, TRAINING
+from cosmos_framework.data.generator.utils import VIDEO_RES_SIZE_INFO
+from cosmos_framework.model.generator.tokenizers.interface import VideoTokenizerInterface
 from cosmos_framework.utils import log
 from cosmos_framework.utils.distributed import get_rank, sync_model_states
 from cosmos_framework.utils.easy_io import easy_io
-from cosmos_framework.data.generator.utils import VIDEO_RES_SIZE_INFO
-from cosmos_framework.model.generator.tokenizers.interface import VideoTokenizerInterface
+from cosmos_framework.utils.flags import DEVICE, INTERNAL, TRAINING
 from cosmos_framework.utils.generator.data_utils import get_vision_data_resolution
 
 # For sequential decoding, CACHE_T is the number of frames to cache.
@@ -802,6 +803,27 @@ class WanVAE_(nn.Module):
         mu, _log_var = self.conv1(out).chunk(2, dim=1)
         return self._normalize_latent(mu, scale), feat_cache
 
+    def _run_encode_chunk(
+        self,
+        x_chunk: torch.Tensor,
+        feat_cache: list[torch.Tensor | None],
+        scale: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, list[torch.Tensor | None]]:
+        """Dispatch a patchified chunk while canonicalizing input/cache strides."""
+        is_prime = feat_cache[0] is None
+        # AOT kernels expect the contiguous cache layout used during export;
+        # compiled outputs can have different strides on some torch versions.
+        x_chunk = x_chunk.contiguous()
+        feat_cache = [c.contiguous() if c is not None else None for c in feat_cache]
+        aot_chunk_fns = getattr(self, "_aot_chunk_fns", None)
+        if aot_chunk_fns is not None:
+            cache_t = 0 if is_prime else feat_cache[0].shape[2]
+            aot_key = (x_chunk.shape[2], x_chunk.shape[3], x_chunk.shape[4], cache_t)
+            aot_fn = aot_chunk_fns.get(aot_key)
+            if aot_fn is not None:
+                return aot_fn(x_chunk, feat_cache)
+        return self._encode_chunk_impl(x_chunk, feat_cache, scale)
+
     def encode(self, x: torch.Tensor, scale: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
         """Chunked causal encoding that converts pixel-space video to latent space.
 
@@ -886,56 +908,15 @@ class WanVAE_(nn.Module):
         # [B, 3, T, H, W] → [B, 12, T, H//2, W//2].
         x = patchify(x, patch_size=2)
 
-        aot_chunk_fns: dict | None = getattr(self, "_aot_chunk_fns", None)
-        H_patch, W_patch = x.shape[3], x.shape[4]
-
-        def _run_chunk(
-            x_chunk: torch.Tensor,
-            feat_cache: list[torch.Tensor | None],
-        ) -> tuple[torch.Tensor, list[torch.Tensor | None]]:
-            """Encode one chunk, through the AOT path or eager fallback.
-
-            If AOT-compiled chunk functions are installed, the function is
-            looked up by ``(T_chunk, H_patch, W_patch, cache_t)`` where
-            ``cache_t`` is the minimum temporal extent of the cache tensors
-            (0 = all-None prime, 1 = post-prime, 2 = steady state).
-
-            Both full-size and remainder chunks (from ``encode_exact_durations``)
-            are dispatched through the AOT path when a matching compiled
-            function exists; uncompiled shapes fall back to eager.
-            """
-            is_prime = feat_cache[0] is None
-
-            # Ensure contiguity so the encoder (eager or AOT-compiled) receives tensors with
-            # deterministic strides regardless of the source slice. This matters most for the
-            # AOT path: the compiled variants are exported against eager-produced (contiguous)
-            # example caches, but the cache returned by a previous AOT chunk is not guaranteed
-            # to share that layout (torch 2.12's AOTInductor returns a differently-strided
-            # cache). Feeding a non-canonical layout makes the compiled function misread it,
-            # silently corrupting subsequent chunks. It is a no-op for already-contiguous
-            # tensors, so applying it on both paths costs nothing and keeps the invariant local.
-            x_chunk = x_chunk.contiguous()
-            feat_cache = [c.contiguous() if c is not None else None for c in feat_cache]
-
-            if aot_chunk_fns is not None:
-                cache_t = 0 if is_prime else feat_cache[0].shape[2]
-                aot_key = (x_chunk.shape[2], H_patch, W_patch, cache_t)
-                aot_fn = aot_chunk_fns.get(aot_key)
-
-                if aot_fn is not None:
-                    return aot_fn(x_chunk, feat_cache)
-
-            return self._encode_chunk_impl(x_chunk, feat_cache, scale)
-
         # --- Chunked encoding loop ---
         # Chunk 0: single-frame "key-frame prime" to seed all causal caches.
-        out, enc_cache = _run_chunk(x[:, :, :1], feat_cache=enc_cache)
+        out, enc_cache = self._run_encode_chunk(x[:, :, :1], enc_cache, scale)
         outs = [out]
 
         # Chunks 1..N: process the remaining frames in fixed-size windows.
         for start in range(1, T, temporal_window):
             x_chunk = x[:, :, start : start + temporal_window]
-            out, enc_cache = _run_chunk(x_chunk, feat_cache=enc_cache)
+            out, enc_cache = self._run_encode_chunk(x_chunk, enc_cache, scale)
             outs.append(out)
 
         final_out = torch.cat(outs, dim=2) if len(outs) > 1 else outs[0]
@@ -1340,6 +1321,34 @@ def _synchronized_reset_dir(path: str, *, is_distributed: bool, rank: int, mode:
         dist.barrier()
 
 
+@dataclass
+class Wan2pt2EncodeState:
+    """One finite observation window; caches never live on the shared tokenizer.
+
+    Inputs must be normalized RGB frames in chronological order. A session owns
+    one initial frame followed by complete groups of four real frames, without
+    temporal padding. Returned latent tensors use the original input dtype.
+    """
+
+    input_layout: tuple[int, int, int, int]
+    input_dtype: torch.dtype
+    device: torch.device
+    frame_count: int = 1
+    closed: bool = False
+    feat_cache: list[torch.Tensor | None] = field(default_factory=list, repr=False)
+    latent_chunks: list[torch.Tensor] = field(default_factory=list, repr=False)
+    _owner_id: int = field(default=0, repr=False)
+    _model_id: int = field(default=0, repr=False)
+    _model_dtype: torch.dtype | None = field(default=None, repr=False)
+
+    @property
+    def latents(self) -> torch.Tensor:
+        """The normalized prefix encoded so far; unavailable after finish/abort."""
+        if self.closed:
+            raise ValueError("The streaming encode session is closed")
+        return torch.cat(self.latent_chunks, dim=2)
+
+
 class Wan2pt2VAEInterface(VideoTokenizerInterface):
     def __init__(
         self,
@@ -1440,6 +1449,106 @@ class Wan2pt2VAEInterface(VideoTokenizerInterface):
             Tensor of shape ``[B, z_dim, T//4, H//16, W//16]``.
         """
         return self.model.encode(state)
+
+    def _validate_stream_frames(self, frames: torch.Tensor) -> None:
+        if frames.ndim != 5 or frames.shape[1] != 3 or min(frames.shape) < 1:
+            raise ValueError("Streaming encode expects nonempty [B,3,T,H,W] normalized RGB frames")
+        if not frames.is_floating_point():
+            raise ValueError("Streaming encode expects floating-point RGB frames normalized to [-1,1]")
+        if frames.shape[3] % 16 or frames.shape[4] % 16:
+            raise ValueError("Streaming encode height and width must be multiples of 16")
+        if self.model.model.training:
+            raise ValueError("Streaming encode requires an eval-mode VAE")
+        if frames.device != next(self.model.model.parameters()).device:
+            raise ValueError("Streaming encode frames and VAE must be on the same device")
+
+    def _validate_stream_state(self, state: Wan2pt2EncodeState) -> None:
+        if not isinstance(state, Wan2pt2EncodeState) or state._owner_id != id(self):
+            raise ValueError("The streaming encode session belongs to another tokenizer")
+        if state.closed:
+            raise ValueError("The streaming encode session is closed")
+        if state._model_id != id(self.model.model) or state._model_dtype != self.model.dtype:
+            raise ValueError("The VAE model or dtype changed during streaming encode")
+
+    def _stream_encode_chunk(self, state: Wan2pt2EncodeState, frames: torch.Tensor) -> torch.Tensor:
+        patches = patchify(frames.to(dtype=self.model.dtype), patch_size=2)
+        latent, cache = self.model.model._run_encode_chunk(patches, state.feat_cache, self.model.scale)
+        state.feat_cache = cache
+        latent = latent.to(dtype=state.input_dtype)
+        state.latent_chunks.append(latent)
+        return latent
+
+    @torch.no_grad()
+    def stream_encode_start(self, first_frame: torch.Tensor) -> Wan2pt2EncodeState:
+        """Prime an isolated window with [B,3,1,H,W] normalized RGB input.
+
+        This API always uses one prime frame followed by four-frame chunks. It
+        does not change the chunk size or padding behavior of ordinary encode.
+        """
+        self._validate_stream_frames(first_frame)
+        if first_frame.shape[2] != 1:
+            raise ValueError("Streaming encode must start with exactly one frame")
+        state = Wan2pt2EncodeState(
+            input_layout=(first_frame.shape[0], 3, first_frame.shape[3], first_frame.shape[4]),
+            input_dtype=first_frame.dtype,
+            device=first_frame.device,
+            feat_cache=self.model.model._new_enc_cache(),
+            _owner_id=id(self),
+            _model_id=id(self.model.model),
+            _model_dtype=self.model.dtype,
+        )
+        try:
+            self._stream_encode_chunk(state, first_frame)
+        except Exception:
+            self.stream_encode_abort(state)
+            raise
+        return state
+
+    @torch.no_grad()
+    def stream_encode_step(self, state: Wan2pt2EncodeState, new_frames: torch.Tensor) -> torch.Tensor:
+        """Append [B,3,4k,H,W] real frames and return only their new latents.
+
+        Frame order and timestamps are the caller's responsibility. No future
+        frames are fabricated, and incomplete groups must remain with the caller.
+        """
+        self._validate_stream_state(state)
+        self._validate_stream_frames(new_frames)
+        layout = (new_frames.shape[0], 3, new_frames.shape[3], new_frames.shape[4])
+        if layout != state.input_layout or new_frames.dtype != state.input_dtype or new_frames.device != state.device:
+            raise ValueError("Streaming encode input layout, dtype and device must remain fixed")
+        if new_frames.shape[2] % 4:
+            raise ValueError("Streaming encode steps require a positive multiple of four real frames")
+        new_latents = []
+        try:
+            for start in range(0, new_frames.shape[2], 4):
+                new_latents.append(self._stream_encode_chunk(state, new_frames[:, :, start : start + 4]))
+                state.frame_count += 4
+        except Exception:
+            self.stream_encode_abort(state)
+            raise
+        return torch.cat(new_latents, dim=2)
+
+    @torch.no_grad()
+    def stream_encode_finish(self, state: Wan2pt2EncodeState) -> torch.Tensor:
+        """Return all normalized window latents and release this session's caches."""
+        self._validate_stream_state(state)
+        try:
+            return state.latents
+        finally:
+            self.stream_encode_abort(state)
+
+    def stream_encode_abort(self, state: Wan2pt2EncodeState) -> None:
+        """Release a session, including after an exception; repeated aborts are safe."""
+        if not isinstance(state, Wan2pt2EncodeState) or state._owner_id != id(self):
+            raise ValueError("The streaming encode session belongs to another tokenizer")
+        state.feat_cache.clear()
+        state.latent_chunks.clear()
+        state.closed = True
+
+    def stream_encode_reset(self, state: Wan2pt2EncodeState, first_frame: torch.Tensor) -> Wan2pt2EncodeState:
+        """Abort a previous window and create a fresh session from its own first frame."""
+        self.stream_encode_abort(state)
+        return self.stream_encode_start(first_frame)
 
     def decode(self, latent: torch.Tensor) -> torch.Tensor:
         """Decode a batch of latent tensors.

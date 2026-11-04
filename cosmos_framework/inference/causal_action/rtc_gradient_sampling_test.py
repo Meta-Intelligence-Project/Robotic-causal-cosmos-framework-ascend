@@ -35,7 +35,7 @@ def _cpu_packing_and_attention(monkeypatch):
 class _RealModel(_CoupledModel):
     """Reuse small packing geometry, replacing every denoise with the real net."""
 
-    def __init__(self, solver):
+    def __init__(self, solver, *, add_action_flag=False):
         super().__init__()
         torch.manual_seed(71)
         config = Qwen3VLTextConfig(
@@ -59,6 +59,7 @@ class _RealModel(_CoupledModel):
                     action_gen=True,
                     sound_gen=False,
                     action_dim=3,
+                    add_action_flag=add_action_flag,
                     latent_patch_size=1,
                     latent_channel_size=1,
                     max_latent_h=1,
@@ -73,6 +74,10 @@ class _RealModel(_CoupledModel):
             .requires_grad_(False)
         )
         with torch.no_grad():
+            if add_action_flag:
+                # Exercise trained, nonzero mask conditions through the real RTC input VJP.
+                self.net.action_mask_embed.weight.uniform_(-0.2, 0.2)
+                self.net.state_mask_embed.weight.uniform_(-0.2, 0.2)
             for layer in language_model.model.layers:
                 layer.self_attn.k_norm_und_for_gen.weight.copy_(torch.linspace(0.5, 2.0, config.head_dim))
         self.sampler = (
@@ -131,8 +136,11 @@ def _observe_input_vjp(monkeypatch):
 
 @pytest.mark.parametrize("solver", ["unipc", "fixed"])
 @pytest.mark.parametrize("cfg", [1.0, 3.0])
-def test_gradient_cache_matches_reference_native_solver_trajectories_and_joint_vjps(monkeypatch, solver, cfg):
-    model = _RealModel(solver)
+@pytest.mark.parametrize("add_action_flag", [False, True])
+def test_gradient_cache_matches_reference_native_solver_trajectories_and_joint_vjps(
+    monkeypatch, solver, cfg, add_action_flag
+):
+    model = _RealModel(solver, add_action_flag=add_action_flag)
     observations = _observe_input_vjp(monkeypatch)
     reference_request = _real_request(model, cache_mode="plans", cfg=cfg)
     # FixedStep re-noises between evaluations; sample_prepared intentionally
@@ -178,8 +186,9 @@ def test_gradient_cache_matches_reference_native_solver_trajectories_and_joint_v
 
 
 @pytest.mark.parametrize("abort_rtc", [False, True])
-def test_ordinary_b_bytes_and_model_patches_survive_successful_or_failed_rtc(monkeypatch, abort_rtc):
-    model = _RealModel("unipc")
+@pytest.mark.parametrize("add_action_flag", [False, True])
+def test_ordinary_b_bytes_and_model_patches_survive_successful_or_failed_rtc(monkeypatch, abort_rtc, add_action_flag):
+    model = _RealModel("unipc", add_action_flag=add_action_flag)
     language_model = model.net.language_model
     forward_before = language_model.forward
     dispatch_before = [layer.self_attn.dispatch_attention_fn for layer in language_model.model.layers]

@@ -17,7 +17,12 @@ def real_actions(result, batch):
         selected_mask = mask[keep]
         if len(selected_mask) and not (selected_mask == selected_mask[0]).all():
             raise ValueError("Generated physical actions must share one valid channel mask")
-        blocks = prediction_block_ids(metadata.action_frame_ids.to(action.device)[keep], metadata.block_size)
+        # 决策窗口只有anchor 0；attention group M不是state/anchor数组索引。
+        blocks = (
+            metadata.action_anchor_indexes.to(action.device)[keep]
+            if getattr(metadata, "layout_mode", "block") == "decision_window"
+            else prediction_block_ids(metadata.action_frame_ids.to(action.device)[keep], metadata.block_size)
+        )
         delta = metadata.statistics.action.denormalize(action[keep], mask[keep])
         physical = metadata.template.decode_action_delta(
             delta,

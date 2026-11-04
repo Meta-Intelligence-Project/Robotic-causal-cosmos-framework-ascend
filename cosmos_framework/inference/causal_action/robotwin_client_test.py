@@ -12,6 +12,7 @@ import torch
 
 from cosmos_framework.data.generator.action.action_state_template import ActionStateTemplate55
 from cosmos_framework.inference.causal_action import robotwin_client as runner
+from cosmos_framework.inference.causal_action.async_session import AsyncRemoteSession
 from cosmos_framework.inference.causal_action.robotwin import RobotwinAdapter
 from cosmos_framework.inference.causal_action.rtc_session import RTCSession
 
@@ -180,6 +181,107 @@ def test_bootstrap_and_calibration_keep_environment_stationary_then_interpolate_
     assert {row[2] for row in env.executed} == {"qpos"}
     assert [int(obs["image"][0, 0, 0]) for obs in client.session.observations] == [0, 2, 4]
     assert np.load(tmp_path / "waypoints_unified.npy").shape == (3, 55)
+
+
+@pytest.mark.parametrize("execution_mode", ["auto", "async", "blocking"])
+def test_rollout_passes_execution_mode_to_the_session_factory(execution_mode):
+    env = FakeEnv(FakeClock())
+    client = FakeClient(env)
+    result = run(env, client, execution_mode=execution_mode, max_waypoints=1)
+    assert client.session.options["execution_mode"] == execution_mode
+    assert client.session.options["enable_rtc"] is False
+    assert result["execution_mode"] == result["final_status"]["execution_mode"] == "blocking_non_rtc"
+
+
+def test_ordinary_async_planning_keeps_servo_execution_running_without_rtc():
+    env = FakeEnv(FakeClock())
+    started, release = Event(), Event()
+
+    class AsyncClient(FakeClient):
+        def __init__(self, env):
+            super().__init__(env)
+            self.metadata.update(action_horizon=32, execute_steps=16, handoff_steps=24, history_steps=1024)
+            self.requests, self.hints = [], []
+
+        def create_session(self, first_measurement, *, prompt, **options):
+            assert options["execution_mode"] == "async" and not options["enable_rtc"]
+            self.session = AsyncRemoteSession(
+                self, torch.stack([command(i) for i in range(32)]), execution_hz=options["execution_hz"]
+            )
+            return self.session
+
+        def plan(self, **request):
+            self.requests.append(request)
+            started.set()
+            if not release.wait(5):
+                raise TimeoutError("Test did not release ordinary background prediction")
+            return torch.stack([command(request["tick"] + i) for i in range(32)])
+
+        def observe(self, **measurement):
+            pass
+
+        def prepare_window(self, *, anchor_tick, revision):
+            self.hints.append(anchor_tick)
+
+    client = AsyncClient(env)
+    pending_commands = []
+
+    def progress():
+        if client.session.status()["inference_pending"]:
+            assert started.wait(2)
+            pending_commands.append(len(env.executed))
+        if len(env.executed) == 35:
+            release.set()
+            client.session.join(timeout=2)
+
+    env.after_action = progress
+    try:
+        result = run(env, client, execution_mode="async", max_waypoints=27)
+        assert result["execution_mode"] == "async_non_rtc"
+        assert not result["continuous_rtc"] and not result["adaptive_execution"]
+        assert result["executed_waypoints"] == 27 and result["servo_commands"] == 54
+        assert pending_commands[:3] == [33, 34, 35]
+        assert result["final_status"]["published_requests"] == 1
+        assert [request["tick"] for request in client.requests] == [16]
+        assert client.requests[0]["rtc"] is None
+        assert client.hints == [16, 32]
+        np.testing.assert_allclose([row[1][0] for row in env.executed[1::2]], np.arange(1, 28))
+    finally:
+        release.set()
+
+
+def test_late_async_handoff_starts_a_fresh_servo_interval_without_catching_up():
+    env = FakeEnv(FakeClock())
+    client = FakeClient(env)
+    create = client.create_session
+
+    def create_late_async(*args, **kwargs):
+        session = create(*args, **kwargs)
+        original_action, original_status = session.get_action, session.status
+
+        def status():
+            value = original_status()
+            value.update(execution_mode="async_non_rtc", published_requests=int(session.tick > 1))
+            return value
+
+        def get_action(**measurement):
+            if session.tick == 1:
+                # 模拟固定交接点等待候选结果；等待期间没有新的模型tick。
+                env.clock.now += 0.75
+            return original_action(**measurement)
+
+        session.status, session.get_action = status, get_action
+        return session
+
+    client.create_session = create_late_async
+    result = run(env, client, execution_mode="async")
+    assert result["execution_mode"] == "async_non_rtc" and not result["continuous_rtc"]
+    assert [row["tick"] for row in result["action_trace"]] == [0, 1, 2]
+    assert [row["call_seconds"] for row in result["action_trace"]] == [0, 0.75, 0]
+    assert result["executed_waypoints"] == 3 and result["servo_commands"] == 6
+    assert result["wall_seconds"] == 2.25 and result["skipped_servo_ticks"] == 0
+    np.testing.assert_allclose([row[0] for row in env.executed], [100.25, 100.5, 101.5, 101.75, 102, 102.25])
+    np.testing.assert_allclose([row[1][0] for row in env.executed], [0.5, 1, 1.5, 2, 2.5, 3])
 
 
 def test_acknowledged_slowdown_is_applied_to_future_interpolation_intervals():

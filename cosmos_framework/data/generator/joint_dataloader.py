@@ -12,14 +12,14 @@ import torch
 import webdataset
 from torch.utils.data.dataloader import default_collate
 
-from cosmos_framework.utils.lazy_config import instantiate
-from cosmos_framework.utils import log
 from cosmos_framework.model.generator.tokenizers.uniae.frame_math import (
     get_uniae_chunk_frames,
     get_uniae_latent_num_frames,
     normalize_uniae_chunk_frames,
 )
+from cosmos_framework.utils import log
 from cosmos_framework.utils.generator.data_utils import read_positive_int_metadata
+from cosmos_framework.utils.lazy_config import instantiate
 
 _TIMING_KEYS = {"_sample_time", "_aug_time", "_pre_aug_time", "_aug_step_times"}
 _BATCH_TIMING_KEYS = {
@@ -371,7 +371,7 @@ class JointDataLoader(webdataset.WebLoader):
             torch.distributed.barrier()
             log.info("Pre-warm: all ranks ready")
 
-    def _compute_num_tokens_per_sample(self, data_batch: dict) -> int:
+    def _compute_num_tokens_per_sample(self, data_batch: dict, *, include_clean_vision: bool = False) -> int:
         """
         This function computes the number of tokens per sample in the data batch.
         This includes text + vision generation tokens + action tokens.
@@ -480,11 +480,17 @@ class JointDataLoader(webdataset.WebLoader):
                     num_tokens += num_sound_tokens
 
         plans = data_batch.get("sequence_plan", [])
+        has_action_metadata = False
         for plan in plans if isinstance(plans, list) else [plans]:
             metadata = getattr(plan, "causal_action_metadata", None)
             if metadata is not None:
+                has_action_metadata = True
                 # Clean visual history plus one independent state per block.
-                num_tokens += causal_generation_tokens + len(metadata.states)
+                if getattr(metadata, "layout_mode", "block") != "decision_window":
+                    num_tokens += causal_generation_tokens
+                num_tokens += len(metadata.states)
+        if include_clean_vision and not has_action_metadata:
+            num_tokens += causal_generation_tokens
         return num_tokens
 
     # Keys whose value per sample is a list of tensors to be flattened into one list in the batch

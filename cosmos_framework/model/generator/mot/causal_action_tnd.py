@@ -51,6 +51,14 @@ def build_action_tnd_plan(layout, *, device, max_kv_tokens=131072):
         elif b == -1:
             keys += buckets.get((s, r, -1), [])
         else:
+            # 决策窗口的历史group逐latent递增，当前group=M；history_blocks=M
+            # 只是TND可见时间组容量，不代表存在M组历史action/state。
+            if (
+                layout.geometry.include_visual_prefix
+                and layout.geometry.include_visual_prefix[s]
+                and b - layout.geometry.history_blocks[s] > -1
+            ):
+                keys += buckets.get((s, 0, -1), [])
             for past in range(max(-1, b - layout.geometry.history_blocks[s]), b):
                 keys += buckets.get((s, 0, past), [])
             if r != 0:

@@ -84,6 +84,7 @@ def rollout(
     client,
     *,
     enable_rtc=False,
+    execution_mode="auto",
     execution_hz=None,
     servo_hz=30.0,
     adaptive_execution=True,
@@ -100,7 +101,8 @@ def rollout(
 
     Each model waypoint advances the session once. Servo interpolation does not
     create observation ticks. The bootstrap and prepare calls run before motion;
-    prepare measures the complete RPC while the simulator remains stationary.
+    RTC prepare measures the complete RPC while the simulator remains stationary;
+    ordinary asynchronous prepare only starts ahead-of-trigger VAE work.
     A fallback is reported and may block the following waypoint request. Missed
     servo deadlines are skipped, rather than emitted as a burst of old commands.
     The final target is sent unless the episode ends before it can be executed.
@@ -173,6 +175,7 @@ def rollout(
         first,
         prompt=env.get_instruction(),
         enable_rtc=enable_rtc,
+        execution_mode=execution_mode,
         execution_hz=requested_hz,
         execution_policy=execution_policy if adaptive_execution else None,
         execution_rate_callback=acknowledge_rate,
@@ -217,8 +220,8 @@ def rollout(
             if previous is None:
                 previous = torch.where(measurement["state_mask"], measurement["state"].float(), command).clone()
             period = 1 / rate
-            # In blocking mode, waiting for inference creates a real pause. Start
-            # a fresh interval instead of rushing expired servo targets afterward.
+            # 普通blocking或异步计划在交接点迟到都会产生真实等待。
+            # 从返回时刻开启新周期，绝不补发已过期的servo指令。
             interval_start = max(deadline, returned_at)
             interval_end = interval_start + period
             rtc_active_throughout &= bool(status.get("rtc_enabled", False))
@@ -292,6 +295,7 @@ def rollout(
             servo_hz=servo_hz,
             adaptive_execution=bool(enable_rtc and adaptive_execution),
             continuous_rtc=bool(enable_rtc and rtc_active_throughout),
+            execution_mode=final_status.get("execution_mode"),
             state_source=state_source,
             rate_changes=changes,
             skipped_servo_ticks=skipped_servo_ticks,
@@ -375,6 +379,12 @@ def parser():
     )
     p.add_argument("--render-freq", type=int, default=0)
     p.add_argument("--enable_rtc", "--enable-rtc", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument(
+        "--execution-mode",
+        choices=("auto", "blocking", "async"),
+        default="auto",
+        help="auto: streaming VAE selects async without RTC; blocking is an explicit baseline",
+    )
     p.add_argument("--adaptive-execution", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument(
         "--initial-execution-hz",
@@ -463,6 +473,7 @@ def main():
                         env,
                         client,
                         enable_rtc=args.enable_rtc,
+                        execution_mode=args.execution_mode,
                         execution_hz=args.execution_hz,
                         servo_hz=args.servo_hz,
                         adaptive_execution=args.adaptive_execution,
