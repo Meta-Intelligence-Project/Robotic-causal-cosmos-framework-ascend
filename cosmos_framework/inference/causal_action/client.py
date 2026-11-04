@@ -154,17 +154,71 @@ class CausalPolicyClient:
         actions = np.asarray(response.get("actions"))
         if (
             actions.dtype.kind != "f"
-            or actions.shape != (self.metadata["actions_per_block"], 55)
+            or actions.shape != (self.metadata.get("returned_action_steps", self.metadata["actions_per_block"]), 55)
             or not np.isfinite(actions).all()
         ):
             raise ValueError("Server returned an invalid physical unified55 action chunk")
         return torch.from_numpy(actions.astype(np.float32, copy=True))
 
-    def plan(self, *, state, state_mask, image, action_mask, history=(), tick, revision, rtc):
+    def calibrate_simulation(self, measurement, *, delay_steps=1, beta=5.0):
+        """Time a guided tick-zero request without advancing the simulator plan."""
+        if not self.metadata.get("simulation_sync", False):
+            raise ValueError("Simulation calibration requires a simulation server")
+        response = self.infer(
+            dict(
+                operation="calibrate",
+                state=_numpy(measurement["state"]).astype(np.float32, copy=True),
+                image=_numpy(measurement["image"]).copy(),
+                tick=0,
+                revision=0,
+                rtc=None,
+                simulation_rtc=dict(delay_steps=delay_steps, beta=beta),
+            )
+        )
+        return self._actions(response)
+
+    def plan(
+        self,
+        *,
+        state,
+        state_mask,
+        image,
+        action_mask,
+        history=(),
+        tick,
+        revision,
+        rtc,
+        executed_observations=None,
+        simulation_rtc=None,
+    ):
         """RPC callback for RTCSession; upload only genuinely required history."""
         for name, mask in (("state_mask", state_mask), ("action_mask", action_mask)):
             if not np.array_equal(_numpy(mask), np.asarray(self.metadata[name], dtype=bool)):
                 raise ValueError(f"{name} differs from the server's configured robot")
+        if self.metadata.get("simulation_sync", False):
+            if rtc is not None:
+                raise ValueError("Synchronous simulation does not accept RTC prefixes")
+            if executed_observations is None:
+                raise ValueError("Synchronous simulation requires the executed observation batch")
+            if simulation_rtc is None:
+                raise ValueError("Simulated RTC requires its reserved delay before prediction")
+            response = self.infer(
+                dict(
+                    state=_numpy(state).astype(np.float32, copy=True),
+                    image=_numpy(image).copy(),
+                    executed_observations=[
+                        dict(tick=record.tick, image=_numpy(record.image).copy()) for record in executed_observations
+                    ],
+                    tick=tick,
+                    revision=revision,
+                    rtc=None,
+                    simulation_rtc=dict(simulation_rtc),
+                )
+            )
+            self.last_simulation_info = response.get("simulation_info")
+            return self._actions(response)
+        if executed_observations is not None or simulation_rtc is not None:
+            raise ValueError("Simulation request fields require a simulation server")
         horizon, stride = self.metadata["actions_per_block"], self.metadata["video_stride"]
         blocks = min(tick // horizon, self.metadata["history_blocks"])
         selected = range(tick - blocks * horizon, tick, stride)
@@ -206,6 +260,7 @@ class CausalPolicyClient:
         execution_policy=None,
         execution_rate_callback=None,
         adaptive_execution=True,
+        simulation_servo_hz=None,
         **session_options,
     ):
         """Return a bootstrapped local session; prepare before enabling motion."""
@@ -213,6 +268,28 @@ class CausalPolicyClient:
         from cosmos_framework.inference.causal_action.rtc_pacing import RTCExecutionPolicy
         from cosmos_framework.inference.causal_action.rtc_session import RTCSession
 
+        if self.metadata.get("simulation_sync", False):
+            from cosmos_framework.inference.causal_action.simulation_session import SimulatedRTCSession
+
+            if not adaptive_execution:
+                raise ValueError("Simulated RTC requires adaptive execution")
+            if not callable(execution_rate_callback):
+                raise ValueError("Simulated RTC needs an execution_rate_callback")
+            initial = self._actions(self.reset(prompt=prompt, measurement=first_measurement))
+            rate = self.metadata["controller_hz"] if execution_hz is None else execution_hz
+            session = SimulatedRTCSession(
+                self,
+                initial,
+                execution_hz=rate,
+                execution_rate_callback=execution_rate_callback,
+                execution_policy=execution_policy,
+                servo_hz=simulation_servo_hz,
+                **session_options,
+            )
+            self._session = session
+            return session
+        if simulation_servo_hz is not None:
+            raise ValueError("simulation_servo_hz requires a simulation server")
         if enable_rtc and not self.metadata.get("rtc_enabled", False):
             raise ValueError("Enable RTC on the server before creating an RTC client session")
         if enable_rtc and not adaptive_execution and execution_policy is not None:

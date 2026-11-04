@@ -9,6 +9,37 @@ The protocol is `cosmos-causal-action-rtc-v1`. Run matching client/server code f
 this branch. The older synchronous `cosmos-causal-action-v2` client is a different
 protocol and fails the handshake rather than silently changing execution.
 
+Choose one execution mode and use the matching client from this checkout:
+
+| Mode                  | Server flag         | Client flag    | Returned action shape | Execution                                            |
+| --------------------- | ------------------- | -------------- | --------------------- | ---------------------------------------------------- |
+| Ordinary baseline     | None                | None           | `[32,55]`             | Execute 16, then wait for a fresh prediction         |
+| Wall-clock RTC        | `--enable_rtc`      | `--enable_rtc` | `[32,55]`             | Continue old actions during a background RPC         |
+| Simulated RTC         | `--simulation-sync` | None required  | `[16,55]`             | Execute a delay-dependent mixture of old/new actions |
+
+## Compatibility with the client/server source branch
+
+The RoboTwin environment setup, camera/state helpers and native robot adapter
+were adapted from `feat/robotwin-client-server`. Its complete client is not a
+drop-in replacement for this branch. The comparison below uses the locally
+available source-branch commit `b4e90f0278d9797343ed79fce25bdbb0780970c0`.
+
+| Interface           | Source branch client                                 | Current simulated RTC client                          |
+| ------------------- | ---------------------------------------------------- | ----------------------------------------------------- |
+| Protocol            | `cosmos-causal-action-v2`                            | `cosmos-causal-action-rtc-v1`                         |
+| Observation request | `obs`: raw three-camera dictionaries, native state   | Prepared CHW image, unified55 state, explicit ticks   |
+| Executed feedback   | 16 camera sets, `executed_steps`, `observation_step` | 16 `executed_observations`, `tick`, `simulation_rtc`  |
+| Actions on the wire | 32 native joint/EEF rows; execute the first 16       | 16 unified55 rows; convert before robot execution     |
+| State default       | `command`                                            | `measured`                                            |
+| Execution schedule  | One `take_action` per received target                | Calibration, online fit and logical servo subdivision |
+
+The source client's `take_action` followed by `get_obs` is the feedback rule
+retained here: return observations of the actions actually executed. Its RPC
+wrapper and execution loop still need adaptation; changing only a server URI
+or the protocol string is insufficient. The current client also needs CPU Torch
+for preprocessing and sessions. Source-branch prediction-video and
+`finish_video` interfaces are not supplied by this server.
+
 ## Ownership and execution
 
 The server loads the checkpoint, VAE, processor and training statistics. The
@@ -16,6 +47,12 @@ client owns the action buffer, observation ticks, servo schedule and online
 latency fit. With RTC enabled, the existing `RTCSession` runs on the client CPU;
 its background planner performs a blocking RPC while the foreground continues
 executing the previous chunk.
+
+In simulated RTC, the server additionally retains its full 32-action prediction
+and supplies only 16 execution actions per round. The client owns the latency
+samples, rate acknowledgement and real executed-observation batch. This mode
+uses `SimulatedRTCSession`; the following background-RPC diagram describes
+wall-clock `RTCSession` execution.
 
 ```text
 Client                                      Server
@@ -34,7 +71,8 @@ At `s=16`, the client requests the next `H=32` chunk in the background. Publicat
 committed-prefix restoration, elapsed-action skipping, deadline checks and
 fallback use the existing session logic.
 
-`--enable_rtc` (alias `--enable-rtc`) is opt-in on both ends. Without it, the client
+Outside simulation mode, `--enable_rtc` (alias `--enable-rtc`) is opt-in on both
+ends. Without it, the client
 performs the ordinary baseline: predict 32 actions, execute 16, then block for a
 fresh prediction. With RTC, adaptive execution is enabled by default in the client
 adapter; `--no-adaptive-execution` permits fixed-rate comparisons. Adaptive
@@ -84,6 +122,135 @@ statistics, processor, VAE, environment and device paths for the server machine.
 `ENABLE_RTC=1` enables RTC; `PRINT_ONLY=1` prints the command without activating an
 environment or launching the model.
 
+## RTC simulation with 16-step observation batches
+
+For RoboTwin evaluations that emulate inference delay without waiting for that
+delay in simulation time, start the server with `--simulation-sync` (alias
+`--simulation_sync`). This flag enables simulated RTC automatically. The matching
+client reads the setting from the handshake; it needs no additional simulation
+flag. The ordinary hardware RTC path remains available through `--enable_rtc`.
+This mode requires `--execute-steps 16` and adaptive execution; passing
+`--no-adaptive-execution` to the client is rejected. An explicit client
+`--enable_rtc` is optional and does not select the wall-clock session when the
+server advertises `simulation_sync`.
+
+```bash
+torchrun --standalone --nproc-per-node=1 \
+  -m cosmos_framework.inference.causal_action.server \
+  --checkpoint /path/to/trained/checkpoint \
+  --processor /path/to/Cosmos3-Edge \
+  --vae /path/to/Wan2.2_VAE.pth \
+  --statistics /path/to/training_statistics.json \
+  --robot-config /path/to/robot_config.json \
+  --simulation-sync
+```
+
+Run the matching client in the RoboTwin environment:
+
+```bash
+python examples/action_pretrain/robotwin_client.py \
+  --robotwin-root /path/to/compatible/RoboTwin \
+  --server-uri ws://SERVER_IP:8000 \
+  --task-name adjust_bottle --task-config demo_clean \
+  --control-mode joint --state-source measured \
+  --initial-execution-hz 30 --servo-hz 30 \
+  --max-waypoints 48 \
+  --output outputs/causal_action/robotwin_rtc_sim
+```
+
+For programmatic clients, `create_session` needs an `execution_rate_callback`
+that actually applies the accepted rate and returns `True`. The CLI adapter
+provides it and supplies `simulation_servo_hz` for integer servo subdivision.
+The source-branch client does not implement this session contract.
+
+The server predicts a full 32-action chunk using caches ①＋② and returns a
+16-action execution batch. The first prediction is ordinary inference. Before
+motion, the client performs one RTC warmup and two timed RTC requests, discarding
+their predictions. Calibration does not advance observation ticks or replace
+the bootstrap prediction retained by the server.
+
+The client retains the last eight completed `(history model seconds, full RPC
+seconds)` measurements and uses the existing CPU online latency fit to choose
+the next execution rate and committed prefix `d`. Predictions use completed
+measurements only. The rate is rounded down to an integer servo subdivision,
+and the client acknowledges and applies it to the upcoming waypoint schedule.
+The request freezes that rate and prefix before the server starts inference.
+
+With a predicted latency budget `L`, execution rate `r` and margin `m`, the
+reservation is `d = ceil(L*r) + m`. After measuring the completed RPC, the
+client checks `q = ceil(actual_RPC_seconds*r)` against `q <= d <= 16`.
+`d` is the committed prefix; `q` is the measured latency expressed in waypoint
+steps. They are recorded separately. The completed request only becomes a
+latency sample for subsequent decisions; it cannot determine its own predicted
+reservation. History length remains `min(floor(tick/32), history_blocks)*32/fps`
+model seconds, regardless of the slower execution rate.
+
+For a request at tick `t`, the server uses the unexecuted 16-action tail of its
+previous full prediction as the RTC prefix, then generates a new 32-action
+prediction. Its committed first `d` actions are restored exactly. The returned
+batch therefore contains:
+
+```text
+old prediction's remaining actions [0:d]
+new prediction aligned to tick t    [d:16]
+```
+
+The server keeps the full new prediction, including its unreturned `[16:32]`
+tail for the next round. `simulation_info` reports the old/new counts and the
+request tick. `d` can vary; `d=16` is a legal boundary where a batch is entirely
+old actions. A batch is not guaranteed to contain a fixed mix of old and new.
+
+The client executes the returned sequence in the simulator. Before consuming
+the next waypoint, it reads the actual observation produced by the preceding
+completed waypoint. Each uploaded image is one preprocessed multi-camera
+composition in uint8 CHW format, rather than three separate raw camera arrays.
+It submits these exact 16 post-action observations and the final measured state
+in the next request.
+The first batch contains ticks 1 through 16, then 17 through 32. Observations
+belong to the actions actually executed, including the old-action prefix;
+they never come from generated video or an unexecuted new trajectory. Reset
+supplies the real tick-zero image. The final batch frame also supplies the
+request's current image.
+
+The server validates every uploaded frame and retains the stride-four samples
+needed by the existing history-window rule. Sixteen uploaded images contribute
+four new sampled observations; they are not sixteen consecutive VAE input
+frames. The original complete-32-step history-block schedule is preserved:
+the tick-16 request uses only its current image, and tick 32 can use images
+0, 4, ..., 32. The server retains earlier samples until their history horizon
+expires, including samples not needed by the immediately preceding request.
+
+While the server encodes and predicts, the client makes no simulator step.
+The process still waits for the real RPC and spends its actual wall time.
+That wait does not advance simulated physics. The modelled delay is represented
+by the committed old-action prefix, which is executed after the RPC returns.
+Servo interpolation advances by logical waypoint time and does not sleep or
+skip steps because of
+model or rendering wall time. Model history still uses the checkpoint's 30 Hz
+grid; actual simulated motion uses the selected execution rate.
+
+After each request, the client checks the measured full RPC duration against
+the reservation chosen before inference. A request exceeding its reservation
+stops with a deadline error; its new actions are not executed. Diagnostics
+separate reserved `d` from the measured delay expressed in waypoint steps.
+This is a simulation of the RTC execution sequence, not an actual asynchronous
+hardware or network deadline test. `virtual_rtc_feasible` reports the emulated
+condition; `continuous_rtc` is not asserted for this mode.
+
+The client writes `metrics.json` and `waypoints_unified.npy` as usual.
+`action_trace[].action_provenance` identifies each executed waypoint as
+`bootstrap`, `old_prefix` or `new_prediction`, with its `prediction_tick` and
+`prediction_row`. `final_status.last_request` records the old/new counts,
+reserved and measured delays, `accepted` and `deadline_miss`.
+`requested_execution_hz` is the requested starting rate; `initial_execution_hz`
+is the calibrated rate when motion begins; `final_execution_hz` is the final
+applied rate. Trace schedules are logical times in this mode, while RPC/call
+durations and wall timestamps are still measured. Zero reported logical
+lateness does not establish a real-time deadline bound.
+
+The server launcher accepts `SIMULATION_SYNC=1`. Without the flag, the existing
+ordinary and hardware RTC paths retain their behavior.
+
 ## Start a RoboTwin client
 
 Use a Python environment that can already run the RoboTwin simulator. The client
@@ -96,6 +263,12 @@ on the client; the wire codec and basic connection do not load model code.
 The adapter expects the supplied RoboTwin checkout to provide
 `scripts/eval_policy_xpolicylab.py` and its task/configuration helpers, as did the
 source client/server branch. Point `--robotwin-root` at that checkout.
+The required helpers include `load_task_args`, `resolve_eval_instruction`,
+`class_decorator`, `build_instruction`, `safe_close_env` and `UnStableError`.
+A checkout with only `script/eval_policy.py` is not directly compatible. The
+local RoboTwin checkout used during development lacks the expected helper and
+object assets; the flag does not install those dependencies or adapt that
+checkout. Use a compatible RoboTwin installation before running task evaluation.
 
 ```bash
 python examples/action_pretrain/robotwin_client.py \
@@ -135,7 +308,8 @@ consistent during an episode.
 `--max-waypoints` limits model actions. `--max-steps` instead limits native
 `env.take_action` calls; servo interpolation can use several such calls for a
 single model waypoint. Episode metrics distinguish issued waypoints, fully
-completed waypoints and native servo calls. Slow simulator calls produce reported
+completed waypoints and native servo calls. In wall-clock execution, slow
+simulator calls produce reported
 lateness and skipped servo deadlines rather than a burst of old commands.
 
 The client saves `waypoints_unified.npy` and `metrics.json`, including action and
@@ -157,19 +331,32 @@ episode. A timeout closes the connection so an unread late result cannot become
 the next request's response. Remote errors, mismatched IDs and disconnects surface
 as errors rather than silently replaying old commands.
 
-The client uploads the genuine historical frame indexes required by the current
-window. With `raw-history-refs-v1`, the server acknowledges which historical images
+In ordinary and wall-clock RTC modes, the client uploads the genuine historical
+frame indexes required by the current window. With `raw-history-refs-v1`, the
+server acknowledges which historical images
 it has received; later requests refer to those ticks and upload only new history
 images and the fresh current image. The server expands references before calling
 the same model planner. This retains raw observations only: VAE encoding and model
 prefix computation follow the existing inference path on each request.
 
-Only historical images enter this transport cache. A bootstrap or calibration
+In those modes, only historical images enter this transport cache. A bootstrap or calibration
 current image must not substitute for a later historical observation with the
 same tick. Historical images are immutable within an episode; conflicting bytes
 for a cached tick or a reference to a missing image require recovery. The cache is
 bounded by the configured history horizon and cleared at episode boundaries.
 Clients without this capability use complete history payloads.
+
+At each continuing planning boundary, simulated RTC uploads its complete
+16-step post-action batch, without history references. Reset retains the real
+tick-zero image; later batches retain
+the stride-four samples, including each batch's final current frame. Calibration
+does not replace those retained images. The current frame is also serialized in
+the top-level `image` field, so there are 16 distinct post-action images and a
+duplicate serialization of the final one. Feedback is sent when another
+prediction is needed. Episode termination does not trigger an extra request;
+an incomplete final batch is not padded or uploaded. The generic
+`history_frames_sent`/`history_frames_reused` counters describe history-reference
+payloads, not `executed_observations`, and can both be zero in simulation mode.
 
 Both endpoints use a bounded 512 MiB message limit. A cold full window of
 257 prepared 640×640 RGB images is about 316 MB before small metadata overhead;
@@ -188,10 +375,15 @@ the planner timer; use `--extra-latency-seconds` for deployment headroom and ins
 actual command/servo lateness.
 
 `--latency-factor`, `--margin-steps` and `--minimum-execution-hz` configure the
-adaptive budget. An unattainable minimum rate, missing acknowledgment or missed
+adaptive budget. In wall-clock RTC, an unattainable minimum rate, missing
+acknowledgment or missed
 deadline preserves the current warning/fallback behavior. Ordinary fallback can
 pause command delivery. The client records whether RTC remained active throughout
 the episode; successful inference does not alone imply continuous RTC.
+Simulated RTC logs a warning and raises on an infeasible budget, failed rate
+acknowledgement or exceeded reservation. It stops before returning a new batch's
+action and does not automatically enter the ordinary fallback path. Reset the
+episode before attempting another simulated run after such an error.
 
 ## Validation scope
 
@@ -200,6 +392,25 @@ background RPC progress, round-trip timing, prefix preservation, adaptive pacing
 request/reset isolation, timeout closure and historical-image references. Model
 adapter tests check that bootstrap uses ordinary inference and later requests use
 the shared RTC planner with genuine observations and zero future placeholders.
+
+The simulated-RTC revision passed 74 focused CPU tests: 40 existing serving,
+network and RoboTwin-adapter cases, 27 simulated wire/model-adapter cases and
+seven delay/session/servo cases. The localhost tests use the actual WebSocket
+codec and `ServingModelPolicy` with a fake model backend. They verify 32 predicted
+rows and 16 returned rows, exact `d=4` and `d=16` old-prefix restoration,
+retention of the unreturned prediction tail, stationary calibration, history
+capacity/reset and rejection of malformed batches. Action-response environments
+produce state and pixels from the commands actually executed; the returned
+observations are checked against those results. Additional cases exercise
+online fitting from completed samples, the eight-sample buffer, latency spikes,
+minimum rates and exact 11/13-servo-step completion without floating-point
+endpoint overruns.
+
+These are protocol, causality and execution-logic checks. The new
+`--simulation-sync` path has not yet been run with the real checkpoint in a full
+RoboTwin scene or on a physical robot, and no task-success rate is established.
+The earlier NPU replay below used the wall-clock RTC path. The 74 focused cases
+are separate from, and must not be added to, the historical 435-test count.
 
 The real 0930 NPU replay exercises ordinary bootstrap, stationary calibration,
 112 client waypoints with background RPCs and a separate full-history request.

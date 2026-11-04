@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: OpenMDW-1.1
-"""Stateless model requests using the validated local ordinary/RTC planner.
+"""Model requests using the validated local ordinary/RTC planner.
 
 Client helpers import CPU preprocessing lazily and never load a checkpoint.
-Only the live episode's prompt/schema are retained; video/KV values are local
-to each request, including repeated startup calibration requests.
+Ordinary serving retains only the live prompt/schema; simulated RTC also keeps
+the previous full action prediction. Video/KV values remain local to each
+request, including repeated startup calibration requests.
 """
 
 import json
@@ -57,6 +58,11 @@ def _integer(value, name, minimum=0):
     return value
 
 
+def validate_simulation_config(*, simulation_sync, execute_steps):
+    if simulation_sync and execute_steps != 16:
+        raise ValueError("simulation_sync requires execute_steps=16")
+
+
 class ServingModelPolicy:
     """One episode's schema with full observed history supplied on every request."""
 
@@ -75,12 +81,15 @@ class ServingModelPolicy:
         guidance=1.0,
         cache_mode="full",
         enable_rtc=False,
+        simulation_sync=False,
         seed=42,
     ):
         from cosmos_framework.data.generator.action.action_state_template import ActionStateTemplate55
         from cosmos_framework.data.generator.action.causal_block_geometry import CausalBlockGeometry
         from cosmos_framework.inference.causal_action.robotwin import RobotwinAdapter
 
+        validate_simulation_config(simulation_sync=simulation_sync, execute_steps=execute_steps)
+        self.simulation_sync = bool(simulation_sync)
         self.model, self.statistics = model, statistics
         self.template = template if template is not None else ActionStateTemplate55()
         self.adapter = adapter if adapter is not None else RobotwinAdapter.from_statistics(self.template, statistics)
@@ -100,7 +109,11 @@ class ServingModelPolicy:
             raise ValueError("guidance must be finite")
         if cache_mode not in ("off", "plans", "full"):
             raise ValueError("cache_mode must be off, plans or full")
-        self.cache_mode, self.enable_rtc, self.seed = cache_mode, bool(enable_rtc), _integer(seed, "seed")
+        self.cache_mode, self.enable_rtc, self.seed = (
+            cache_mode,
+            bool(enable_rtc or simulation_sync),
+            _integer(seed, "seed"),
+        )
         model.net.eval().requires_grad_(False)
         self.clear()
 
@@ -114,6 +127,8 @@ class ServingModelPolicy:
         )
         return dict(
             actions_per_block=self.geometry.actions_per_block,
+            simulation_sync=self.simulation_sync,
+            returned_action_steps=self.execute_steps if self.simulation_sync else self.geometry.actions_per_block,
             execute_steps=self.execute_steps,
             controller_hz=self.controller_hz,
             fps=self.controller_hz,
@@ -134,6 +149,7 @@ class ServingModelPolicy:
     def clear(self):
         self.builder = self.planner = self._reference = None
         self.prompt = None
+        self._simulation_actions = self._simulation_origin = None
 
     def _measurement(self, request):
         import torch
@@ -249,14 +265,39 @@ class ServingModelPolicy:
                 seed=[self.seed],
             )
             self.prompt = prompt
-        elif operation == "predict":
+        elif operation in ("predict", "calibrate"):
+            if operation == "calibrate" and not self.simulation_sync:
+                raise ValueError("Calibration operations require simulation_sync")
             if self.planner is None:
                 raise ValueError("Reset with a fresh observation before requesting predictions")
             state, image = self._measurement(request)
         else:
-            raise ValueError("operation must be reset or predict")
+            raise ValueError("operation must be reset, predict or simulation calibration")
         rtc = None
         prefix = request.get("rtc")
+        if self.simulation_sync:
+            if prefix is not None:
+                raise ValueError("Simulation prefixes come from the server's previous full prediction")
+            if operation == "reset":
+                if request.get("simulation_rtc") is not None:
+                    raise ValueError("Simulation bootstrap must be ordinary inference")
+            else:
+                options = request.get("simulation_rtc")
+                if not isinstance(options, dict):
+                    raise ValueError("Simulation inference requires simulation_rtc delay_steps and beta")
+                delay = _integer(options.get("delay_steps"), "delay_steps", 1)
+                if delay > self.execute_steps:
+                    raise ValueError("Simulation delay_steps must not exceed 16")
+                offset = tick - self._simulation_origin
+                if (operation == "calibrate" and (tick != 0 or self._simulation_origin != 0)) or (
+                    operation == "predict" and offset != self.execute_steps
+                ):
+                    raise ValueError("Simulation calibration must precede motion; predictions advance exactly 16 steps")
+                prefix = dict(
+                    previous_actions=self._simulation_actions[offset:].clone(),
+                    delay_steps=delay,
+                    beta=options.get("beta", 5.0),
+                )
         if prefix is not None:
             if operation == "reset" or not self.enable_rtc:
                 raise ValueError("RTC predictions require an enabled server and an ordinary bootstrap first")
@@ -280,11 +321,36 @@ class ServingModelPolicy:
             rtc=rtc,
         )
         actions = self.planner(**inputs)
+        if self.simulation_sync:
+            delay = 0 if rtc is None else rtc.delay_steps
+            if rtc is not None:
+                # Match RTCSession's exact committed-prefix restoration. The
+                # client later executes these old commands before the new tail.
+                actions[:delay] = rtc.previous_actions[:delay]
+            if operation != "calibrate":
+                self._simulation_actions = actions.clone()
+                self._simulation_origin = tick
+            return dict(
+                actions=actions[: self.execute_steps].numpy(),
+                tick=tick,
+                revision=revision,
+                simulation_info=dict(
+                    request_tick=tick,
+                    delay_steps=delay,
+                    old_action_steps=delay,
+                    new_action_steps=self.execute_steps - delay,
+                    calibration=operation == "calibrate",
+                ),
+            )
         return dict(actions=actions.numpy(), tick=tick, revision=revision)
 
 
 def load_policy(args):
     """Load one model rank; no training dataset or recorded observation is needed."""
+    validate_simulation_config(
+        simulation_sync=getattr(args, "simulation_sync", False),
+        execute_steps=args.execute_steps,
+    )
     os.environ.setdefault("COSMOS_DEVICE", "npu")
     os.environ["WAN_VAE_PATH"] = args.vae
     if int(os.environ.get("WORLD_SIZE", "1")) != 1:
@@ -340,5 +406,6 @@ def load_policy(args):
         guidance=args.guidance,
         cache_mode=getattr(args, "cache_mode", "full"),
         enable_rtc=args.enable_rtc,
+        simulation_sync=getattr(args, "simulation_sync", False),
         seed=args.seed,
     )

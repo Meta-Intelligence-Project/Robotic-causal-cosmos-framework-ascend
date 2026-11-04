@@ -104,6 +104,8 @@ def rollout(
     A fallback is reported and may block the following waypoint request. Missed
     servo deadlines are skipped, rather than emitted as a burst of old commands.
     The final target is sent unless the episode ends before it can be executed.
+    A synchronous simulation server instead advances interpolation in logical
+    time: inference waits and slow rendering never consume simulated steps.
 
     This adapter implements a RoboTwin interpolation policy. Hardware clients
     must implement their own actuator limits, interpolation and stop behavior.
@@ -119,6 +121,7 @@ def rollout(
         raise ValueError("max_waypoints must be a positive integer")
     if client.control_mode not in ("joint", "eef"):
         raise ValueError("control_mode must be joint or eef")
+    simulation_sync = bool(client.metadata.get("simulation_sync", False))
     model_hz = _frequency(client.metadata.get("controller_hz", client.metadata.get("fps", 30.0)), "controller_hz")
     requested_hz = _frequency(model_hz if execution_hz is None else execution_hz, "execution_hz")
     servo_hz = _frequency(servo_hz, "servo_hz")
@@ -177,6 +180,7 @@ def rollout(
         execution_policy=execution_policy if adaptive_execution else None,
         execution_rate_callback=acknowledge_rate,
         adaptive_execution=adaptive_execution,
+        **(dict(simulation_servo_hz=servo_hz) if simulation_sync else {}),
     )
     prepared_at = now()
     issued = completed = 0
@@ -195,7 +199,8 @@ def rollout(
         action_type = "qpos" if client.control_mode == "joint" else "ee"
         rtc_active_throughout = bool(status.get("rtc_enabled", False))
         while not episode_finished(env) and (max_waypoints is None or issued < max_waypoints):
-            wait_until(deadline)
+            if not simulation_sync:
+                wait_until(deadline)
             measurement = _measurement(env, adapter, resolution, state_source, prepare_image)
             if not torch.equal(torch.as_tensor(measurement["image_size"]).detach().cpu(), image_size):
                 raise ValueError("Camera layout/content geometry changed within the episode; reset is required")
@@ -217,9 +222,13 @@ def rollout(
             if previous is None:
                 previous = torch.where(measurement["state_mask"], measurement["state"].float(), command).clone()
             period = 1 / rate
-            # In blocking mode, waiting for inference creates a real pause. Start
-            # a fresh interval instead of rushing expired servo targets afterward.
-            interval_start = max(deadline, returned_at)
+            if simulation_sync:
+                servo_steps = round(servo_hz / rate)
+                if servo_steps < 1 or not math.isclose(servo_steps, servo_hz / rate):
+                    raise ValueError("Simulated RTC rate must use an integer number of servo steps per waypoint")
+            # Simulation owns a logical timeline; the ordinary path starts a
+            # fresh wall interval after inference instead of rushing old targets.
+            interval_start = deadline if simulation_sync else max(deadline, returned_at)
             interval_end = interval_start + period
             rtc_active_throughout &= bool(status.get("rtc_enabled", False))
             issued += 1
@@ -231,22 +240,26 @@ def rollout(
                     started_seconds=call_started - started,
                     returned_seconds=returned_at - started,
                     call_seconds=returned_at - call_started,
-                    lateness_seconds=max(0.0, returned_at - deadline),
+                    lateness_seconds=0.0 if simulation_sync else max(0.0, returned_at - deadline),
                     execution_hz=rate,
                     inference_pending=bool(status.get("inference_pending", False)),
                     published_requests=status.get("published_requests", 0),
                     execution_mode=status.get("execution_mode"),
+                    action_provenance=status.get("last_action"),
                 )
             )
             servo_tick = 1
             while not episode_finished(env):
                 servo_deadline = min(interval_end, interval_start + servo_tick / servo_hz)
-                at = wait_until(servo_deadline)
+                at = now() if simulation_sync else wait_until(servo_deadline)
                 status = session.status()
                 if status.get("error"):
                     raise RuntimeError(f"Remote planning failed: {status['error']}")
                 rtc_active_throughout &= bool(status.get("rtc_enabled", False))
-                alpha = 1.0 if at >= interval_end else min(1.0, max(0.0, (at - interval_start) / period))
+                if simulation_sync:
+                    alpha = 1.0 if servo_tick >= servo_steps else servo_tick / servo_steps
+                else:
+                    alpha = 1.0 if at >= interval_end else min(1.0, max(0.0, (at - interval_start) / period))
                 target = interpolate_action(adapter.template, adapter.action_mask, previous, command, alpha)
                 native = adapter.split_actions(target[None].numpy())[client.control_mode]
                 if native is None or native.ndim != 2 or native.shape[0] != 1 or not np.isfinite(native).all():
@@ -260,17 +273,21 @@ def rollout(
                         scheduled_seconds=servo_deadline - started,
                         started_seconds=at - started,
                         completed_seconds=finished_at - started,
-                        lateness_seconds=max(0.0, at - servo_deadline),
+                        lateness_seconds=0.0 if simulation_sync else max(0.0, at - servo_deadline),
                     )
                 )
                 if alpha >= 1:
                     completed += 1
                     break
-                following_tick = max(servo_tick + 1, math.floor((finished_at - interval_start) * servo_hz) + 1)
+                following_tick = (
+                    servo_tick + 1
+                    if simulation_sync
+                    else max(servo_tick + 1, math.floor((finished_at - interval_start) * servo_hz) + 1)
+                )
                 skipped_servo_ticks += following_tick - servo_tick - 1
                 servo_tick = following_tick
             previous = command
-            deadline = max(interval_end, now())
+            deadline = interval_end if simulation_sync else max(interval_end, now())
         elapsed = now() - started
         final_status = session.status()
         if final_status.get("error"):
@@ -283,6 +300,7 @@ def rollout(
             servo_commands=len(servo_trace),
             simulator_action_count=env.take_action_cnt,
             model_seconds=completed / model_hz,
+            simulation_sync=simulation_sync,
             wall_seconds=elapsed,
             startup_calibration_seconds=started - prepared_at,
             controller_hz=model_hz,
@@ -290,8 +308,10 @@ def rollout(
             initial_execution_hz=initial_hz,
             final_execution_hz=pacer["hz"],
             servo_hz=servo_hz,
-            adaptive_execution=bool(enable_rtc and adaptive_execution),
-            continuous_rtc=bool(enable_rtc and rtc_active_throughout),
+            adaptive_execution=bool((enable_rtc or simulation_sync) and adaptive_execution),
+            continuous_rtc=bool(not simulation_sync and enable_rtc and rtc_active_throughout),
+            simulated_rtc=bool(final_status.get("simulated_rtc", False)),
+            virtual_rtc_feasible=bool(final_status.get("virtual_rtc_feasible", False)),
             state_source=state_source,
             rate_changes=changes,
             skipped_servo_ticks=skipped_servo_ticks,

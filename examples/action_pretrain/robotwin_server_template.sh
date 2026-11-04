@@ -25,6 +25,11 @@ case "${ENABLE_RTC:-0}" in
     0) ;;
     *) printf 'ENABLE_RTC must be 0 or 1\n' >&2; exit 2 ;;
 esac
+case "${SIMULATION_SYNC:-0}" in
+    1) CMD+=(--simulation-sync) ;;
+    0) ;;
+    *) printf 'SIMULATION_SYNC must be 0 or 1\n' >&2; exit 2 ;;
+esac
 CMD+=("$@")
 printf 'Command: '
 printf '%q ' "${CMD[@]}"

@@ -57,6 +57,60 @@ class PolicyConnection:
         images = {index: image for index, image in images.items() if index >= tick - capacity}
         return {**request, "history": expanded}, images
 
+    def _simulation_history(self, request, tick, *, reset):
+        """Validate one executed batch, then sample the existing model history grid."""
+        if request.get("rtc") is not None or request.get("history", []) != []:
+            raise ValueError(
+                "simulation_sync accepts executed_observations without wire RTC prefixes or history references"
+            )
+        records = request.get("executed_observations", [])
+        if not isinstance(records, list):
+            raise ValueError("executed_observations must be a list")
+        if reset or request["operation"] == "calibrate":
+            if records:
+                raise ValueError("Stationary simulation requests must not contain executed_observations")
+            if request["operation"] == "calibrate":
+                if tick != 0 or self.last_tick != 0:
+                    raise ValueError("Simulation calibration must precede motion")
+                return {**request, "history": []}, dict(self.history_images)
+            images = {}
+            frames = [dict(tick=0, image=request["image"])]
+        else:
+            if tick != self.last_tick + 16 or len(records) != 16:
+                raise ValueError("simulation_sync requires exactly 16 executed_observations and a 16-step advance")
+            images = dict(self.history_images)
+            frames = records
+        stride = self.policy.metadata["video_stride"]
+        shape = next(iter(images.values())).shape if images else None
+        for expected, record in zip(range(0 if reset else self.last_tick + 1, tick + 1), frames, strict=True):
+            if not isinstance(record, dict) or set(record) != {"tick", "image"}:
+                raise ValueError("Executed observations must contain tick and image")
+            if type(record["tick"]) is not int or record["tick"] != expected:
+                raise ValueError("Executed observation ticks must be consecutive post-action ticks")
+            image = np.asarray(record["image"])
+            if (
+                image.dtype != np.uint8
+                or image.ndim != 3
+                or image.shape[0] != 3
+                or min(image.shape[1:]) < 1
+                or (shape is not None and image.shape != shape)
+            ):
+                raise ValueError("Executed observations require matching real uint8 CHW images")
+            shape = image.shape
+            if expected == tick and not np.array_equal(image, request["image"]):
+                raise ValueError("The final executed observation must match the current image")
+            # Every frame is validated; only the training stride is retained.
+            if expected % stride == 0:
+                image = image.copy()
+                image.setflags(write=False)
+                images[expected] = image
+        horizon = self.policy.metadata["actions_per_block"]
+        capacity = self.policy.metadata["history_blocks"] * horizon
+        blocks = min(tick // horizon, self.policy.metadata["history_blocks"])
+        history = [dict(tick=t, image=images[t]) for t in range(tick - blocks * horizon, tick, stride)]
+        images = {t: image for t, image in images.items() if t >= tick - capacity}
+        return {**request, "history": history}, images
+
     def infer(self, request):
         if not isinstance(request, dict):
             raise ValueError("Request must be a dictionary")
@@ -67,8 +121,10 @@ class PolicyConnection:
             raise ValueError("episode_id must be a nonempty bounded string")
         self.last_request_id = request_id
         operation = request.get("operation")
-        if operation not in ("reset", "predict"):
-            raise ValueError("operation must be reset or predict")
+        if operation not in ("reset", "predict", "calibrate"):
+            raise ValueError("operation must be reset, predict or calibrate")
+        if operation == "calibrate" and not self.policy.metadata.get("simulation_sync", False):
+            raise ValueError("Calibration operations require simulation_sync")
         tick, revision = request.get("tick", 0), request.get("revision", 0)
         if type(tick) is not int or tick < 0 or type(revision) is not int or revision < 0:
             raise ValueError("tick and revision must be nonnegative integers")
@@ -88,7 +144,10 @@ class PolicyConnection:
                 raise ValueError("RTC is disabled on this server")
         started = time.perf_counter()
         try:
-            expanded, history_images = self._expand_history(request, tick, reset=operation == "reset")
+            expand = (
+                self._simulation_history if self.policy.metadata.get("simulation_sync", False) else self._expand_history
+            )
+            expanded, history_images = expand(request, tick, reset=operation == "reset")
             result = self.policy.infer(expanded)
             if not isinstance(result, dict):
                 raise ValueError("Policy response must be a dictionary")
@@ -102,7 +161,7 @@ class PolicyConnection:
         result = dict(result)
         result.update(request_id=request_id, episode_id=episode_id, tick=tick, revision=revision)
         result["server_timing"] = {"infer_seconds": time.perf_counter() - started}
-        result["cached_history_ticks"] = sorted(history_images)
+        result["cached_history_ticks"] = sorted(t for t in history_images if t < tick)
         return result
 
 
@@ -191,6 +250,13 @@ def parser():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--cache-mode", choices=("off", "plans", "full"), default="full")
     p.add_argument("--enable_rtc", "--enable-rtc", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument(
+        "--simulation-sync",
+        "--simulation_sync",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Emulate RTC delay and adaptive speed with paused inference; return 16 mixed old/new actions",
+    )
     p.add_argument("--override", action="append", default=[])
     return p
 
